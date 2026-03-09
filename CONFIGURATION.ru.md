@@ -9,14 +9,15 @@
 ```json
 {
   "providers": {
-    "openrouter": {
+    "openrouter_main": {
+      "providerKind": "openrouter",
       "apiKey": "sk-or-v1-xxx"
     }
   },
   "agents": {
     "defaults": {
       "model": "anthropic/claude-opus-4-5",
-      "provider": "openrouter"
+      "provider": "openrouter_main"
     }
   }
 }
@@ -427,6 +428,66 @@ fagent agent -w C:\\path\\to\\workspace
 ```bash
 fagent status
 ```
+
+## Named providers, model profiles, and `tools.moa`
+
+The current schema supports named provider instances, reusable model profiles, and MOA presets.
+
+```json
+{
+  "providers": {
+    "openrouter_main": {
+      "providerKind": "openrouter",
+      "apiKey": "sk-or-v1-xxx"
+    },
+    "custom_local": {
+      "providerKind": "custom",
+      "apiKey": "local-key",
+      "apiBase": "http://localhost:8000/v1"
+    }
+  },
+  "models": {
+    "profiles": {
+      "opus_main": {
+        "provider": "openrouter_main",
+        "model": "anthropic/claude-opus-4-5"
+      },
+      "workflow_fast": {
+        "provider": "openrouter_main",
+        "model": "openai/gpt-4.1-mini"
+      },
+      "local_reasoner": {
+        "provider": "custom_local",
+        "model": "gpt-5.4"
+      }
+    },
+    "roles": {
+      "main": "opus_main",
+      "workflowLight": "workflow_fast"
+    }
+  },
+  "tools": {
+    "moa": {
+      "defaultPreset": "default",
+      "presets": {
+        "default": {
+          "workerModels": ["opus_main", "workflow_fast", "local_reasoner"],
+          "judgeModel": "opus_main",
+          "parallelism": 3,
+          "returnCandidates": true
+        }
+      }
+    }
+  }
+}
+```
+
+- `providers.<id>.providerKind`: provider family
+- `models.profiles.<id>.provider`: provider instance id
+- `models.roles.<role>`: built-in runtime role alias
+- `tools.moa.presets.<id>.workerModels`: parallel worker profiles
+- `tools.moa.presets.<id>.judgeModel`: judge profile
+- legacy `providers.openrouter` and `models.main` style configs are migrated automatically on load
 
 ## Security notes
 

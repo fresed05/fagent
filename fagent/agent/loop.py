@@ -25,6 +25,7 @@ from fagent.agent.tools.memory_search import (
     MemorySearchV2Tool,
 )
 from fagent.agent.tools.message import MessageTool
+from fagent.agent.tools.moa import MoaTool
 from fagent.agent.tools.registry import ToolRegistry
 from fagent.agent.tools.shell import ExecTool
 from fagent.agent.tools.spawn import SpawnTool
@@ -32,6 +33,7 @@ from fagent.agent.tools.web import WebFetchTool, WebSearchTool
 from fagent.agent.tools.workflow import WorkflowTool
 from fagent.bus.events import InboundMessage, OutboundMessage
 from fagent.bus.queue import MessageBus
+from fagent.providers.factory import ProviderFactory
 from fagent.providers.base import LLMProvider
 from fagent.memory.orchestrator import MemoryOrchestrator, NullMemoryOrchestrator
 from fagent.session.manager import Session, SessionManager
@@ -82,6 +84,7 @@ class AgentLoop:
         self.channels_config = channels_config
         self.memory_config = memory_config
         self.app_config = app_config
+        self.provider_factory = ProviderFactory(app_config) if app_config else None
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
@@ -105,6 +108,7 @@ class AgentLoop:
                 config=memory_config,
                 model=self.model,
                 app_config=app_config,
+                provider_factory=self.provider_factory,
             )
         except Exception as exc:
             logger.warning("Memory subsystem unavailable, continuing without it: {}", exc)
@@ -157,9 +161,12 @@ class AgentLoop:
         self.tools.register(MemoryGetEntityTool(memory=self.memory))
         self.tools.register(MemoryGetDailyNoteTool(memory=self.memory))
         workflow_light_role = self.app_config.resolve_model_role("workflow_light", self.model) if self.app_config else None
+        workflow_provider = self.provider
+        if self.provider_factory and workflow_light_role and workflow_light_role.provider_kind not in ("", "inherit"):
+            workflow_provider = self.provider_factory.build_from_profile(workflow_light_role)
         self.tools.register(WorkflowTool(
             tool_registry=self.tools,
-            provider=self.provider,
+            provider=workflow_provider,
             model=(workflow_light_role.model if workflow_light_role and workflow_light_role.model else self.model),
             max_tokens=min(1200, self.max_tokens),
             repair_callback=lambda category, trigger, recovery, session_key=None: self.memory.record_experience_event(
@@ -170,6 +177,8 @@ class AgentLoop:
                 metadata={"source": "workflow_tool"},
             ),
         ))
+        if self.provider_factory and self.app_config and self.app_config.tools.moa.enabled:
+            self.tools.register(MoaTool(provider_factory=self.provider_factory, config=self.app_config.tools.moa))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
 

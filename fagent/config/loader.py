@@ -72,4 +72,60 @@ def _migrate_config(data: dict) -> dict:
     exec_cfg = tools.get("exec", {})
     if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:
         tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
+
+    providers = data.get("providers")
+    if isinstance(providers, dict):
+        typed_provider_names = {
+            "custom",
+            "azureOpenai",
+            "azure_openai",
+            "anthropic",
+            "openai",
+            "openrouter",
+            "deepseek",
+            "groq",
+            "zhipu",
+            "dashscope",
+            "vllm",
+            "gemini",
+            "moonshot",
+            "minimax",
+            "aihubmix",
+            "siliconflow",
+            "volcengine",
+            "openaiCodex",
+            "openai_codex",
+            "githubCopilot",
+            "github_copilot",
+        }
+        if any(key in typed_provider_names for key in providers):
+            migrated_providers: dict[str, dict] = {}
+            for name, cfg in providers.items():
+                if not isinstance(cfg, dict):
+                    continue
+                provider_kind = (
+                    name.replace("azureOpenai", "azure_openai")
+                    .replace("openaiCodex", "openai_codex")
+                    .replace("githubCopilot", "github_copilot")
+                )
+                migrated_providers[provider_kind] = {"providerKind": provider_kind, **cfg}
+            data["providers"] = migrated_providers
+
+    models = data.get("models")
+    if isinstance(models, dict) and "profiles" not in models and "roles" not in models:
+        profiles: dict[str, dict] = {}
+        roles: dict[str, str] = {}
+        for name, cfg in models.items():
+            if not isinstance(cfg, dict):
+                continue
+            canonical = (
+                name.replace("graphExtract", "graph_extract")
+                .replace("graphNormalize", "graph_normalize")
+                .replace("workflowLight", "workflow_light")
+                .replace("autoSummarize", "auto_summarize")
+            )
+            profiles[canonical] = cfg
+            roles[canonical] = canonical
+        if profiles:
+            data["models"] = {"profiles": profiles, "roles": roles}
     return data

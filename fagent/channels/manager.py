@@ -33,6 +33,8 @@ class ChannelManager:
 
     def _init_channels(self) -> None:
         """Initialize channels based on config."""
+        groq_provider = next(iter(self.config._providers_by_kind("groq")), (None, None))[1]
+        groq_api_key = groq_provider.api_key if groq_provider else ""
 
         # Telegram channel
         if self.config.channels.telegram.enabled:
@@ -41,7 +43,7 @@ class ChannelManager:
                 self.channels["telegram"] = TelegramChannel(
                     self.config.channels.telegram,
                     self.bus,
-                    groq_api_key=self.config.providers.groq.api_key,
+                    groq_api_key=groq_api_key,
                 )
                 logger.info("Telegram channel enabled")
             except ImportError as e:
@@ -75,7 +77,7 @@ class ChannelManager:
                 from fagent.channels.feishu import FeishuChannel
                 self.channels["feishu"] = FeishuChannel(
                     self.config.channels.feishu, self.bus,
-                    groq_api_key=self.config.providers.groq.api_key,
+                    groq_api_key=groq_api_key,
                 )
                 logger.info("Feishu channel enabled")
             except ImportError as e:
