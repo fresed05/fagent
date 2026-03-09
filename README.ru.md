@@ -82,14 +82,15 @@ fagent onboard
 ```json
 {
   "providers": {
-    "openrouter": {
+    "openrouter_main": {
+      "providerKind": "openrouter",
       "apiKey": "sk-or-v1-xxx"
     }
   },
   "agents": {
     "defaults": {
       "model": "anthropic/claude-opus-4-5",
-      "provider": "openrouter"
+      "provider": "openrouter_main"
     }
   }
 }
@@ -139,6 +140,62 @@ fagent status
 - `fagent channels login`
 - `fagent auth login --provider ...`
 - `fagent memory ...`
+
+## MOA tool
+
+В `fagent` появился встроенный `moa` tool для mixture-of-agents сценариев. Основная модель вызывает его явно, когда нужен более сильный ответ, чем от одной модели.
+
+`moa` отправляет один и тот же запрос нескольким named model profiles, затем передаёт их ответы отдельной judge model. Worker и judge модели могут жить на разных provider instances, включая несколько аккаунтов или gateway одного и того же provider family.
+
+Пример:
+
+```json
+{
+  "providers": {
+    "openrouter_main": {
+      "providerKind": "openrouter",
+      "apiKey": "sk-or-v1-xxx"
+    },
+    "custom_local": {
+      "providerKind": "custom",
+      "apiKey": "local-key",
+      "apiBase": "http://localhost:8000/v1"
+    }
+  },
+  "models": {
+    "profiles": {
+      "opus_main": {
+        "provider": "openrouter_main",
+        "model": "anthropic/claude-opus-4-5"
+      },
+      "gemini_fast": {
+        "provider": "openrouter_main",
+        "model": "google/gemini-2.5-pro"
+      },
+      "local_reasoner": {
+        "provider": "custom_local",
+        "model": "gpt-5.4"
+      }
+    },
+    "roles": {
+      "main": "opus_main"
+    }
+  },
+  "tools": {
+    "moa": {
+      "defaultPreset": "default",
+      "presets": {
+        "default": {
+          "workerModels": ["opus_main", "gemini_fast", "local_reasoner"],
+          "judgeModel": "opus_main",
+          "parallelism": 3,
+          "returnCandidates": true
+        }
+      }
+    }
+  }
+}
+```
 
 ## Почему `fagent` часто удобнее крупных агентных стеков
 

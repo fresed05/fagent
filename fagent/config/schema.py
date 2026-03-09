@@ -1,9 +1,10 @@
 """Configuration schema using Pydantic."""
 
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, RootModel, model_validator
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -239,19 +240,22 @@ class AgentsConfig(Base):
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
 
 
-class ProviderConfig(Base):
-    """LLM provider configuration."""
+class ProviderInstanceConfig(Base):
+    """Named provider instance configuration."""
 
+    provider_kind: str = ""
     api_key: str = ""
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
 
 
-class ModelRoleConfig(Base):
-    """Explicit model settings for one runtime role."""
+class ModelProfileConfig(Base):
+    """Named model profile configuration."""
 
+    provider: str | None = None
     provider_kind: str = "inherit"
     api_base: str | None = None
+    provider_kind: str = ""
     api_key: str = ""
     model: str = ""
     extra_headers: dict[str, str] = Field(default_factory=dict)
@@ -261,39 +265,99 @@ class ModelRoleConfig(Base):
     dimensions: int | None = None
 
 
+ROLE_MODEL_NAMES = (
+    "main",
+    "shadow",
+    "graph_extract",
+    "graph_normalize",
+    "workflow_light",
+    "embeddings",
+    "auto_summarize",
+)
+
+
+def _default_model_profiles() -> dict[str, ModelProfileConfig]:
+    return {name: ModelProfileConfig() for name in ROLE_MODEL_NAMES}
+
+
+def _default_model_roles() -> dict[str, str]:
+    return {name: name for name in ROLE_MODEL_NAMES}
+
+
 class ModelsConfig(Base):
-    """Central model registry for runtime roles."""
+    """Central named model registry with backward-compatible role aliases."""
 
-    main: ModelRoleConfig = Field(default_factory=ModelRoleConfig)
-    shadow: ModelRoleConfig = Field(default_factory=ModelRoleConfig)
-    graph_extract: ModelRoleConfig = Field(default_factory=ModelRoleConfig)
-    graph_normalize: ModelRoleConfig = Field(default_factory=ModelRoleConfig)
-    workflow_light: ModelRoleConfig = Field(default_factory=ModelRoleConfig)
-    embeddings: ModelRoleConfig = Field(default_factory=ModelRoleConfig)
-    auto_summarize: ModelRoleConfig = Field(default_factory=ModelRoleConfig)
+    profiles: dict[str, ModelProfileConfig] = Field(default_factory=_default_model_profiles)
+    roles: dict[str, str] = Field(default_factory=_default_model_roles)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_old_role_shape(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+
+        data = dict(value)
+        profiles = dict(data.get("profiles") or {})
+        roles = {**_default_model_roles(), **dict(data.get("roles") or {})}
+
+        for role in ROLE_MODEL_NAMES:
+            role_value = data.get(role)
+            if isinstance(role_value, dict):
+                profiles.setdefault(role, role_value)
+                roles.setdefault(role, role)
+
+        if not profiles:
+            profiles = _default_model_profiles()
+        return {"profiles": profiles, "roles": roles}
+
+    def __getattr__(self, item: str) -> ModelProfileConfig:
+        if item in self.roles:
+            profile_name = self.roles[item]
+            if profile_name in self.profiles:
+                return self.profiles[profile_name]
+        raise AttributeError(item)
+
+    def get_profile(self, name: str) -> ModelProfileConfig | None:
+        return self.profiles.get(name)
+
+    def get_role_profile(self, role: str) -> ModelProfileConfig:
+        profile_name = self.roles.get(role, role)
+        profile = self.profiles.get(profile_name)
+        return profile if profile is not None else ModelProfileConfig()
 
 
-class ProvidersConfig(Base):
-    """Configuration for LLM providers."""
+class ProvidersConfig(RootModel[dict[str, ProviderInstanceConfig]]):
+    """Named provider instance registry."""
 
-    custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
-    azure_openai: ProviderConfig = Field(default_factory=ProviderConfig)  # Azure OpenAI (model = deployment name)
-    anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
-    openai: ProviderConfig = Field(default_factory=ProviderConfig)
-    openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
-    deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
-    groq: ProviderConfig = Field(default_factory=ProviderConfig)
-    zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
-    dashscope: ProviderConfig = Field(default_factory=ProviderConfig)  # 阿里云通义千问
-    vllm: ProviderConfig = Field(default_factory=ProviderConfig)
-    gemini: ProviderConfig = Field(default_factory=ProviderConfig)
-    moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
-    minimax: ProviderConfig = Field(default_factory=ProviderConfig)
-    aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
-    siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # SiliconFlow (硅基流动)
-    volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine (火山引擎)
-    openai_codex: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenAI Codex (OAuth)
-    github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
+    root: dict[str, ProviderInstanceConfig] = Field(default_factory=dict)
+
+    def get(
+        self,
+        name: str,
+        default: ProviderInstanceConfig | None = None,
+    ) -> ProviderInstanceConfig | None:
+        return self.root.get(name, default)
+
+    def items(self) -> Iterable[tuple[str, ProviderInstanceConfig]]:
+        return self.root.items()
+
+    def values(self) -> Iterable[ProviderInstanceConfig]:
+        return self.root.values()
+
+    def keys(self) -> Iterable[str]:
+        return self.root.keys()
+
+    def __contains__(self, item: object) -> bool:
+        return item in self.root
+
+    def __getattr__(self, item: str) -> ProviderInstanceConfig:
+        try:
+            return self.root[item]
+        except KeyError as exc:
+            raise AttributeError(item) from exc
+
+    def __iter__(self):
+        return iter(self.root)
 
 
 class HeartbeatConfig(Base):
@@ -346,6 +410,35 @@ class MCPServerConfig(Base):
     tool_timeout: int = 30  # seconds before a tool call is cancelled
 
 
+class MoaPresetConfig(Base):
+    """MOA preset configuration."""
+
+    worker_models: list[str] = Field(default_factory=list)
+    judge_model: str = ""
+    parallelism: int = 3
+    include_reasoning: bool = False
+    return_candidates: bool = False
+    worker_max_tokens: int | None = None
+    judge_max_tokens: int | None = None
+    temperature_override: float | None = None
+
+
+class MoaToolConfig(Base):
+    """Configuration for the MOA tool."""
+
+    enabled: bool = True
+    default_preset: str = "default"
+    presets: dict[str, MoaPresetConfig] = Field(
+        default_factory=lambda: {
+            "default": MoaPresetConfig(
+                worker_models=["main", "shadow", "workflow_light"],
+                judge_model="main",
+                parallelism=3,
+            )
+        }
+    )
+
+
 class ToolsConfig(Base):
     """Tools configuration."""
 
@@ -353,6 +446,7 @@ class ToolsConfig(Base):
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+    moa: MoaToolConfig = Field(default_factory=MoaToolConfig)
 
 
 class MemoryShadowContextConfig(Base):
@@ -503,16 +597,28 @@ class Config(BaseSettings):
         """Get expanded workspace path."""
         return Path(self.agents.defaults.workspace).expanduser()
 
+    def _providers_by_kind(self, provider_kind: str) -> list[tuple[str, ProviderInstanceConfig]]:
+        normalized = provider_kind.lower().replace("-", "_")
+        return [
+            (name, cfg)
+            for name, cfg in self.providers.items()
+            if cfg.provider_kind.lower().replace("-", "_") == normalized
+        ]
+
     def _match_provider(
-        self, model: str | None = None
-    ) -> tuple["ProviderConfig | None", str | None]:
-        """Match provider config and its registry name. Returns (config, spec_name)."""
+        self,
+        model: str | None = None,
+        forced_provider: str | None = None,
+    ) -> tuple["ProviderInstanceConfig | None", str | None, str | None]:
+        """Match provider instance. Returns (instance, provider_kind, instance_name)."""
         from fagent.providers.registry import PROVIDERS
 
-        forced = self.agents.defaults.provider
+        forced = forced_provider if forced_provider is not None else self.agents.defaults.provider
         if forced != "auto":
-            p = getattr(self.providers, forced, None)
-            return (p, forced) if p else (None, None)
+            provider = self.providers.get(forced)
+            if provider:
+                return provider, provider.provider_kind or forced, forced
+            return None, None, None
 
         model_lower = (model or self.agents.defaults.model).lower()
         model_normalized = model_lower.replace("-", "_")
@@ -525,44 +631,96 @@ class Config(BaseSettings):
 
         # Explicit provider prefix wins — prevents `github-copilot/...codex` matching openai_codex.
         for spec in PROVIDERS:
-            p = getattr(self.providers, spec.name, None)
-            if p and model_prefix and normalized_prefix == spec.name:
-                if spec.is_oauth or p.api_key:
-                    return p, spec.name
+            matches = self._providers_by_kind(spec.name)
+            if model_prefix and normalized_prefix == spec.name:
+                if spec.is_oauth and not matches:
+                    return None, spec.name, None
+                for instance_name, provider in matches:
+                    if spec.is_oauth or provider.api_key:
+                        return provider, spec.name, instance_name
 
         # Match by keyword (order follows PROVIDERS registry)
         for spec in PROVIDERS:
-            p = getattr(self.providers, spec.name, None)
-            if p and any(_kw_matches(kw) for kw in spec.keywords):
-                if spec.is_oauth or p.api_key:
-                    return p, spec.name
+            matches = self._providers_by_kind(spec.name)
+            if any(_kw_matches(kw) for kw in spec.keywords):
+                if spec.is_oauth and not matches:
+                    return None, spec.name, None
+                for instance_name, provider in matches:
+                    if spec.is_oauth or provider.api_key:
+                        return provider, spec.name, instance_name
 
         # Fallback: gateways first, then others (follows registry order)
         # OAuth providers are NOT valid fallbacks — they require explicit model selection
         for spec in PROVIDERS:
             if spec.is_oauth:
                 continue
-            p = getattr(self.providers, spec.name, None)
-            if p and p.api_key:
-                return p, spec.name
-        return None, None
+            for instance_name, provider in self._providers_by_kind(spec.name):
+                if provider.api_key:
+                    return provider, spec.name, instance_name
+        return None, None, None
 
-    def get_provider(self, model: str | None = None) -> ProviderConfig | None:
-        """Get matched provider config (api_key, api_base, extra_headers). Falls back to first available."""
-        p, _ = self._match_provider(model)
+    def get_provider(self, model: str | None = None) -> ProviderInstanceConfig | None:
+        """Get matched provider instance. Falls back to first available."""
+        p, _, _ = self._match_provider(model)
         return p
 
-    def get_model_config(self, role: str) -> ModelRoleConfig:
+    def get_provider_instance_name(self, model: str | None = None) -> str | None:
+        """Get matched provider instance id for a model."""
+        _, _, instance_name = self._match_provider(model)
+        return instance_name
+
+    def get_model_config(self, role: str) -> ModelProfileConfig:
         """Get explicit model-role config with inherited defaults resolved lazily by callers."""
-        return getattr(self.models, role, ModelRoleConfig())
+        return self.models.get_role_profile(role)
 
-    def resolve_model_role(self, role: str, fallback_model: str | None = None) -> ModelRoleConfig:
-        """Resolve a runtime role to concrete settings while staying backward compatible."""
-        role_cfg = self.get_model_config(role).model_copy(deep=True)
+    def resolve_model_profile(
+        self,
+        profile_name: str,
+        fallback_model: str | None = None,
+    ) -> ModelProfileConfig:
+        """Resolve a named model profile into concrete settings."""
         defaults = self.agents.defaults
+        profile = self.models.get_profile(profile_name)
+        if profile is None and profile_name in self.models.roles:
+            profile = self.models.get_role_profile(profile_name)
+        resolved = (profile or ModelProfileConfig()).model_copy(deep=True)
 
-        if not role_cfg.model:
-            role_cfg.model = fallback_model or defaults.model
+        if not resolved.model:
+            resolved.model = fallback_model or defaults.model
+
+        provider_instance: ProviderInstanceConfig | None = None
+        provider_name: str | None = None
+        provider_instance_name: str | None = None
+        if resolved.provider:
+            provider_instance_name = resolved.provider
+            provider_instance = self.providers.get(resolved.provider)
+            provider_name = provider_instance.provider_kind if provider_instance else None
+        else:
+            provider_instance, provider_name, provider_instance_name = self._match_provider(
+                resolved.model,
+                forced_provider=defaults.provider if defaults.provider != "auto" else None,
+            )
+
+        if provider_instance_name and not resolved.provider:
+            resolved.provider = provider_instance_name
+        if resolved.provider_kind in ("", "inherit"):
+            resolved.provider_kind = provider_name or "inherit"
+        if provider_instance:
+            if not resolved.api_key:
+                resolved.api_key = provider_instance.api_key
+            if not resolved.api_base:
+                resolved.api_base = provider_instance.api_base or self.get_api_base(
+                    resolved.model,
+                    provider_override=resolved.provider,
+                )
+            if not resolved.extra_headers and provider_instance.extra_headers:
+                resolved.extra_headers = dict(provider_instance.extra_headers)
+        return resolved
+
+    def resolve_model_role(self, role: str, fallback_model: str | None = None) -> ModelProfileConfig:
+        """Resolve a runtime role to concrete settings while staying backward compatible."""
+        role_cfg = self.resolve_model_profile(self.models.roles.get(role, role), fallback_model)
+
         if role == "embeddings":
             if not role_cfg.model:
                 role_cfg.model = self.memory.vector.embedding_model
@@ -575,24 +733,11 @@ class Config(BaseSettings):
             if role_cfg.dimensions is None and self.memory.vector.embedding_dimensions:
                 role_cfg.dimensions = self.memory.vector.embedding_dimensions
             role_cfg.timeout_s = role_cfg.timeout_s or self.memory.vector.request_timeout_s
-            return role_cfg
-
-        if role_cfg.provider_kind in ("", "inherit"):
-            matched = self.get_provider(role_cfg.model)
-            provider_name = self.get_provider_name(role_cfg.model)
-            role_cfg.provider_kind = provider_name or "inherit"
-            if matched:
-                if not role_cfg.api_key:
-                    role_cfg.api_key = matched.api_key
-                if not role_cfg.api_base:
-                    role_cfg.api_base = self.get_api_base(role_cfg.model)
-                if not role_cfg.extra_headers and matched.extra_headers:
-                    role_cfg.extra_headers = dict(matched.extra_headers)
         return role_cfg
 
     def get_provider_name(self, model: str | None = None) -> str | None:
         """Get the registry name of the matched provider (e.g. "deepseek", "openrouter")."""
-        _, name = self._match_provider(model)
+        _, name, _ = self._match_provider(model)
         return name
 
     def get_api_key(self, model: str | None = None) -> str | None:
@@ -600,11 +745,11 @@ class Config(BaseSettings):
         p = self.get_provider(model)
         return p.api_key if p else None
 
-    def get_api_base(self, model: str | None = None) -> str | None:
+    def get_api_base(self, model: str | None = None, provider_override: str | None = None) -> str | None:
         """Get API base URL for the given model. Applies default URLs for known gateways."""
         from fagent.providers.registry import find_by_name
 
-        p, name = self._match_provider(model)
+        p, name, _ = self._match_provider(model, forced_provider=provider_override)
         if p and p.api_base:
             return p.api_base
         # Only gateways get a default api_base here. Standard providers

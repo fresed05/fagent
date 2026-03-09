@@ -9,14 +9,15 @@ This file is the practical reference for `~/.fagent/config.json`.
 ```json
 {
   "providers": {
-    "openrouter": {
+    "openrouter_main": {
+      "providerKind": "openrouter",
       "apiKey": "sk-or-v1-xxx"
     }
   },
   "agents": {
     "defaults": {
       "model": "anthropic/claude-opus-4-5",
-      "provider": "openrouter"
+      "provider": "openrouter_main"
     }
   }
 }
@@ -26,8 +27,8 @@ This file is the practical reference for `~/.fagent/config.json`.
 
 - `agents`: main runtime defaults such as model, provider, workspace, temperature, and iteration limits
 - `channels`: chat platform integrations and channel-level behavior
-- `providers`: credentials and base URLs for model providers
-- `models`: per-role model overrides for main, shadow, workflow, graph, embeddings, and auto-summary jobs
+- `providers`: named provider instances with credentials and base URLs
+- `models`: named model profiles plus role aliases for main, shadow, workflow, graph, embeddings, and auto-summary jobs
 - `gateway`: gateway host, port, and heartbeat behavior
 - `tools`: web, exec, workspace restriction, and MCP server definitions
 - `memory`: layered memory subsystem controls
@@ -66,8 +67,9 @@ Main fields:
 
 ## `providers`
 
-Each provider entry usually accepts:
+Each provider instance usually accepts:
 
+- `providerKind`
 - `apiKey`
 - `apiBase`
 - `extraHeaders`
@@ -77,14 +79,17 @@ Example:
 ```json
 {
   "providers": {
-    "openrouter": {
+    "openrouter_main": {
+      "providerKind": "openrouter",
       "apiKey": "sk-or-v1-xxx"
     },
-    "custom": {
+    "custom_local": {
+      "providerKind": "custom",
       "apiKey": "local-key",
       "apiBase": "http://localhost:8000/v1"
     },
-    "azureOpenai": {
+    "azure_prod": {
+      "providerKind": "azure_openai",
       "apiKey": "azure-key",
       "apiBase": "https://example.openai.azure.com"
     }
@@ -92,7 +97,9 @@ Example:
 }
 ```
 
-Available provider families in the current schema include:
+Named instances let you keep multiple accounts, gateways, or local endpoints for the same provider family. `agents.defaults.provider` and model profiles point to the instance id, not the provider family.
+
+Available `providerKind` values include:
 
 - `custom`
 - `azureOpenai`
@@ -115,9 +122,12 @@ Available provider families in the current schema include:
 
 ## `models`
 
-The `models` section lets you assign different model roles to different runtime jobs.
+The `models` section now has two parts:
 
-Supported roles:
+- `profiles`: unlimited named model profiles
+- `roles`: backward-compatible aliases used by built-in runtime jobs
+
+Supported built-in roles:
 
 - `main`
 - `shadow`
@@ -132,23 +142,30 @@ Example:
 ```json
 {
   "models": {
-    "main": {
-      "providerKind": "openrouter",
-      "model": "anthropic/claude-opus-4-5",
-      "maxTokens": 8192,
-      "temperature": 0.1
+    "profiles": {
+      "opus_main": {
+        "provider": "openrouter_main",
+        "model": "anthropic/claude-opus-4-5",
+        "maxTokens": 8192,
+        "temperature": 0.1
+      },
+      "workflow_fast": {
+        "provider": "openrouter_main",
+        "model": "openai/gpt-4.1-mini",
+        "maxTokens": 1200,
+        "temperature": 0.1
+      },
+      "embed_large": {
+        "provider": "custom_local",
+        "model": "text-embedding-3-large",
+        "dimensions": 3072,
+        "timeoutS": 45
+      }
     },
-    "workflowLight": {
-      "providerKind": "openrouter",
-      "model": "openai/gpt-4.1-mini",
-      "maxTokens": 1200,
-      "temperature": 0.1
-    },
-    "embeddings": {
-      "providerKind": "openai",
-      "model": "text-embedding-3-large",
-      "dimensions": 3072,
-      "timeoutS": 45
+    "roles": {
+      "main": "opus_main",
+      "workflowLight": "workflow_fast",
+      "embeddings": "embed_large"
     }
   }
 }
@@ -160,6 +177,8 @@ Why this matters:
 - `workflowLight` controls the helper model used by `run_workflow`
 - `graphExtract` and `graphNormalize` let you isolate graph-specific costs
 - `embeddings` can point to a separate embedding endpoint from your main chat model
+- profiles can be reused by `moa` presets without changing built-in role aliases
+- old config files with `models.main`, `models.shadow`, and similar fields are migrated automatically on load
 
 ## `tools`
 
@@ -188,6 +207,18 @@ Example:
         "env": {},
         "toolTimeout": 30
       }
+    },
+    "moa": {
+      "defaultPreset": "default",
+      "presets": {
+        "default": {
+          "workerModels": ["opus_main", "workflow_fast"],
+          "judgeModel": "opus_main",
+          "parallelism": 2,
+          "includeReasoning": false,
+          "returnCandidates": true
+        }
+      }
     }
   }
 }
@@ -201,6 +232,17 @@ Key fields:
 - `exec.pathAppend`: additional PATH fragments for shell execution
 - `restrictToWorkspace`: hard restriction for file/shell operations
 - `mcpServers`: stdio, SSE, or streamable HTTP MCP server definitions
+- `moa`: presets for the built-in mixture-of-agents tool
+
+`tools.moa` fields:
+
+- `defaultPreset`: preset used when the tool is called without a preset name
+- `presets[].workerModels`: ordered list of named model profiles queried in parallel
+- `presets[].judgeModel`: named model profile used to pick and synthesize the final answer
+- `presets[].parallelism`: max worker concurrency
+- `presets[].includeReasoning`: include worker reasoning content in the judge payload when available
+- `presets[].returnCandidates`: include raw worker answers in the tool result
+- `presets[].workerMaxTokens`, `presets[].judgeMaxTokens`, `presets[].temperatureOverride`: optional per-preset overrides
 
 ## `channels`
 

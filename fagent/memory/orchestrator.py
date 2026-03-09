@@ -34,6 +34,7 @@ from fagent.prompts import PromptLoader
 if TYPE_CHECKING:
     from fagent.config.schema import Config, MemoryConfig
     from fagent.providers.base import LLMProvider
+    from fagent.providers.factory import ProviderFactory
     from fagent.session.manager import Session
 
 
@@ -47,6 +48,7 @@ class MemoryOrchestrator:
         config: "MemoryConfig | None" = None,
         model: str | None = None,
         app_config: "Config | None" = None,
+        provider_factory: "ProviderFactory | None" = None,
     ):
         from fagent.config.schema import MemoryConfig
 
@@ -54,6 +56,7 @@ class MemoryOrchestrator:
         self.provider = provider
         self.config = config or MemoryConfig()
         self.model = model
+        self.provider_factory = provider_factory
         self.registry = MemoryRegistry(workspace)
         self.policy = MemoryPolicy()
         self.prompts = PromptLoader.from_package()
@@ -61,6 +64,16 @@ class MemoryOrchestrator:
         self.file_store = FileMemoryStore(workspace)
         embedding_role = app_config.resolve_model_role("embeddings") if app_config else None
         shadow_role = app_config.resolve_model_role("shadow", model) if app_config else None
+        shadow_provider = provider
+        auto_summarize_provider = provider
+        if provider_factory and shadow_role and shadow_role.provider_kind not in ("", "inherit"):
+            shadow_provider = provider_factory.build_from_profile(shadow_role)
+        if provider_factory and app_config:
+            auto_role = app_config.resolve_model_role("auto_summarize", model)
+            if auto_role.provider_kind not in ("", "inherit"):
+                auto_summarize_provider = provider_factory.build_from_profile(auto_role)
+        self.shadow_provider = shadow_provider
+        self.auto_summarize_provider = auto_summarize_provider
         self.vector_backend = VectorMemoryBackend(
             workspace,
             collection=self.config.vector.collection,
@@ -76,7 +89,7 @@ class MemoryOrchestrator:
         )
         self.graph_backend = self._build_graph_backend(workspace)
         self.router = MemoryRouter(
-            provider=provider,
+            provider=shadow_provider,
             model=(shadow_role.model if shadow_role else None),
             default_strategy=self.config.router.default_strategy,
             raw_evidence_escalation=self.config.router.raw_evidence_escalation,
@@ -87,7 +100,7 @@ class MemoryOrchestrator:
                 ("vector", self.vector_backend),
                 ("graph", self.graph_backend),
             ],
-            provider=provider,
+            provider=shadow_provider,
             fast_model=(shadow_role.model if shadow_role and shadow_role.model else self.config.shadow_context.fast_model or model),
             max_tokens=self.config.shadow_context.max_tokens,
             prompt_loader=self.prompts,
@@ -853,9 +866,9 @@ class MemoryOrchestrator:
             f"[{msg.get('turn_id','?')}] {msg.get('role','?')}: {str(msg.get('content',''))[:500]}"
             for msg in messages
         )
-        if self.provider and auto_role and auto_role.model:
+        if self.auto_summarize_provider and auto_role and auto_role.model:
             try:
-                response = await self.provider.chat(
+                response = await self.auto_summarize_provider.chat(
                     messages=[
                         {"role": "system", "content": prompt_text},
                         {"role": "user", "content": f"Session: {session_key}\n\n{payload}"},

@@ -89,14 +89,15 @@ Minimal example:
 ```json
 {
   "providers": {
-    "openrouter": {
+    "openrouter_main": {
+      "providerKind": "openrouter",
       "apiKey": "sk-or-v1-xxx"
     }
   },
   "agents": {
     "defaults": {
       "model": "anthropic/claude-opus-4-5",
-      "provider": "openrouter"
+      "provider": "openrouter_main"
     }
   }
 }
@@ -148,6 +149,62 @@ For community links and QR codes, see [COMMUNICATION.md](./COMMUNICATION.md).
 - `fagent channels login`: set up the WhatsApp bridge and QR login flow
 - `fagent auth login --provider ...`: OAuth login for supported providers
 - `fagent memory ...`: inspect and repair memory indexes and retrieval state
+
+## MOA tool
+
+`fagent` now includes a built-in `moa` tool for mixture-of-agents orchestration. The main model can call `moa` explicitly when it wants a stronger answer than one model alone can provide.
+
+`moa` runs the same prompt across multiple named model profiles, then hands the candidate answers to a separate judge model that chooses and synthesizes the final answer. Worker and judge models can live on different provider instances, including multiple accounts or gateways from the same provider family.
+
+Example configuration:
+
+```json
+{
+  "providers": {
+    "openrouter_main": {
+      "providerKind": "openrouter",
+      "apiKey": "sk-or-v1-xxx"
+    },
+    "custom_local": {
+      "providerKind": "custom",
+      "apiKey": "local-key",
+      "apiBase": "http://localhost:8000/v1"
+    }
+  },
+  "models": {
+    "profiles": {
+      "opus_main": {
+        "provider": "openrouter_main",
+        "model": "anthropic/claude-opus-4-5"
+      },
+      "gemini_fast": {
+        "provider": "openrouter_main",
+        "model": "google/gemini-2.5-pro"
+      },
+      "local_reasoner": {
+        "provider": "custom_local",
+        "model": "gpt-5.4"
+      }
+    },
+    "roles": {
+      "main": "opus_main"
+    }
+  },
+  "tools": {
+    "moa": {
+      "defaultPreset": "default",
+      "presets": {
+        "default": {
+          "workerModels": ["opus_main", "gemini_fast", "local_reasoner"],
+          "judgeModel": "opus_main",
+          "parallelism": 3,
+          "returnCandidates": true
+        }
+      }
+    }
+  }
+}
+```
 
 ## Why fagent over bigger agent stacks
 
