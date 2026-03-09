@@ -6,10 +6,8 @@
   <h1>fagent: Lightning-Fast Personal AI Assistant</h1>
   <p>
     <a href="https://pypi.org/project/fagent-ai/"><img src="https://img.shields.io/pypi/v/fagent-ai" alt="PyPI"></a>
-    <a href="https://pepy.tech/project/fagent-ai"><img src="https://static.pepy.tech/badge/fagent-ai" alt="Downloads"></a>
     <img src="https://img.shields.io/badge/python-%E2%89%A53.11-blue" alt="Python">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
-    <a href="./COMMUNICATION.md"><img src="https://img.shields.io/badge/Community-Chat-5865F2" alt="Community"></a>
   </p>
 </div>
 
