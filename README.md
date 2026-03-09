@@ -18,7 +18,9 @@
 ## Deep dives
 
 - [Why fagent wins for focused agent work](./WHY_FAGENT.md)
+- [Russian: why fagent wins](./WHY_FAGENT.ru.md)
 - [Full configuration reference](./CONFIGURATION.md)
+- [Russian: configuration reference](./CONFIGURATION.ru.md)
 
 ## Built on nanobot
 
@@ -50,12 +52,10 @@ A lightweight agent runtime with CLI, channels, tools, memory, and background au
 
 ## Install
 
-### Clone with GitHub CLI
-
-`gh` is already enough here. Clone the repo directly:
+### Clone from GitHub
 
 ```bash
-gh repo clone HKUDS/fagent
+git clone https://github.com/fresed05/fagent.git
 cd fagent
 pip install -e .
 ```

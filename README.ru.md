@@ -11,7 +11,9 @@
 ## Дополнительная документация
 
 - [Почему `fagent` выигрывает в практической работе](./WHY_FAGENT.md)
+- [Русская версия сравнения и преимуществ](./WHY_FAGENT.ru.md)
 - [Полная настройка конфига](./CONFIGURATION.md)
+- [Русская версия настройки конфига](./CONFIGURATION.ru.md)
 
 ## Основа проекта
 
@@ -43,12 +45,10 @@
 
 ## Установка
 
-### Клонирование через GitHub CLI
-
-`gh` уже установлен и авторизация выполнена, поэтому достаточно:
+### Клонирование с GitHub
 
 ```bash
-gh repo clone HKUDS/fagent
+git clone https://github.com/fresed05/fagent.git
 cd fagent
 pip install -e .
 ```
