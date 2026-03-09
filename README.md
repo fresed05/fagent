@@ -15,6 +15,11 @@
 
 `fagent` is a lightweight AI assistant framework for terminal use, chat apps, automation, memory, and tool-driven workflows.
 
+## Deep dives
+
+- [Why fagent wins for focused agent work](./WHY_FAGENT.md)
+- [Full configuration reference](./CONFIGURATION.md)
+
 ## Built on nanobot
 
 This project is based on [nanobot](https://github.com/HKUDS/nanobot), which originally established the lightweight agent architecture, packaging shape, and multi-channel runtime model used here.
@@ -143,6 +148,14 @@ For community links and QR codes, see [COMMUNICATION.md](./COMMUNICATION.md).
 - `fagent channels login`: set up the WhatsApp bridge and QR login flow
 - `fagent auth login --provider ...`: OAuth login for supported providers
 - `fagent memory ...`: inspect and repair memory indexes and retrieval state
+
+## Why fagent over bigger agent stacks
+
+For the detailed version, see [WHY_FAGENT.md](./WHY_FAGENT.md).
+
+- `fagent` is easier to deploy and reason about than larger agent platforms such as [OpenClaw](https://github.com/openclaw/openclaw) because it stays centered on one Python runtime, one config tree, and one workspace model.
+- The memory system is not just "chat history". It combines file memory, vector retrieval, graph relationships, workflow snapshots, task graph state, experience patterns, and a shadow-context compression pass before the main model runs.
+- The built-in workflow tool can execute ordered tool chains and use a lighter helper model for repair/recovery, so the main model does not need to burn full-context tokens on every small operational correction.
 
 ## Development
 

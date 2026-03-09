@@ -8,6 +8,11 @@
 
 `fagent` — это лёгкий фреймворк персонального AI-ассистента для CLI, чатов, автоматизации, памяти и tool-driven workflow.
 
+## Дополнительная документация
+
+- [Почему `fagent` выигрывает в практической работе](./WHY_FAGENT.md)
+- [Полная настройка конфига](./CONFIGURATION.md)
+
 ## Основа проекта
 
 Проект основан на [nanobot](https://github.com/HKUDS/nanobot). Именно nanobot дал базовую лёгкую архитектуру агента, многоканальную модель рантайма и упаковку, на которой построен `fagent`.
@@ -134,6 +139,14 @@ fagent status
 - `fagent channels login`
 - `fagent auth login --provider ...`
 - `fagent memory ...`
+
+## Почему `fagent` часто удобнее крупных агентных стеков
+
+Подробная версия вынесена в [WHY_FAGENT.md](./WHY_FAGENT.md).
+
+- `fagent` проще разворачивать и поддерживать, чем более тяжёлые платформы вроде [OpenClaw](https://github.com/openclaw/openclaw), потому что здесь один понятный Python runtime, один конфиг и одна рабочая модель workspace.
+- Память здесь — это не только история сообщений. Используются file memory, vector retrieval, graph memory, workflow snapshots, task graph, experience patterns и shadow-context сжатие перед основным вызовом модели.
+- Встроенный workflow tool умеет выполнять последовательность шагов и подключать более лёгкую модель для локального ремонта шага, не тратя основной контекст на каждую мелкую ошибку.
 
 ## Разработка
 
