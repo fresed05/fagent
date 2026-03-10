@@ -30,6 +30,34 @@ class MemoryRegistry:
         conn.row_factory = sqlite3.Row
         return conn
 
+    @staticmethod
+    def _column_names(conn: sqlite3.Connection, table_name: str) -> set[str]:
+        return {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+
+    @staticmethod
+    def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _ensure_columns(
+        conn: sqlite3.Connection,
+        table_name: str,
+        column_defs: dict[str, str],
+    ) -> set[str]:
+        columns = MemoryRegistry._column_names(conn, table_name)
+        for column_name, definition in column_defs.items():
+            if column_name not in columns:
+                conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+                columns.add(column_name)
+        return columns
+
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.executescript(
@@ -169,67 +197,70 @@ class MemoryRegistry:
                     source_refs_json TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                """
+            )
+            artifact_columns = self._ensure_columns(
+                conn,
+                "artifacts",
+                {
+                "session_key": "TEXT NOT NULL DEFAULT ''",
+                "turn_id": "TEXT NOT NULL DEFAULT ''",
+                "channel": "TEXT NOT NULL DEFAULT ''",
+                "chat_id": "TEXT NOT NULL DEFAULT ''",
+                "search_text": "TEXT NOT NULL DEFAULT ''",
+                },
+            )
+            if self._table_exists(conn, "graph_jobs"):
+                self._ensure_columns(
+                    conn,
+                    "graph_jobs",
+                    {"error": "TEXT NOT NULL DEFAULT ''"},
+                )
+            conn.executescript(
+                """
                 CREATE INDEX IF NOT EXISTS idx_artifacts_type_created_at ON artifacts(type, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_artifacts_session_type_created_at ON artifacts(session_key, type, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_artifacts_session_created_at ON artifacts(session_key, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_post_turn_jobs_episode ON post_turn_jobs(episode_id, updated_at DESC);
                 """
             )
-            artifact_columns = {
-                row["name"]
-                for row in conn.execute("PRAGMA table_info(artifacts)").fetchall()
-            }
-            artifact_column_defs = {
-                "session_key": "TEXT NOT NULL DEFAULT ''",
-                "turn_id": "TEXT NOT NULL DEFAULT ''",
-                "channel": "TEXT NOT NULL DEFAULT ''",
-                "chat_id": "TEXT NOT NULL DEFAULT ''",
-                "search_text": "TEXT NOT NULL DEFAULT ''",
-            }
-            for column_name, definition in artifact_column_defs.items():
-                if column_name not in artifact_columns:
-                    conn.execute(f"ALTER TABLE artifacts ADD COLUMN {column_name} {definition}")
-            columns = {
-                row["name"]
-                for row in conn.execute("PRAGMA table_info(graph_jobs)").fetchall()
-            }
-            if "error" not in columns:
-                conn.execute("ALTER TABLE graph_jobs ADD COLUMN error TEXT NOT NULL DEFAULT ''")
-            rows = conn.execute(
-                """
-                SELECT id, type, content, summary, metadata_json
-                FROM artifacts
-                WHERE session_key = '' OR turn_id = '' OR channel = '' OR chat_id = '' OR search_text = ''
-                """
-            ).fetchall()
-            if rows:
-                conn.executemany(
+            required_backfill_columns = {"session_key", "turn_id", "channel", "chat_id", "search_text"}
+            if required_backfill_columns.issubset(artifact_columns):
+                rows = conn.execute(
                     """
-                    UPDATE artifacts
-                    SET session_key = ?,
-                        turn_id = ?,
-                        channel = ?,
-                        chat_id = ?,
-                        search_text = ?
-                    WHERE id = ?
-                    """,
-                    [
-                        (
-                            str((metadata := json.loads(row["metadata_json"] or "{}")).get("session_key") or ""),
-                            str(metadata.get("turn_id") or ""),
-                            str(metadata.get("channel") or ""),
-                            str(metadata.get("chat_id") or ""),
-                            self._artifact_search_text(
-                                str(row["content"] or ""),
-                                str(row["summary"] or ""),
-                                metadata,
-                                str(row["type"] or ""),
-                            ),
-                            str(row["id"]),
-                        )
-                        for row in rows
-                    ],
-                )
+                    SELECT id, type, content, summary, metadata_json
+                    FROM artifacts
+                    WHERE session_key = '' OR turn_id = '' OR channel = '' OR chat_id = '' OR search_text = ''
+                    """
+                ).fetchall()
+                if rows:
+                    conn.executemany(
+                        """
+                        UPDATE artifacts
+                        SET session_key = ?,
+                            turn_id = ?,
+                            channel = ?,
+                            chat_id = ?,
+                            search_text = ?
+                        WHERE id = ?
+                        """,
+                        [
+                            (
+                                str((metadata := json.loads(row["metadata_json"] or "{}")).get("session_key") or ""),
+                                str(metadata.get("turn_id") or ""),
+                                str(metadata.get("channel") or ""),
+                                str(metadata.get("chat_id") or ""),
+                                self._artifact_search_text(
+                                    str(row["content"] or ""),
+                                    str(row["summary"] or ""),
+                                    metadata,
+                                    str(row["type"] or ""),
+                                ),
+                                str(row["id"]),
+                            )
+                            for row in rows
+                        ],
+                    )
 
     @staticmethod
     def _artifact_search_text(
