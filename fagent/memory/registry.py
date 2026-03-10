@@ -88,6 +88,7 @@ class MemoryRegistry:
                     attempts INTEGER NOT NULL DEFAULT 0,
                     prompt_version TEXT NOT NULL,
                     model_role TEXT NOT NULL,
+                    error TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS task_nodes (
@@ -145,6 +146,12 @@ class MemoryRegistry:
                 );
                 """
             )
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(graph_jobs)").fetchall()
+            }
+            if "error" not in columns:
+                conn.execute("ALTER TABLE graph_jobs ADD COLUMN error TEXT NOT NULL DEFAULT ''")
 
     def upsert_artifact(self, artifact: MemoryArtifact) -> None:
         with self._connect() as conn:
@@ -530,14 +537,15 @@ class MemoryRegistry:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO graph_jobs(job_id, episode_id, summary, status, attempts, prompt_version, model_role)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO graph_jobs(job_id, episode_id, summary, status, attempts, prompt_version, model_role, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
                     summary=excluded.summary,
                     status=excluded.status,
                     attempts=excluded.attempts,
                     prompt_version=excluded.prompt_version,
                     model_role=excluded.model_role,
+                    error=excluded.error,
                     updated_at=CURRENT_TIMESTAMP
                 """,
                 (
@@ -548,6 +556,7 @@ class MemoryRegistry:
                     job.attempts,
                     job.prompt_version,
                     job.model_role,
+                    job.error,
                 ),
             )
 
@@ -572,6 +581,7 @@ class MemoryRegistry:
             attempts=row["attempts"],
             prompt_version=row["prompt_version"],
             model_role=row["model_role"],
+            error=row["error"] if "error" in row.keys() else "",
         )
 
     def upsert_task_node(self, node: TaskNode, metadata: dict[str, Any] | None = None) -> None:

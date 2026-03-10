@@ -46,7 +46,7 @@ def test_graph_ui_server_serves_static_and_api(tmp_path: Path) -> None:
             body = response.read().decode("utf-8")
         with urlopen(f"{url}assets/styles.css", timeout=5) as response:  # noqa: S310
             css = response.read().decode("utf-8")
-        payload = _http_json("GET", f"{url}api/graph")
+        payload = _http_json("GET", f"{url}api/graph?query=node")
         node_payload = _http_json("GET", f"{url}api/graph/node/node%3Aa")
         layout_payload = _http_json(
             "POST",
@@ -59,6 +59,21 @@ def test_graph_ui_server_serves_static_and_api(tmp_path: Path) -> None:
         assert any(item["id"] == "node:a" for item in payload["nodes"])
         assert node_payload["id"] == "node:a"
         assert layout_payload["saved"] == 1
+    finally:
+        manager.stop()
+
+
+def test_graph_ui_api_requires_scope_for_default_snapshot(tmp_path: Path) -> None:
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="stub")
+    orchestrator.upsert_graph_node(node_id="entity:test", label="Test", metadata={"kind": "entity"})
+    manager = get_graph_ui_manager(tmp_path)
+    url = manager.start(orchestrator, open_browser=False)
+
+    try:
+        payload = _http_json("GET", f"{url}api/graph")
+        assert payload["nodes"] == []
+        assert payload["edges"] == []
+        assert "session or query" in payload["message"].lower()
     finally:
         manager.stop()
 

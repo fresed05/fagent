@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from pathlib import Path
 from typing import Any
 
@@ -17,13 +16,107 @@ from fagent.prompts import PromptLoader
 from fagent.providers.base import LLMProvider
 
 
-class LocalGraphBackend:
-    """SQLite-backed graph memory with optional LLM extraction and normalization."""
+_GRAPH_AGENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_graph",
+            "description": "Search existing graph nodes before creating new ones.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 8, "default": 5},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_graph_node",
+            "description": "Read one existing graph node and its nearby edges.",
+            "parameters": {
+                "type": "object",
+                "properties": {"node_id": {"type": "string"}},
+                "required": ["node_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_entity",
+            "description": "Stage one durable entity node. Never create generic filler words.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entity_id": {"type": "string"},
+                    "label": {"type": "string"},
+                    "kind": {"type": "string"},
+                    "aliases": {"type": "array", "items": {"type": "string"}},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+                "required": ["label", "kind"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_fact",
+            "description": "Stage one durable fact node tied to an entity or episode subject.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fact_id": {"type": "string"},
+                    "statement": {"type": "string"},
+                    "subject_id": {"type": "string"},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "supersedes": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["statement"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_relation",
+            "description": "Stage one directed relation between existing or staged nodes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_id": {"type": "string"},
+                    "target_id": {"type": "string"},
+                    "relation": {"type": "string"},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+                "required": ["source_id", "target_id", "relation"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finish_graph_plan",
+            "description": "Finish extraction after all durable updates have been staged.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["reason"],
+            },
+        },
+    },
+]
 
-    _STOPWORDS = {
-        "the", "and", "for", "with", "that", "this", "from", "into", "about", "what",
-        "как", "что", "это", "для", "или", "ещё", "еще", "чтобы", "после", "пока",
-    }
+
+class LocalGraphBackend:
+    """SQLite-backed graph memory with tool-driven LLM extraction."""
 
     def __init__(
         self,
@@ -61,29 +154,37 @@ class LocalGraphBackend:
     async def ingest_episode_async(self, episode: EpisodeRecord) -> None:
         summary = self.policy.build_summary(episode)
         extractor_prompt = self.prompt_loader.load("system/memory-extractor.md")
-        normalizer_prompt = self.prompt_loader.load("system/graph-normalizer.md")
+        previous_job = self.registry.get_graph_job(episode.episode_id)
         job = GraphExtractionJob(
             job_id=f"graph-{episode.episode_id}",
             episode_id=episode.episode_id,
             summary=summary,
             status="running",
-            attempts=(self.registry.get_graph_job(episode.episode_id).attempts + 1) if self.registry.get_graph_job(episode.episode_id) else 1,
-            prompt_version=f"{extractor_prompt.version}:{normalizer_prompt.version}",
+            attempts=(previous_job.attempts + 1) if previous_job else 1,
+            prompt_version=extractor_prompt.version,
             model_role="graph_extract",
+            error="",
         )
         self.registry.upsert_graph_job(job)
+
+        if self.provider is None or not self.extract_model:
+            job.status = "skipped"
+            job.error = "graph_extract_unavailable"
+            self.registry.upsert_graph_job(job)
+            return
+
         try:
-            extraction = await self._extract_with_llm(episode, summary, extractor_prompt.text, normalizer_prompt.text)
-            if extraction is None:
-                extraction = self._extract_fallback(episode, summary)
-            self._persist_graph(episode, summary, extraction)
+            extraction = await self._extract_with_llm(episode, summary, extractor_prompt.text)
+            if extraction is not None:
+                self._persist_graph(episode, summary, extraction)
             job.status = "done"
+            job.error = ""
             self.registry.upsert_graph_job(job)
         except Exception as exc:
             logger.warning("Graph extraction failed for {}: {}", episode.episode_id, exc)
             job.status = "retry"
+            job.error = str(exc)[:500]
             self.registry.upsert_graph_job(job)
-            self._persist_graph(episode, summary, self._extract_fallback(episode, summary))
 
     def ingest_episode(self, episode: EpisodeRecord) -> None:
         """Sync compatibility wrapper."""
@@ -105,102 +206,199 @@ class LocalGraphBackend:
         episode: EpisodeRecord,
         summary: str,
         extractor_prompt: str,
-        normalizer_prompt: str,
     ) -> dict[str, Any] | None:
-        if self.provider is None or not self.extract_model:
-            return None
-        response = await self.provider.chat(
-            messages=[
-                {"role": "system", "content": extractor_prompt},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Episode ID: {episode.episode_id}\n"
-                        f"Session: {episode.session_key}\n"
-                        f"Summary: {summary}\n\n"
-                        f"Episode:\n{episode.content}\n\n"
-                        "Return JSON only."
-                    ),
-                },
-            ],
-            model=self.extract_model,
-            temperature=0.0,
-            max_tokens=1200,
-        )
-        if not response.content:
-            return None
-        data = self._extract_json(response.content)
-        if self.provider is None or not self.normalize_model:
-            return data
-        normalized = await self.provider.chat(
-            messages=[
-                {"role": "system", "content": normalizer_prompt},
-                {"role": "user", "content": json.dumps(data, ensure_ascii=False)},
-            ],
-            model=self.normalize_model,
-            temperature=0.0,
-            max_tokens=1200,
-        )
-        return self._extract_json(normalized.content) if normalized.content else data
+        assert self.provider is not None
+        assert self.extract_model
 
-    def _extract_json(self, content: str) -> dict[str, Any]:
-        match = re.search(r"\{[\s\S]*\}", content)
-        if not match:
-            raise ValueError("No JSON object found in graph extraction response")
-        return json.loads(match.group(0))
-
-    def _extract_fallback(self, episode: EpisodeRecord, summary: str) -> dict[str, Any]:
-        text = f"{episode.user_text}\n{episode.assistant_text}"
-        entities: list[dict[str, Any]] = []
-        facts: list[dict[str, Any]] = []
-        relations: list[dict[str, Any]] = []
-
-        for raw in re.findall(r"[A-Za-zА-Яа-я0-9_.-]{3,}", text):
-            token = raw.strip(".,:;!?()[]{}\"'").lower()
-            if token in self._STOPWORDS or token.isdigit():
-                continue
-            entities.append(
-                {
-                    "id": f"entity:{token}",
-                    "name": token,
-                    "kind": "concept",
-                    "aliases": [raw],
-                    "confidence": 0.45,
-                }
-            )
-        seen = set()
-        deduped_entities = []
-        for item in entities:
-            if item["id"] in seen:
-                continue
-            seen.add(item["id"])
-            deduped_entities.append(item)
-
-        if deduped_entities:
-            primary = deduped_entities[0]
-            facts.append(
-                {
-                    "id": f"fact:{episode.episode_id}:summary",
-                    "statement": summary,
-                    "subject": primary["id"],
-                    "confidence": 0.55,
-                    "supersedes": [],
-                }
-            )
-        for left, right in zip(deduped_entities, deduped_entities[1:]):
-            relations.append(
-                {
-                    "source": left["id"],
-                    "target": right["id"],
-                    "type": "relates_to",
-                    "confidence": 0.4,
-                }
-            )
-        return {
+        stage: dict[str, Any] = {
             "summary": summary,
-            "entities": deduped_entities[:12],
-            "facts": facts,
-            "relations": relations[:24],
+            "reason": "",
+            "entities": {},
+            "facts": {},
+            "relations": [],
+        }
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": extractor_prompt},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "episode_id": episode.episode_id,
+                        "session_key": episode.session_key,
+                        "turn_id": episode.turn_id,
+                        "summary": summary,
+                        "user_text": episode.user_text,
+                        "assistant_text": episode.assistant_text,
+                        "tool_trace": episode.tool_trace,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+
+        for _ in range(5):
+            response = await self.provider.chat(
+                messages=messages,
+                tools=_GRAPH_AGENT_TOOLS,
+                model=self.extract_model,
+                temperature=0.0,
+                max_tokens=900,
+            )
+            assistant_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": response.content,
+            }
+            if response.has_tool_calls:
+                assistant_message["tool_calls"] = [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                        },
+                    }
+                    for call in response.tool_calls
+                ]
+            messages.append(assistant_message)
+
+            if not response.has_tool_calls:
+                raise ValueError("graph_agent_no_tool_calls")
+
+            finished = False
+            for call in response.tool_calls:
+                result, finished = self._run_graph_tool(call.name, call.arguments, stage)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "name": call.name,
+                        "content": json.dumps(result, ensure_ascii=False),
+                    }
+                )
+            if finished:
+                return self._finalize_graph_stage(stage)
+
+        if stage["entities"] or stage["facts"] or stage["relations"]:
+            return self._finalize_graph_stage(stage)
+        raise ValueError("graph_agent_exceeded_tool_budget")
+
+    def _run_graph_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        stage: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        if name == "search_graph":
+            query = str(arguments.get("query", "")).strip()
+            limit = max(1, min(8, int(arguments.get("limit", 5) or 5)))
+            rows = self.registry.find_graph_nodes(query, limit=limit) if query else []
+            return {
+                "matches": [
+                    {
+                        "id": str(row["id"]),
+                        "label": str(row["label"]),
+                        "metadata": json.loads(row["metadata_json"]) if row["metadata_json"] else {},
+                    }
+                    for row in rows
+                ]
+            }, False
+
+        if name == "read_graph_node":
+            node_id = str(arguments.get("node_id", "")).strip()
+            row = self.registry.get_graph_node(node_id)
+            if row is None:
+                return {"found": False, "node_id": node_id}, False
+            edges = self.registry.get_graph_edges_for_node(node_id, limit=12)
+            return {
+                "found": True,
+                "node": {
+                    "id": str(row["id"]),
+                    "label": str(row["label"]),
+                    "metadata": json.loads(row["metadata_json"]) if row["metadata_json"] else {},
+                },
+                "edges": [
+                    {
+                        "source_id": str(edge["source_id"]),
+                        "target_id": str(edge["target_id"]),
+                        "relation": str(edge["relation"]),
+                        "weight": float(edge["weight"]),
+                    }
+                    for edge in edges
+                ],
+            }, False
+
+        if name == "create_entity":
+            label = str(arguments.get("label", "")).strip()
+            kind = str(arguments.get("kind", "")).strip() or "entity"
+            if not label:
+                return {"ok": False, "error": "label_required"}, False
+            entity_id = str(arguments.get("entity_id") or f"entity:{self._slug(label)}")
+            aliases = [str(item).strip() for item in (arguments.get("aliases") or []) if str(item).strip()]
+            stage["entities"][entity_id] = {
+                "id": entity_id,
+                "name": label,
+                "kind": kind,
+                "aliases": aliases,
+                "confidence": float(arguments.get("confidence", 0.7) or 0.7),
+            }
+            return {"ok": True, "entity_id": entity_id}, False
+
+        if name == "create_fact":
+            statement = str(arguments.get("statement", "")).strip()
+            if not statement:
+                return {"ok": False, "error": "statement_required"}, False
+            fact_id = str(arguments.get("fact_id") or f"fact:{self._slug(statement)}")
+            stage["facts"][fact_id] = {
+                "id": fact_id,
+                "statement": statement,
+                "subject": str(arguments.get("subject_id") or ""),
+                "confidence": float(arguments.get("confidence", 0.8) or 0.8),
+                "supersedes": [str(item).strip() for item in (arguments.get("supersedes") or []) if str(item).strip()],
+            }
+            return {"ok": True, "fact_id": fact_id}, False
+
+        if name == "create_relation":
+            source_id = str(arguments.get("source_id", "")).strip()
+            target_id = str(arguments.get("target_id", "")).strip()
+            relation = str(arguments.get("relation", "")).strip()
+            if not source_id or not target_id or not relation:
+                return {"ok": False, "error": "source_target_relation_required"}, False
+            relation_item = {
+                "source": source_id,
+                "target": target_id,
+                "type": relation,
+                "confidence": float(arguments.get("confidence", 0.75) or 0.75),
+            }
+            if relation_item not in stage["relations"]:
+                stage["relations"].append(relation_item)
+            return {"ok": True}, False
+
+        if name == "finish_graph_plan":
+            stage["reason"] = str(arguments.get("reason", "")).strip()
+            if arguments.get("summary"):
+                stage["summary"] = str(arguments["summary"])
+            return {
+                "ok": True,
+                "reason": stage["reason"],
+                "entities": len(stage["entities"]),
+                "facts": len(stage["facts"]),
+                "relations": len(stage["relations"]),
+            }, True
+
+        return {"ok": False, "error": f"unknown_tool:{name}"}, False
+
+    def _finalize_graph_stage(self, stage: dict[str, Any]) -> dict[str, Any] | None:
+        entities = list(stage["entities"].values())
+        facts = list(stage["facts"].values())
+        relations = list(stage["relations"])
+        if not entities and not facts and not relations:
+            return None
+        return {
+            "summary": str(stage.get("summary") or ""),
+            "entities": entities[:12],
+            "facts": facts[:8],
+            "relations": relations[:16],
         }
 
     def _persist_graph(self, episode: EpisodeRecord, summary: str, extraction: dict[str, Any]) -> None:
@@ -215,30 +413,35 @@ class LocalGraphBackend:
                 "episode_id": episode.episode_id,
                 "turn_id": episode.turn_id,
                 "timestamp": episode.timestamp,
+                "source": "llm_graph_agent",
             },
         )
+
         entities = extraction.get("entities") or []
         facts = extraction.get("facts") or []
         relations = extraction.get("relations") or []
+
         for entity in entities:
             entity_id = str(entity.get("id") or f"entity:{self._slug(entity.get('name', 'unknown'))}")
             label = str(entity.get("name") or entity_id)
             metadata = {
                 "kind": entity.get("kind", "entity"),
                 "aliases": entity.get("aliases", []),
-                "confidence": entity.get("confidence", 0.5),
+                "confidence": entity.get("confidence", 0.7),
                 "provenance_episode": episode.episode_id,
+                "source": "llm_graph_agent",
             }
             self.registry.upsert_graph_node(entity_id, label=label, metadata=metadata)
             self.registry.upsert_graph_edge(
                 episode_node,
                 entity_id,
                 relation="mentions",
-                weight=float(entity.get("confidence", 0.5)),
+                weight=float(entity.get("confidence", 0.7)),
                 metadata={"episode_id": episode.episode_id, "source": "entity"},
             )
+
         for fact in facts:
-            fact_id = str(fact.get("id") or f"fact:{episode.episode_id}:{self._slug(fact.get('statement', 'fact'))}")
+            fact_id = str(fact.get("id") or f"fact:{self._slug(fact.get('statement', 'fact'))}")
             statement = str(fact.get("statement") or summary)
             self.registry.upsert_graph_node(
                 fact_id,
@@ -246,9 +449,10 @@ class LocalGraphBackend:
                 metadata={
                     "kind": "fact",
                     "statement": statement,
-                    "confidence": fact.get("confidence", 0.6),
+                    "confidence": fact.get("confidence", 0.8),
                     "provenance_episode": episode.episode_id,
                     "supersedes": fact.get("supersedes", []),
+                    "source": "llm_graph_agent",
                 },
             )
             subject = str(fact.get("subject") or episode_node)
@@ -256,14 +460,14 @@ class LocalGraphBackend:
                 subject,
                 fact_id,
                 relation="decided",
-                weight=float(fact.get("confidence", 0.6)),
+                weight=float(fact.get("confidence", 0.8)),
                 metadata={"episode_id": episode.episode_id},
             )
             self.registry.upsert_graph_edge(
                 episode_node,
                 fact_id,
                 relation="mentions",
-                weight=float(fact.get("confidence", 0.6)),
+                weight=float(fact.get("confidence", 0.8)),
                 metadata={"episode_id": episode.episode_id},
             )
             for superseded in fact.get("supersedes", []):
@@ -274,12 +478,13 @@ class LocalGraphBackend:
                     weight=1.0,
                     metadata={"episode_id": episode.episode_id, "superseded": True},
                 )
+
         for relation in relations:
             self.registry.upsert_graph_edge(
                 str(relation.get("source") or episode_node),
                 str(relation.get("target") or episode_node),
                 relation=str(relation.get("type") or "relates_to"),
-                weight=float(relation.get("confidence", 0.5)),
+                weight=float(relation.get("confidence", 0.75)),
                 metadata={"episode_id": episode.episode_id, "source": "relation"},
             )
 

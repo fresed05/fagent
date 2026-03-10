@@ -642,8 +642,23 @@ class MemoryOrchestrator:
         node_limit: int = 200,
         edge_limit: int = 400,
     ) -> dict[str, object]:
+        if not query and not session_key:
+            return {
+                "nodes": [],
+                "edges": [],
+                "message": "Provide a session or query to load graph data.",
+            }
         node_ids = self.registry.recent_graph_node_ids_for_session(session_key, limit=node_limit) if session_key else None
-        nodes = self.registry.list_graph_nodes(query=query, node_ids=node_ids, limit=node_limit)
+        raw_nodes = self.registry.list_graph_nodes(query=query, node_ids=node_ids, limit=node_limit)
+        nodes = []
+        for row in raw_nodes:
+            metadata = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
+            kind = str(metadata.get("kind") or "")
+            confidence = float(metadata.get("confidence", 1.0) or 1.0)
+            aliases = metadata.get("aliases") or []
+            if not query and kind == "concept" and confidence <= 0.5 and len(aliases) <= 1:
+                continue
+            nodes.append(row)
         resolved_ids = [str(row["id"]) for row in nodes]
         edges = self.registry.list_graph_edges(node_ids=resolved_ids if resolved_ids else node_ids, limit=edge_limit)
         layouts = self.registry.load_graph_layouts(resolved_ids)
@@ -677,6 +692,7 @@ class MemoryOrchestrator:
                 }
                 for row in edges
             ],
+            "message": "" if resolved_ids else "No graph items matched the current scope.",
         }
 
     def _sync_graph_node(self, node_id: str) -> list[str]:

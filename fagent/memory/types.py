@@ -153,6 +153,7 @@ class GraphExtractionJob:
     attempts: int
     prompt_version: str
     model_role: str
+    error: str = ""
 
 
 @dataclass(slots=True)

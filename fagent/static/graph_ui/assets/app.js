@@ -237,9 +237,11 @@ async function loadGraph() {
   network.fit({ animation: { duration: 550, easingFunction: "easeInOutQuad" } });
   renderGraphSummary(payload);
   setStatus(
-    payload.nodes.length
-      ? "Graph loaded. Select a node to inspect details or expand its neighborhood."
-      : "No graph items matched. Try a broader query or create a new node."
+    payload.message || (
+      payload.nodes.length
+        ? "Graph loaded. Select a node to inspect details or expand its neighborhood."
+        : "No graph items matched. Try a broader query or create a new node."
+    )
   );
 }
 
@@ -457,4 +459,9 @@ edgeForm.addEventListener("submit", async (event) => {
 });
 
 renderInspectorEmpty();
-loadGraph().catch(showError);
+if (queryInput.value.trim() || sessionInput.value.trim()) {
+  loadGraph().catch(showError);
+} else {
+  updateStats({ nodes: [], edges: [] });
+  setStatus("Use /graph inside a session or enter a query before loading the graph.");
+}
