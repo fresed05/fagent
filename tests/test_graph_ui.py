@@ -47,6 +47,9 @@ def test_graph_ui_server_serves_static_and_api(tmp_path: Path) -> None:
         with urlopen(f"{url}assets/styles.css", timeout=5) as response:  # noqa: S310
             css = response.read().decode("utf-8")
         payload = _http_json("GET", f"{url}api/graph?query=node")
+        overview_payload = _http_json("GET", f"{url}api/graph/overview?query=node")
+        focus_payload = _http_json("GET", f"{url}api/graph/focus/node%3Aa?query=node")
+        details_payload = _http_json("GET", f"{url}api/graph/details/node%3Aa?query=node")
         node_payload = _http_json("GET", f"{url}api/graph/node/node%3Aa")
         layout_payload = _http_json(
             "POST",
@@ -55,7 +58,13 @@ def test_graph_ui_server_serves_static_and_api(tmp_path: Path) -> None:
         )
 
         assert "fagent graph" in body
-        assert ".masthead" in css
+        assert ".topbar" in css
+        assert payload["view"] == "overview"
+        assert overview_payload["view"] == "overview"
+        assert focus_payload["view"] == "focus"
+        assert focus_payload["selected_id"] == "node:a"
+        assert details_payload["view"] == "details"
+        assert details_payload["selected_id"] == "node:a"
         assert any(item["id"] == "node:a" for item in payload["nodes"])
         assert node_payload["id"] == "node:a"
         assert layout_payload["saved"] == 1
@@ -73,6 +82,7 @@ def test_graph_ui_api_requires_scope_for_default_snapshot(tmp_path: Path) -> Non
         payload = _http_json("GET", f"{url}api/graph")
         assert payload["nodes"] == []
         assert payload["edges"] == []
+        assert payload["view"] == "overview"
         assert "session or query" in payload["message"].lower()
     finally:
         manager.stop()
@@ -131,6 +141,34 @@ def test_graph_ui_clustered_mode_collapses_dense_hub_neighbors(tmp_path: Path) -
     assert payload["hidden_node_count"] >= 5
     assert payload["clusters"]
     assert any(node["metadata"].get("is_cluster") for node in payload["nodes"])
+
+
+def test_graph_ui_focus_and_details_support_cluster_nodes(tmp_path: Path) -> None:
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="stub")
+    orchestrator.upsert_graph_node(node_id="hub:root", label="Hub", metadata={"kind": "entity"})
+    for index in range(8):
+        node_id = f"fact:{index}"
+        orchestrator.upsert_graph_node(node_id=node_id, label=f"Fact {index}", metadata={"kind": "fact"})
+        orchestrator.upsert_graph_edge(
+            source_id="hub:root",
+            target_id=node_id,
+            relation="supports",
+            weight=1.0,
+            metadata={"source": "test"},
+        )
+
+    overview = orchestrator.export_graph_overview(query=":", mode="global-clustered")
+    cluster_id = next(item["id"] for item in overview["clusters"])
+
+    focus = orchestrator.export_graph_focus(cluster_id, query=":")
+    details = orchestrator.export_graph_details(cluster_id, query=":")
+
+    assert focus["view"] == "focus"
+    assert focus["selected_kind"] == "cluster"
+    assert focus["summary"]["cluster_size"] >= 5
+    assert details["view"] == "details"
+    assert details["kind"] == "cluster"
+    assert "cluster_bridge_targets" in details["metadata"]
 
 
 def test_graph_ui_raw_mode_falls_back_to_clustered_when_graph_is_too_large(tmp_path: Path) -> None:

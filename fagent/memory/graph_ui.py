@@ -62,11 +62,45 @@ class GraphUiRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/graph":
             params = parse_qs(parsed.query)
-            payload = self.graph_server.orchestrator.export_graph_subgraph(
+            payload = self.graph_server.orchestrator.export_graph_overview(
                 query=_first(params.get("query")),
                 session_key=_first(params.get("session")),
                 mode=_first(params.get("mode")) or "global-clustered",
-                focus_node=_first(params.get("focus_node")),
+                node_limit=_int_or_default(_first(params.get("node_limit")), 200),
+                edge_limit=_int_or_default(_first(params.get("edge_limit")), 400),
+            )
+            self._send_json(payload)
+            return
+        if parsed.path == "/api/graph/overview":
+            params = parse_qs(parsed.query)
+            payload = self.graph_server.orchestrator.export_graph_overview(
+                query=_first(params.get("query")),
+                session_key=_first(params.get("session")),
+                mode=_first(params.get("mode")) or "global-clustered",
+                node_limit=_int_or_default(_first(params.get("node_limit")), 200),
+                edge_limit=_int_or_default(_first(params.get("edge_limit")), 400),
+            )
+            self._send_json(payload)
+            return
+        if parsed.path.startswith("/api/graph/focus/"):
+            params = parse_qs(parsed.query)
+            node_id = unquote(parsed.path.removeprefix("/api/graph/focus/"))
+            payload = self.graph_server.orchestrator.export_graph_focus(
+                node_id,
+                query=_first(params.get("query")),
+                session_key=_first(params.get("session")),
+                node_limit=_int_or_default(_first(params.get("node_limit")), 200),
+                edge_limit=_int_or_default(_first(params.get("edge_limit")), 400),
+            )
+            self._send_json(payload)
+            return
+        if parsed.path.startswith("/api/graph/details/"):
+            params = parse_qs(parsed.query)
+            node_id = unquote(parsed.path.removeprefix("/api/graph/details/"))
+            payload = self.graph_server.orchestrator.export_graph_details(
+                node_id,
+                query=_first(params.get("query")),
+                session_key=_first(params.get("session")),
                 node_limit=_int_or_default(_first(params.get("node_limit")), 200),
                 edge_limit=_int_or_default(_first(params.get("edge_limit")), 400),
             )

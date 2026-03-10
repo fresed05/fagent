@@ -1565,6 +1565,229 @@ class MemoryOrchestrator:
             "message": message,
         }
 
+    def export_graph_overview(
+        self,
+        *,
+        query: str | None = None,
+        session_key: str | None = None,
+        mode: str = "global-clustered",
+        node_limit: int = 200,
+        edge_limit: int = 400,
+    ) -> dict[str, object]:
+        payload = self.export_graph_subgraph(
+            query=query,
+            session_key=session_key,
+            mode=mode,
+            node_limit=node_limit,
+            edge_limit=edge_limit,
+        )
+        for node in payload.get("nodes", []):
+            metadata = dict(node.get("metadata") or {})
+            metadata.setdefault("view_role", "overview")
+            metadata.setdefault("priority_score", self._graph_priority_score(node))
+            node["metadata"] = metadata
+        search_results = [
+            {
+                "id": str(node["id"]),
+                "label": str(node["label"]),
+                "kind": str((node.get("metadata") or {}).get("kind") or "node"),
+                "is_cluster": bool((node.get("metadata") or {}).get("is_cluster")),
+                "priority_score": int((node.get("metadata") or {}).get("priority_score") or self._graph_priority_score(node)),
+            }
+            for node in payload.get("nodes", [])
+        ]
+        search_results.sort(
+            key=lambda item: (
+                0 if query and query.lower() in item["label"].lower() else 1,
+                -int(item["priority_score"]),
+                item["label"],
+            )
+        )
+        payload["search_results"] = search_results[:18]
+        payload["view"] = "overview"
+        return payload
+
+    def export_graph_focus(
+        self,
+        node_id: str,
+        *,
+        query: str | None = None,
+        session_key: str | None = None,
+        node_limit: int = 200,
+        edge_limit: int = 400,
+    ) -> dict[str, object]:
+        if node_id.startswith("cluster:"):
+            overview = self.export_graph_subgraph(
+                query=query,
+                session_key=session_key,
+                mode="global-clustered",
+                node_limit=node_limit,
+                edge_limit=edge_limit,
+            )
+            cluster = next((item for item in overview.get("clusters", []) if str(item.get("id")) == node_id), None)
+            if cluster is None:
+                return {"view": "focus", "selected_id": node_id, "nodes": [], "edges": [], "message": "Cluster not found."}
+            hub_payload = self.get_entity(str(cluster["hub_id"])) or {}
+            member_ids = {str(item) for item in cluster.get("cluster_member_ids", [])}
+            neighbor_map = {
+                str(item["id"]): item
+                for item in hub_payload.get("neighbors", [])
+                if str(item["id"]) in member_ids or str(item["id"]) == str(cluster["hub_id"])
+            }
+            if str(cluster["hub_id"]) not in neighbor_map and hub_payload:
+                neighbor_map[str(cluster["hub_id"])] = {
+                    "id": hub_payload.get("id"),
+                    "label": hub_payload.get("label"),
+                    "metadata": hub_payload.get("metadata", {}),
+                }
+            focus_nodes = [
+                {
+                    "id": str(item["id"]),
+                    "label": str(item["label"]),
+                    "metadata": {**dict(item.get("metadata") or {}), "view_role": "focus"},
+                    "degree": 0,
+                    "layout": None,
+                }
+                for item in neighbor_map.values()
+            ]
+            focus_edges = [
+                {
+                    "source_id": str(edge["source_id"]),
+                    "target_id": str(edge["target_id"]),
+                    "relation": str(edge["relation"]),
+                    "weight": float(edge["weight"]),
+                    "metadata": dict(edge.get("metadata") or {}),
+                }
+                for edge in hub_payload.get("edges", [])
+                if str(edge["source_id"]) in neighbor_map and str(edge["target_id"]) in neighbor_map
+            ]
+            return {
+                "view": "focus",
+                "selected_id": node_id,
+                "selected_kind": "cluster",
+                "nodes": focus_nodes,
+                "edges": focus_edges,
+                "summary": {
+                    "hub_id": cluster["hub_id"],
+                    "cluster_size": cluster["cluster_size"],
+                    "relation_breakdown": cluster.get("relation_breakdown", {}),
+                    "node_kind_breakdown": cluster.get("node_kind_breakdown", {}),
+                },
+                "message": f"Expanded cluster around {cluster['hub_id']}.",
+            }
+        entity = self.get_entity(node_id)
+        if entity is None:
+            return {"view": "focus", "selected_id": node_id, "nodes": [], "edges": [], "message": "Node not found."}
+        focus_node_map: dict[str, dict[str, object]] = {
+            str(entity["id"]): {
+                "id": str(entity["id"]),
+                "label": str(entity.get("label") or entity["id"]),
+                "metadata": {**dict(entity.get("metadata") or {}), "view_role": "focus", "selected": True},
+                "degree": len(entity.get("neighbors", [])),
+                "layout": None,
+            }
+        }
+        for neighbor in entity.get("neighbors", [])[:32]:
+            focus_node_map[str(neighbor["id"])] = {
+                "id": str(neighbor["id"]),
+                "label": str(neighbor.get("label") or neighbor["id"]),
+                "metadata": {**dict(neighbor.get("metadata") or {}), "view_role": "focus"},
+                "degree": 0,
+                "layout": None,
+            }
+        focus_edges = [
+            {
+                "source_id": str(edge["source_id"]),
+                "target_id": str(edge["target_id"]),
+                "relation": str(edge["relation"]),
+                "weight": float(edge["weight"]),
+                "metadata": dict(edge.get("metadata") or {}),
+            }
+            for edge in entity.get("edges", [])
+            if str(edge["source_id"]) in focus_node_map and str(edge["target_id"]) in focus_node_map
+        ]
+        return {
+            "view": "focus",
+            "selected_id": node_id,
+            "selected_kind": "node",
+            "nodes": list(focus_node_map.values()),
+            "edges": focus_edges,
+            "summary": {
+                "neighbor_count": len(entity.get("neighbors", [])),
+                "edge_count": len(focus_edges),
+            },
+            "message": f"Focused on {node_id}.",
+        }
+
+    def export_graph_details(
+        self,
+        node_id: str,
+        *,
+        query: str | None = None,
+        session_key: str | None = None,
+        node_limit: int = 200,
+        edge_limit: int = 400,
+    ) -> dict[str, object]:
+        if node_id.startswith("cluster:"):
+            overview = self.export_graph_subgraph(
+                query=query,
+                session_key=session_key,
+                mode="global-clustered",
+                node_limit=node_limit,
+                edge_limit=edge_limit,
+            )
+            cluster = next((item for item in overview.get("clusters", []) if str(item.get("id")) == node_id), None)
+            if cluster is None:
+                return {"view": "details", "selected_id": node_id, "error": "cluster_not_found"}
+            return {
+                "view": "details",
+                "selected_id": node_id,
+                "kind": "cluster",
+                "title": str(cluster["id"]),
+                "summary": f"Cluster around {cluster['hub_id']} with {cluster['cluster_size']} hidden members.",
+                "metadata": {
+                    "view_role": "detail",
+                    "hub_id": cluster["hub_id"],
+                    "cluster_size": cluster["cluster_size"],
+                    "cluster_relation_types": cluster.get("cluster_relation_types", []),
+                    "cluster_bridge_targets": cluster.get("cluster_bridge_targets", []),
+                    "node_kind_breakdown": cluster.get("node_kind_breakdown", {}),
+                    "relation_breakdown": cluster.get("relation_breakdown", {}),
+                    "cluster_member_ids": cluster.get("cluster_member_ids", []),
+                },
+            }
+        entity = self.get_entity(node_id)
+        if entity is None:
+            return {"view": "details", "selected_id": node_id, "error": "node_not_found"}
+        metadata = dict(entity.get("metadata") or {})
+        return {
+            "view": "details",
+            "selected_id": node_id,
+            "kind": str(metadata.get("kind") or "node"),
+            "title": str(entity.get("label") or node_id),
+            "summary": f"{len(entity.get('neighbors', []))} neighbors, {len(entity.get('edges', []))} edges.",
+            "metadata": {
+                **metadata,
+                "view_role": "detail",
+                "related_neighbors": len(entity.get("neighbors", [])),
+                "related_edges": len(entity.get("edges", [])),
+            },
+            "neighbors": entity.get("neighbors", [])[:24],
+            "edges": entity.get("edges", [])[:32],
+        }
+
+    def _graph_priority_score(self, node: dict[str, object]) -> int:
+        metadata = dict(node.get("metadata") or {})
+        kind = str(metadata.get("kind") or "node")
+        base = int(node.get("degree", 0) or 0)
+        if metadata.get("is_cluster"):
+            base += 8
+        if kind == "entity":
+            base += 4
+        elif kind == "fact":
+            base += 2
+        return base
+
     def _focus_graph_snapshot(
         self,
         nodes: list[dict[str, object]],
@@ -1680,7 +1903,6 @@ class MemoryOrchestrator:
                 "hidden_node_count": 0,
                 "hidden_edge_count": 0,
             }
-        cluster_map = {cluster["id"]: cluster for cluster in cluster_defs}
         visible_nodes = [node for node in nodes if str(node["id"]) not in hidden_nodes]
         for cluster in cluster_defs:
             hub_node = node_map.get(str(cluster["hub_id"]))
@@ -1741,6 +1963,14 @@ class MemoryOrchestrator:
                 payload_metadata["member_edge_count"] = int(payload_metadata.get("member_edge_count", 1)) + 1
                 payload["metadata"] = payload_metadata
                 hidden_edge_count += 1
+        cluster_bridge_targets: dict[str, set[str]] = {str(cluster["id"]): set() for cluster in cluster_defs}
+        for aggregate in aggregate_edges.values():
+            source_id = str(aggregate["source_id"])
+            target_id = str(aggregate["target_id"])
+            if source_id in cluster_bridge_targets and not target_id.startswith("cluster:"):
+                cluster_bridge_targets[source_id].add(target_id)
+            if target_id in cluster_bridge_targets and not source_id.startswith("cluster:"):
+                cluster_bridge_targets[target_id].add(source_id)
         return {
             "nodes": visible_nodes,
             "edges": list(aggregate_edges.values()),
@@ -1755,6 +1985,7 @@ class MemoryOrchestrator:
                     "node_kind_breakdown": cluster["node_kind_breakdown"],
                     "node_kind": cluster["node_kind"],
                     "direction": cluster["direction"],
+                    "cluster_bridge_targets": sorted(cluster_bridge_targets.get(str(cluster["id"]), set())),
                 }
                 for cluster in cluster_defs
             ],
