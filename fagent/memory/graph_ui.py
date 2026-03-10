@@ -65,6 +65,8 @@ class GraphUiRequestHandler(BaseHTTPRequestHandler):
             payload = self.graph_server.orchestrator.export_graph_subgraph(
                 query=_first(params.get("query")),
                 session_key=_first(params.get("session")),
+                mode=_first(params.get("mode")) or "global-clustered",
+                focus_node=_first(params.get("focus_node")),
                 node_limit=_int_or_default(_first(params.get("node_limit")), 200),
                 edge_limit=_int_or_default(_first(params.get("edge_limit")), 400),
             )

@@ -2,6 +2,7 @@
 
 import asyncio
 from dataclasses import dataclass
+import re
 import os
 import select
 import signal
@@ -49,7 +50,11 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 
-console = Console()
+console = Console(
+    force_terminal=bool(getattr(sys.stdout, "isatty", lambda: False)()),
+    color_system="auto" if bool(getattr(sys.stdout, "isatty", lambda: False)()) else None,
+    no_color=not bool(getattr(sys.stdout, "isatty", lambda: False)()),
+)
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
 BRAND_GRADIENT = "bold bright_white on blue"
 ACCENT = "bright_cyan"
@@ -193,10 +198,26 @@ class _TurnTimeline:
         }.get(status, "dim")
 
     def _sanitize_error_text(self, text: str, *, stage: str = "") -> str:
-        raw = (text or "").strip()
+        raw = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", (text or ""))
+        raw = re.sub(r"\?\[[0-9;?]*[A-Za-z]", "", raw).strip()
         if not raw:
             return ""
         lowered = raw.lower()
+        if stage == "Summarizing session" and "not_triggered" in lowered:
+            if "threshold=" in lowered:
+                metrics = {
+                    key: value
+                    for key, value in re.findall(r"([a-z_]+)=([0-9]+)", raw)
+                }
+                current = metrics.get("last_prompt_tokens") or metrics.get("current_tokens") or "n/a"
+                threshold = metrics.get("threshold") or "n/a"
+                return f"context below summarize threshold ({current}/{threshold} tokens)"
+            if "usage_unavailable" in lowered:
+                return "usage metrics unavailable"
+            if "not enough new messages" in lowered:
+                return "not enough new messages since the last rollup"
+            if "empty slice" in lowered:
+                return "nothing new to summarize"
         if "workflowstateartifact" in lowered and "attribute 'id'" in lowered:
             if stage == "Writing vectors":
                 return "workflow snapshot normalization required"
@@ -305,7 +326,9 @@ class _TurnTimeline:
             return text or "running"
         if status in {"ok", "done"}:
             return text or status
-        if status in {"skipped", "retry", "failed", "error", "not_triggered"}:
+        if status == "not_triggered":
+            return f"skipped: {text or 'conditions not met'}"
+        if status in {"skipped", "retry", "failed", "error"}:
             detail = text or str(extra.get("reason") or "").strip()
             return f"{status}: {detail}" if detail else status
         return text or status or "n/a"
@@ -370,10 +393,13 @@ class _TurnTimeline:
         }.get(stage, stage)
         if stage == "Turn complete":
             return
+        display_message = message
+        if status == "not_triggered":
+            display_message = f"skipped: {message.removeprefix('skipped: ').removeprefix('not_triggered: ').strip()}"
         self._render_line(
             self._stage_icon(stage, status=status),
             stage_label,
-            message,
+            display_message,
             style=self._stage_style(status),
             badge=_status_chip(status, self._stage_style(status)),
         )

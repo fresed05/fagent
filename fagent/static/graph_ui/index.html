@@ -37,6 +37,17 @@
             </label>
           </div>
           <div class="controls">
+            <label class="field compact selectField modeField">
+              <span>Mode</span>
+              <select id="modeSelect">
+                <option value="global-clustered">Clustered</option>
+                <option value="global-raw">Raw</option>
+                <option value="focus-expand">Focus</option>
+              </select>
+            </label>
+            <label class="toggleChip"><input id="showHiddenToggle" type="checkbox" checked> <span>Show hidden counts</span></label>
+            <label class="toggleChip"><input id="hideWeakEdgesToggle" type="checkbox"> <span>Hide weak edges</span></label>
+            <label class="toggleChip"><input id="freezeLayoutToggle" type="checkbox"> <span>Freeze layout</span></label>
             <button id="loadBtn" class="btn primary">Load graph</button>
             <button id="focusBtn" class="btn ghost">Focus match</button>
             <button id="fitBtn" class="btn ghost">Fit</button>

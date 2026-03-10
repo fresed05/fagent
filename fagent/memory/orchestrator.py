@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import time
 import re
+from collections import Counter, defaultdict
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -1367,7 +1368,7 @@ class MemoryOrchestrator:
             candidates = self.registry.find_graph_nodes(entity_ref, limit=1)
             row = candidates[0] if candidates else None
         if row is not None:
-            edges = self.registry.get_graph_edges_for_node(row["id"])
+            edges = self.registry.get_graph_edges_for_node(row["id"], limit=256)
             neighbor_ids = {
                 str(edge["target_id"]) if str(edge["source_id"]) == str(row["id"]) else str(edge["source_id"])
                 for edge in edges
@@ -1455,6 +1456,8 @@ class MemoryOrchestrator:
         *,
         query: str | None = None,
         session_key: str | None = None,
+        mode: str = "global-clustered",
+        focus_node: str | None = None,
         node_limit: int = 200,
         edge_limit: int = 400,
     ) -> dict[str, object]:
@@ -1462,6 +1465,11 @@ class MemoryOrchestrator:
             return {
                 "nodes": [],
                 "edges": [],
+                "clusters": [],
+                "mode": mode,
+                "requested_mode": mode,
+                "hidden_node_count": 0,
+                "hidden_edge_count": 0,
                 "message": "Provide a session or query to load a graph snapshot.",
             }
         node_ids = self.registry.recent_graph_node_ids_for_session(session_key, limit=node_limit) if session_key else None
@@ -1487,32 +1495,271 @@ class MemoryOrchestrator:
             }
             for row in layouts
         }
+        node_payloads = [
+            {
+                "id": str(row["id"]),
+                "label": str(row["label"]),
+                "metadata": json.loads(row["metadata_json"]) if row["metadata_json"] else {},
+                "degree": int(row["degree"]) if "degree" in row.keys() else 0,
+                "layout": layout_map.get(str(row["id"])),
+            }
+            for row in nodes
+        ]
+        edge_payloads = [
+            {
+                "source_id": str(row["source_id"]),
+                "target_id": str(row["target_id"]),
+                "relation": str(row["relation"]),
+                "weight": float(row["weight"]),
+                "metadata": json.loads(row["metadata_json"]) if row["metadata_json"] else {},
+            }
+            for row in edges
+        ]
+        requested_mode = mode or "global-clustered"
+        raw_mode = requested_mode == "global-raw"
+        focus_mode = requested_mode == "focus-expand"
+        needs_cluster_fallback = raw_mode and (
+            len(node_payloads) > 90 or len(edge_payloads) > 180
+        )
+        effective_mode = "global-clustered" if needs_cluster_fallback else requested_mode
+        if focus_mode:
+            focused_payload = self._focus_graph_snapshot(
+                node_payloads,
+                edge_payloads,
+                focus_node=focus_node,
+                query=query,
+            )
+            node_payloads = focused_payload["nodes"]
+            edge_payloads = focused_payload["edges"]
+        if effective_mode == "global-clustered":
+            clustered = self._cluster_graph_snapshot(node_payloads, edge_payloads)
+            node_payloads = clustered["nodes"]
+            edge_payloads = clustered["edges"]
+            clusters = clustered["clusters"]
+            hidden_node_count = clustered["hidden_node_count"]
+            hidden_edge_count = clustered["hidden_edge_count"]
+        else:
+            clusters = []
+            hidden_node_count = 0
+            hidden_edge_count = 0
+        message = (
+            "Loaded latest graph snapshot."
+            if resolved_ids and not query and not session_key
+            else ("" if resolved_ids else "No graph items matched the current scope.")
+        )
+        if needs_cluster_fallback:
+            message = (
+                f"Raw graph exceeded safe limits ({len(node_payloads)} nodes / {len(edge_payloads)} edges). "
+                "Switched to clustered mode."
+            )
+        elif effective_mode == "focus-expand" and focus_node:
+            message = f"Focused on {focus_node}."
         return {
-            "nodes": [
-                {
-                    "id": str(row["id"]),
-                    "label": str(row["label"]),
-                    "metadata": json.loads(row["metadata_json"]) if row["metadata_json"] else {},
-                    "degree": int(row["degree"]) if "degree" in row.keys() else 0,
-                    "layout": layout_map.get(str(row["id"])),
+            "nodes": node_payloads,
+            "edges": edge_payloads,
+            "clusters": clusters,
+            "mode": effective_mode,
+            "requested_mode": requested_mode,
+            "hidden_node_count": hidden_node_count,
+            "hidden_edge_count": hidden_edge_count,
+            "message": message,
+        }
+
+    def _focus_graph_snapshot(
+        self,
+        nodes: list[dict[str, object]],
+        edges: list[dict[str, object]],
+        *,
+        focus_node: str | None,
+        query: str | None,
+    ) -> dict[str, list[dict[str, object]]]:
+        if not nodes:
+            return {"nodes": [], "edges": []}
+        node_map = {str(node["id"]): node for node in nodes}
+        focus_id = focus_node if focus_node in node_map else None
+        if focus_id is None and query:
+            query_lower = query.lower()
+            for node in nodes:
+                if query_lower in str(node["id"]).lower() or query_lower in str(node["label"]).lower():
+                    focus_id = str(node["id"])
+                    break
+        if focus_id is None:
+            focus_id = str(max(nodes, key=lambda item: int(item.get("degree", 0) or 0))["id"])
+        neighbor_ids = {focus_id}
+        filtered_edges: list[dict[str, object]] = []
+        for edge in edges:
+            source_id = str(edge["source_id"])
+            target_id = str(edge["target_id"])
+            if source_id == focus_id or target_id == focus_id:
+                neighbor_ids.add(source_id)
+                neighbor_ids.add(target_id)
+                filtered_edges.append(edge)
+        return {
+            "nodes": [node_map[node_id] for node_id in neighbor_ids if node_id in node_map],
+            "edges": filtered_edges,
+        }
+
+    def _cluster_graph_snapshot(
+        self,
+        nodes: list[dict[str, object]],
+        edges: list[dict[str, object]],
+    ) -> dict[str, object]:
+        if not nodes or not edges:
+            return {
+                "nodes": nodes,
+                "edges": edges,
+                "clusters": [],
+                "hidden_node_count": 0,
+                "hidden_edge_count": 0,
+            }
+        node_map = {str(node["id"]): dict(node) for node in nodes}
+        adjacency: dict[str, list[dict[str, object]]] = defaultdict(list)
+        for edge in edges:
+            adjacency[str(edge["source_id"])].append(edge)
+            adjacency[str(edge["target_id"])].append(edge)
+        hidden_nodes: set[str] = set()
+        member_to_cluster: dict[str, str] = {}
+        cluster_defs: list[dict[str, object]] = []
+        hub_threshold = 8
+        min_members = 5
+        bridge_degree_limit = 4
+        for hub in sorted(node_map.values(), key=lambda item: int(item.get("degree", 0) or 0), reverse=True):
+            hub_id = str(hub["id"])
+            if int(hub.get("degree", 0) or 0) < hub_threshold:
+                continue
+            grouped: dict[tuple[str, str, str], list[str]] = defaultdict(list)
+            for edge in adjacency.get(hub_id, []):
+                source_id = str(edge["source_id"])
+                target_id = str(edge["target_id"])
+                neighbor_id = target_id if source_id == hub_id else source_id
+                if neighbor_id in hidden_nodes or neighbor_id not in node_map:
+                    continue
+                neighbor = node_map[neighbor_id]
+                neighbor_kind = str((neighbor.get("metadata") or {}).get("kind") or "node")
+                direction = "out" if source_id == hub_id else "in"
+                relation = str(edge["relation"])
+                grouped[(direction, relation, neighbor_kind)].append(neighbor_id)
+            for group_index, ((direction, relation, neighbor_kind), member_ids) in enumerate(grouped.items(), start=1):
+                eligible = [
+                    member_id
+                    for member_id in member_ids
+                    if member_id not in hidden_nodes
+                    and int(node_map[member_id].get("degree", 0) or 0) <= bridge_degree_limit
+                ]
+                if len(eligible) < min_members:
+                    continue
+                cluster_id = f"cluster:{hub_id}:{direction}:{relation}:{neighbor_kind}:{group_index}"
+                hidden_nodes.update(eligible)
+                for member_id in eligible:
+                    member_to_cluster[member_id] = cluster_id
+                relation_counter = Counter()
+                node_kind_counter = Counter()
+                for member_id in eligible:
+                    node_kind_counter[str((node_map[member_id].get("metadata") or {}).get("kind") or "node")] += 1
+                    for edge in adjacency.get(member_id, []):
+                        relation_counter[str(edge["relation"])] += 1
+                cluster_defs.append(
+                    {
+                        "id": cluster_id,
+                        "hub_id": hub_id,
+                        "direction": direction,
+                        "relation": relation,
+                        "node_kind": neighbor_kind,
+                        "member_ids": eligible,
+                        "cluster_size": len(eligible),
+                        "relation_breakdown": dict(relation_counter.most_common(6)),
+                        "node_kind_breakdown": dict(node_kind_counter.most_common(6)),
+                        "label": f"{relation} ×{len(eligible)}",
+                    }
+                )
+        if not cluster_defs:
+            return {
+                "nodes": nodes,
+                "edges": edges,
+                "clusters": [],
+                "hidden_node_count": 0,
+                "hidden_edge_count": 0,
+            }
+        cluster_map = {cluster["id"]: cluster for cluster in cluster_defs}
+        visible_nodes = [node for node in nodes if str(node["id"]) not in hidden_nodes]
+        for cluster in cluster_defs:
+            hub_node = node_map.get(str(cluster["hub_id"]))
+            layout = None
+            if hub_node and hub_node.get("layout"):
+                hub_layout = hub_node["layout"]
+                layout = {
+                    "x": float(hub_layout["x"]) + 55.0,
+                    "y": float(hub_layout["y"]) + 36.0,
+                    "pinned": False,
                 }
-                for row in nodes
-            ],
-            "edges": [
+            visible_nodes.append(
                 {
-                    "source_id": str(row["source_id"]),
-                    "target_id": str(row["target_id"]),
-                    "relation": str(row["relation"]),
-                    "weight": float(row["weight"]),
-                    "metadata": json.loads(row["metadata_json"]) if row["metadata_json"] else {},
+                    "id": cluster["id"],
+                    "label": cluster["label"],
+                    "metadata": {
+                        "kind": "cluster",
+                        "is_cluster": True,
+                        "hub_id": cluster["hub_id"],
+                        "cluster_size": cluster["cluster_size"],
+                        "cluster_relation_types": [cluster["relation"]],
+                        "cluster_member_ids": list(cluster["member_ids"]),
+                        "cluster_relation_breakdown": cluster["relation_breakdown"],
+                        "cluster_node_kind_breakdown": cluster["node_kind_breakdown"],
+                        "cluster_node_kind": cluster["node_kind"],
+                        "cluster_direction": cluster["direction"],
+                    },
+                    "degree": len(cluster["member_ids"]),
+                    "layout": layout,
                 }
-                for row in edges
+            )
+        aggregate_edges: dict[tuple[str, str, str], dict[str, object]] = {}
+        hidden_edge_count = 0
+        for edge in edges:
+            source_id = member_to_cluster.get(str(edge["source_id"]), str(edge["source_id"]))
+            target_id = member_to_cluster.get(str(edge["target_id"]), str(edge["target_id"]))
+            if source_id == target_id:
+                hidden_edge_count += 1
+                continue
+            key = (source_id, target_id, str(edge["relation"]))
+            payload = aggregate_edges.get(key)
+            if payload is None:
+                payload = {
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "relation": str(edge["relation"]),
+                    "weight": float(edge["weight"]),
+                    "metadata": {
+                        **dict(edge.get("metadata") or {}),
+                        "is_aggregate": source_id.startswith("cluster:") or target_id.startswith("cluster:"),
+                        "member_edge_count": 1,
+                    },
+                }
+                aggregate_edges[key] = payload
+            else:
+                payload["weight"] = max(float(payload["weight"]), float(edge["weight"]))
+                payload_metadata = dict(payload["metadata"])
+                payload_metadata["member_edge_count"] = int(payload_metadata.get("member_edge_count", 1)) + 1
+                payload["metadata"] = payload_metadata
+                hidden_edge_count += 1
+        return {
+            "nodes": visible_nodes,
+            "edges": list(aggregate_edges.values()),
+            "clusters": [
+                {
+                    "id": cluster["id"],
+                    "hub_id": cluster["hub_id"],
+                    "cluster_size": cluster["cluster_size"],
+                    "cluster_member_ids": list(cluster["member_ids"]),
+                    "cluster_relation_types": [cluster["relation"]],
+                    "relation_breakdown": cluster["relation_breakdown"],
+                    "node_kind_breakdown": cluster["node_kind_breakdown"],
+                    "node_kind": cluster["node_kind"],
+                    "direction": cluster["direction"],
+                }
+                for cluster in cluster_defs
             ],
-            "message": (
-                "Loaded latest graph snapshot."
-                if resolved_ids and not query and not session_key
-                else ("" if resolved_ids else "No graph items matched the current scope.")
-            ),
+            "hidden_node_count": len(hidden_nodes),
+            "hidden_edge_count": hidden_edge_count,
         }
 
     def _sync_graph_node(self, node_id: str) -> list[str]:

@@ -24,8 +24,8 @@ def setup_runtime_logging(*, verbose: bool = False, console_output: bool = True)
     if console_output:
         logger.add(
             sys.stderr,
-            level="DEBUG" if verbose else "INFO",
-            colorize=True,
+            level="DEBUG" if verbose else "WARNING",
+            colorize=bool(getattr(sys.stderr, "isatty", lambda: False)()),
             backtrace=False,
             diagnose=False,
         )

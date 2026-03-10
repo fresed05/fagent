@@ -125,3 +125,23 @@ def test_timeline_renders_thoughts_and_tools_differently() -> None:
     assert "Thought" in output
     assert "Checking memory and planning the next tool call." in output
     assert 'exec("df -hT")' in output
+
+
+def test_timeline_formats_not_triggered_summary_without_raw_ansi() -> None:
+    console = Console(record=True, width=140)
+    timeline = _TurnTimeline(console)
+    timeline.start_turn()
+
+    timeline.handle_event({
+        "event": "stage",
+        "stage": "Summarizing session",
+        "status": "not_triggered",
+        "content": "\x1b[2mSummary\x1b[0m not_triggered: last_prompt_tokens=13079, peak_prompt_tokens=13079, threshold=800000",
+        "extra": {},
+        "error": "",
+    })
+
+    output = console.export_text()
+    assert "context below summarize threshold (13079/800000 tokens)" in output
+    assert "\x1b[" not in output
+    assert "?[2m" not in output

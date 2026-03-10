@@ -111,6 +111,49 @@ def test_graph_ui_api_supports_crud(tmp_path: Path) -> None:
         manager.stop()
 
 
+def test_graph_ui_clustered_mode_collapses_dense_hub_neighbors(tmp_path: Path) -> None:
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="stub")
+    orchestrator.upsert_graph_node(node_id="hub:root", label="Hub", metadata={"kind": "entity"})
+    for index in range(8):
+        node_id = f"fact:{index}"
+        orchestrator.upsert_graph_node(node_id=node_id, label=f"Fact {index}", metadata={"kind": "fact"})
+        orchestrator.upsert_graph_edge(
+            source_id="hub:root",
+            target_id=node_id,
+            relation="supports",
+            weight=1.0,
+            metadata={"source": "test"},
+        )
+
+    payload = orchestrator.export_graph_subgraph(query=":", mode="global-clustered")
+
+    assert payload["mode"] == "global-clustered"
+    assert payload["hidden_node_count"] >= 5
+    assert payload["clusters"]
+    assert any(node["metadata"].get("is_cluster") for node in payload["nodes"])
+
+
+def test_graph_ui_raw_mode_falls_back_to_clustered_when_graph_is_too_large(tmp_path: Path) -> None:
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="stub")
+    orchestrator.upsert_graph_node(node_id="hub:root", label="Hub", metadata={"kind": "entity"})
+    for index in range(95):
+        node_id = f"leaf:{index}"
+        orchestrator.upsert_graph_node(node_id=node_id, label=f"Leaf {index}", metadata={"kind": "fact"})
+        orchestrator.upsert_graph_edge(
+            source_id="hub:root",
+            target_id=node_id,
+            relation="supports",
+            weight=1.0,
+            metadata={"source": "test"},
+        )
+
+    payload = orchestrator.export_graph_subgraph(query=":", mode="global-raw", node_limit=200, edge_limit=400)
+
+    assert payload["requested_mode"] == "global-raw"
+    assert payload["mode"] == "global-clustered"
+    assert "Switched to clustered mode" in payload["message"]
+
+
 @pytest.mark.asyncio
 async def test_graph_slash_command_returns_url(monkeypatch, tmp_path: Path) -> None:
     class _Manager:

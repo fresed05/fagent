@@ -11,6 +11,10 @@ const focusBtn = document.getElementById("focusBtn");
 const fitBtn = document.getElementById("fitBtn");
 const physicsBtn = document.getElementById("physicsBtn");
 const saveLayoutBtn = document.getElementById("saveLayoutBtn");
+const modeSelect = document.getElementById("modeSelect");
+const showHiddenToggle = document.getElementById("showHiddenToggle");
+const hideWeakEdgesToggle = document.getElementById("hideWeakEdgesToggle");
+const freezeLayoutToggle = document.getElementById("freezeLayoutToggle");
 const inspector = document.getElementById("inspector");
 const expandBtn = document.getElementById("expandBtn");
 const deleteSelectedBtn = document.getElementById("deleteSelectedBtn");
@@ -26,9 +30,12 @@ const resetEdgeBtn = document.getElementById("resetEdgeBtn");
 
 queryInput.value = params.get("query") || "";
 sessionInput.value = params.get("session") || "";
+modeSelect.value = params.get("mode") || "global-clustered";
 
 let physicsEnabled = true;
 let selected = { type: null, id: null };
+let currentPayload = { nodes: [], edges: [], clusters: [], mode: modeSelect.value, hidden_node_count: 0, hidden_edge_count: 0 };
+let clusterIndex = new Map();
 
 const network = new vis.Network(
   document.getElementById("network"),
@@ -75,6 +82,8 @@ const network = new vis.Network(
 
 function nodeKindColor(kind) {
   switch (kind) {
+    case "cluster":
+      return { background: "#2b2a56", border: "#e6c2ff" };
     case "episode":
       return { background: "#17355e", border: "#62d0ff" };
     case "fact":
@@ -90,13 +99,17 @@ function formatNode(row) {
   const metadata = row.metadata || {};
   const kind = metadata.kind || "node";
   const color = nodeKindColor(kind);
+  const isCluster = !!metadata.is_cluster;
   const visNode = {
     id: row.id,
-    label: row.label,
+    label: isCluster ? `${row.label}\n${metadata.cluster_size || 0} hidden` : row.label,
     title: `${row.id}\n${JSON.stringify(metadata, null, 2)}`,
     color,
-    shape: metadata.kind === "fact" ? "box" : "dot",
-    font: { color: "#edf4ff" }
+    shape: isCluster ? "hexagon" : metadata.kind === "fact" ? "box" : "dot",
+    size: isCluster ? 28 : 20,
+    mass: isCluster ? 2.6 : 1,
+    borderWidth: isCluster ? 3 : 2,
+    font: { color: "#edf4ff", multi: "md" }
   };
   if (row.layout) {
     visNode.x = row.layout.x;
@@ -107,13 +120,15 @@ function formatNode(row) {
 }
 
 function formatEdge(row) {
+  const edgeCount = Number((row.metadata || {}).member_edge_count || 1);
   return {
     id: `${row.source_id}|${row.relation}|${row.target_id}`,
     from: row.source_id,
     to: row.target_id,
-    label: row.relation,
+    label: edgeCount > 1 ? `${row.relation} ×${edgeCount}` : row.relation,
     arrows: "to",
-    width: Math.max(1, Number(row.weight || 1))
+    dashes: !!((row.metadata || {}).is_aggregate),
+    width: Math.max(1, Number(row.weight || 1) + (edgeCount > 1 ? 1 : 0))
   };
 }
 
@@ -136,7 +151,11 @@ function setStatus(message) {
 function updateStats(payload) {
   nodeCount.textContent = String((payload.nodes || []).length);
   edgeCount.textContent = String((payload.edges || []).length);
-  queryState.textContent = queryInput.value.trim() || "latest";
+  const modeLabel = payload.mode || modeSelect.value;
+  const hiddenLabel = showHiddenToggle.checked
+    ? ` · hidden ${payload.hidden_node_count || 0}/${payload.hidden_edge_count || 0}`
+    : "";
+  queryState.textContent = `${queryInput.value.trim() || "latest"} · ${modeLabel}${hiddenLabel}`;
 }
 
 function formatMetadata(metadata) {
@@ -168,10 +187,39 @@ function renderGraphSummary(payload) {
       <div class="kvGrid">
         <div class="kvItem"><span>Nodes</span><strong>${payload.nodes.length}</strong></div>
         <div class="kvItem"><span>Edges</span><strong>${payload.edges.length}</strong></div>
+        <div class="kvItem"><span>Mode</span><strong>${escapeHtml(payload.mode || "global-clustered")}</strong></div>
+        <div class="kvItem"><span>Clusters</span><strong>${(payload.clusters || []).length}</strong></div>
       </div>
       <pre class="inspectorMeta">${escapeHtml(JSON.stringify({
         query: queryInput.value.trim() || null,
-        session: sessionInput.value.trim() || null
+        session: sessionInput.value.trim() || null,
+        hidden_nodes: payload.hidden_node_count || 0,
+        hidden_edges: payload.hidden_edge_count || 0,
+        requested_mode: payload.requested_mode || payload.mode || null
+      }, null, 2))}</pre>
+    </div>
+  `;
+}
+
+function renderClusterInspector(cluster) {
+  inspector.className = "inspector";
+  selectionBadge.textContent = "Cloud";
+  inspector.innerHTML = `
+    <div class="inspectorCard">
+      <div class="inspectorTitleRow">
+        <h3 class="inspectorTitle">${escapeHtml(cluster.id)}</h3>
+        <span class="inspectorKind">cluster</span>
+      </div>
+      <div class="kvGrid">
+        <div class="kvItem"><span>Hub</span><strong>${escapeHtml(cluster.hub_id)}</strong></div>
+        <div class="kvItem"><span>Hidden nodes</span><strong>${cluster.cluster_size}</strong></div>
+      </div>
+      <pre class="inspectorMeta">${escapeHtml(JSON.stringify({
+        direction: cluster.direction,
+        node_kind: cluster.node_kind,
+        relation_breakdown: cluster.relation_breakdown || {},
+        node_kind_breakdown: cluster.node_kind_breakdown || {},
+        cluster_member_ids: showHiddenToggle.checked ? (cluster.cluster_member_ids || []) : `[hidden:${cluster.cluster_size}]`
       }, null, 2))}</pre>
     </div>
   `;
@@ -221,6 +269,43 @@ function showError(err) {
   setStatus(`Error: ${err.message}`);
 }
 
+function applyEdgeFilters(edgeItems) {
+  if (!hideWeakEdgesToggle.checked) {
+    return edgeItems;
+  }
+  return edgeItems.filter((edge) => Number((edge.metadata || {}).member_edge_count || edge.weight || 1) >= 2);
+}
+
+function applyGraphPayload(payload) {
+  currentPayload = payload;
+  clusterIndex = new Map((payload.clusters || []).map((cluster) => [cluster.id, cluster]));
+  const nextEdges = applyEdgeFilters(payload.edges || []);
+  nodes.clear();
+  edges.clear();
+  nodes.add((payload.nodes || []).map(formatNode));
+  edges.add(nextEdges.map(formatEdge));
+  updateStats({ ...payload, edges: nextEdges });
+  network.setOptions({
+    physics: {
+      enabled: physicsEnabled && !freezeLayoutToggle.checked,
+      stabilization: { enabled: true, iterations: payload.mode === "global-clustered" ? 120 : 40 },
+    },
+    edges: {
+      smooth: {
+        enabled: payload.mode !== "global-clustered",
+        type: payload.mode === "global-clustered" ? "continuous" : "dynamic",
+      },
+    },
+  });
+  if (freezeLayoutToggle.checked) {
+    network.stopSimulation();
+  } else {
+    setTimeout(() => network.stopSimulation(), payload.mode === "global-clustered" ? 700 : 1100);
+  }
+  network.fit({ animation: { duration: 550, easingFunction: "easeInOutQuad" } });
+  renderGraphSummary({ ...payload, edges: nextEdges });
+}
+
 async function loadGraph() {
   setStatus("Loading graph snapshot...");
   const query = queryInput.value.trim();
@@ -228,14 +313,12 @@ async function loadGraph() {
   const qs = new URLSearchParams();
   if (query) qs.set("query", query);
   if (session) qs.set("session", session);
+  qs.set("mode", modeSelect.value);
+  if (modeSelect.value === "focus-expand" && selected.type === "node" && selected.id) {
+    qs.set("focus_node", selected.id);
+  }
   const payload = await api(`/api/graph?${qs.toString()}`);
-  nodes.clear();
-  edges.clear();
-  nodes.add(payload.nodes.map(formatNode));
-  edges.add(payload.edges.map(formatEdge));
-  updateStats(payload);
-  network.fit({ animation: { duration: 550, easingFunction: "easeInOutQuad" } });
-  renderGraphSummary(payload);
+  applyGraphPayload(payload);
   setStatus(
     payload.message || (
       payload.nodes.length
@@ -250,6 +333,7 @@ function resetNodeForm() {
   nodeForm.elements.metadata_json.value = "{}";
   selected = { type: null, id: null };
   expandBtn.disabled = true;
+  expandBtn.textContent = "Expand neighbors";
   deleteSelectedBtn.disabled = true;
   renderInspectorEmpty();
 }
@@ -276,6 +360,32 @@ async function expandSelectedNode() {
   network.focus(selected.id, { scale: 1.08, animation: { duration: 480, easingFunction: "easeInOutQuad" } });
   renderNodeInspector(payload);
   setStatus(`Expanded neighborhood for ${selected.id}.`);
+}
+
+async function expandSelectedCloud() {
+  const cluster = clusterIndex.get(selected.id);
+  if (!cluster) return;
+  const hubPayload = await api(`/api/graph/node/${encodeURIComponent(cluster.hub_id)}`);
+  const memberIds = new Set(cluster.cluster_member_ids || []);
+  const memberNodes = (hubPayload.neighbors || []).filter((node) => memberIds.has(node.id));
+  const memberEdges = (hubPayload.edges || []).filter((edge) => {
+    return edge.source_id === cluster.hub_id
+      ? memberIds.has(edge.target_id)
+      : memberIds.has(edge.source_id);
+  });
+  nodes.remove(cluster.id);
+  nodes.update(memberNodes.map(formatNode));
+  edges.remove(edges.getIds().filter((id) => id.includes(cluster.id)));
+  edges.update(memberEdges.map(formatEdge));
+  updateStats({
+    ...currentPayload,
+    nodes: nodes.get(),
+    edges: edges.get(),
+    hidden_node_count: Math.max(0, (currentPayload.hidden_node_count || 0) - memberNodes.length),
+    hidden_edge_count: Math.max(0, (currentPayload.hidden_edge_count || 0) - memberEdges.length),
+  });
+  renderClusterInspector(cluster);
+  setStatus(`Expanded cloud ${cluster.id}.`);
 }
 
 async function savePositions() {
@@ -318,6 +428,13 @@ network.on("selectNode", async (event) => {
   selected = { type: "node", id: event.nodes[0] };
   expandBtn.disabled = false;
   deleteSelectedBtn.disabled = false;
+  if (clusterIndex.has(selected.id)) {
+    expandBtn.textContent = "Expand cloud";
+    renderClusterInspector(clusterIndex.get(selected.id));
+    setStatus(`Selected cluster ${selected.id}.`);
+    return;
+  }
+  expandBtn.textContent = "Expand neighbors";
   const payload = await api(`/api/graph/node/${encodeURIComponent(selected.id)}`);
   nodeForm.elements.id.value = payload.id;
   nodeForm.elements.label.value = payload.label;
@@ -359,14 +476,32 @@ focusBtn.addEventListener("click", focusBestMatch);
 fitBtn.addEventListener("click", () => network.fit({ animation: { duration: 420, easingFunction: "easeInOutQuad" } }));
 physicsBtn.addEventListener("click", () => {
   physicsEnabled = !physicsEnabled;
-  network.setOptions({ physics: { enabled: physicsEnabled, stabilization: false } });
+  network.setOptions({ physics: { enabled: physicsEnabled && !freezeLayoutToggle.checked, stabilization: false } });
   physicsBtn.textContent = `Physics: ${physicsEnabled ? "on" : "off"}`;
   setStatus(`Physics ${physicsEnabled ? "enabled" : "disabled"}.`);
 });
 saveLayoutBtn.addEventListener("click", () => savePositions().catch(showError));
-expandBtn.addEventListener("click", () => expandSelectedNode().catch(showError));
+expandBtn.addEventListener("click", () => {
+  const action = clusterIndex.has(selected.id) ? expandSelectedCloud : expandSelectedNode;
+  action().catch(showError);
+});
 resetNodeBtn.addEventListener("click", resetNodeForm);
 resetEdgeBtn.addEventListener("click", resetEdgeForm);
+modeSelect.addEventListener("change", () => loadGraph().catch(showError));
+showHiddenToggle.addEventListener("change", () => {
+  updateStats(currentPayload);
+  renderGraphSummary(currentPayload);
+});
+hideWeakEdgesToggle.addEventListener("change", () => applyGraphPayload(currentPayload));
+freezeLayoutToggle.addEventListener("change", () => {
+  if (freezeLayoutToggle.checked) {
+    network.stopSimulation();
+    setStatus("Layout frozen.");
+    return;
+  }
+  network.setOptions({ physics: { enabled: physicsEnabled, stabilization: false } });
+  setStatus("Layout unfrozen.");
+});
 
 queryInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
