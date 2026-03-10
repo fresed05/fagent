@@ -82,12 +82,37 @@ class _TurnTimeline:
         if self._last_tool_key is None:
             return
         tool_name, preview = self._last_tool_key
-        suffix = f" x{self._last_tool_count}" if self._last_tool_count > 1 else ""
-        style = self._stage_style(self._pending_tool_status)
-        self.console.print(f"  [{style}]Tool execution[/{style}] {preview}{suffix} [{style}]{self._pending_tool_status}[/{style}]")
+        suffix = f" ×{self._last_tool_count}" if self._last_tool_count > 1 else ""
+        self.console.print(f"  ⚙️ {tool_name} / {preview}{suffix}")
         self._last_tool_key = None
         self._last_tool_count = 0
         self._pending_tool_status = "running"
+
+    @staticmethod
+    def _clean_summary_value(value: object) -> str:
+        text = str(value or "n/a").strip()
+        return text or "n/a"
+
+    def _render_presearch(self, extra: dict[str, object]) -> None:
+        stores = extra.get("used_stores") if isinstance(extra.get("used_stores"), list) else []
+        count = int(extra.get("count", 0) or 0)
+        confidence = float(extra.get("confidence", 0.0) or 0.0)
+        stores_text = ", ".join(str(item) for item in stores) if stores else "none"
+        self.console.print(f"  🔎 Memory Lookup: {stores_text}")
+        self.console.print(f"  📚 Results: {count} • confidence {confidence:.2f}")
+
+    def _render_thinking(self, content: str) -> None:
+        text = content.strip()
+        if not text or text == "Running main loop":
+            self.console.print("  🧠 Planning response")
+            return
+        self.console.print(f"  🧠 {text}")
+
+    def _render_post_turn_summary(self) -> None:
+        self.console.print("  💾 Indexing complete")
+        self.console.print(f"  🕸 Graph: {self._clean_summary_value(self._summary.get('graph', 'n/a'))}")
+        self.console.print(f"  🧬 Vector: {self._clean_summary_value(self._summary.get('vector', 'n/a'))}")
+        self.console.print(f"  📝 Summary: {self._clean_summary_value(self._summary.get('summary', 'n/a'))}")
 
     def handle_event(self, event: dict[str, object]) -> None:
         stage = str(event.get("stage", "") or "")
@@ -98,12 +123,16 @@ class _TurnTimeline:
         if isinstance(extra, dict):
             if stage == "Saving file memory":
                 self._summary["file_memory"] = content
+                return
             elif stage == "Building graph":
                 self._summary["graph"] = content
+                return
             elif stage == "Writing vectors":
                 self._summary["vector"] = content
+                return
             elif stage == "Summarizing session":
                 self._summary["summary"] = content
+                return
         if event_type == "tool":
             tool_name = str(event.get("tool_name", "") or "")
             preview = str(event.get("arguments_preview", "") or tool_name or content)
@@ -118,22 +147,21 @@ class _TurnTimeline:
             self._pending_tool_status = status
             return
         self._flush_tool()
-        style = self._stage_style(status)
+        if stage == "Draft ready":
+            return
+        if stage == "Pre-search":
+            self._render_presearch(extra if isinstance(extra, dict) else {})
+            return
+        if stage == "Thinking":
+            self._render_thinking(content)
+            return
         if stage == "Turn complete":
             elapsed = time.perf_counter() - self._turn_started_at
-            self.console.print(f"  [{style}]{stage}[/{style}] {content}")
-            footer = " | ".join(
-                part for part in [
-                    f"graph: {self._summary.get('graph', 'n/a')}",
-                    f"vectors: {self._summary.get('vector', 'n/a')}",
-                    f"summary: {self._summary.get('summary', 'n/a')}",
-                ]
-                if part
-            )
-            if footer:
-                self.console.print(f"  [dim]{footer}[/dim]")
-            self.console.print(f"  [dim]Post-turn: {elapsed:.1f}s[/dim]")
+            self._render_post_turn_summary()
+            self.console.print("  ✅ Done")
+            self.console.print(f"  ⏱ {elapsed:.1f}s")
             return
+        style = self._stage_style(status)
         self.console.print(f"  [{style}]{stage}[/{style}] {content}")
 
 # ---------------------------------------------------------------------------
