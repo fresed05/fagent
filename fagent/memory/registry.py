@@ -55,6 +55,14 @@ class MemoryRegistry:
                     label TEXT NOT NULL,
                     metadata_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS entity_aliases (
+                    entity_id TEXT NOT NULL,
+                    alias_text TEXT NOT NULL,
+                    alias_language TEXT NOT NULL DEFAULT '',
+                    is_canonical INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (entity_id, alias_text)
+                );
                 CREATE TABLE IF NOT EXISTS graph_edges (
                     source_id TEXT NOT NULL,
                     target_id TEXT NOT NULL,
@@ -284,6 +292,48 @@ class MemoryRegistry:
                 (node_id, label, json.dumps(metadata, ensure_ascii=False)),
             )
 
+    def replace_graph_aliases(self, entity_id: str, aliases: list[dict[str, Any]]) -> None:
+        rows: list[tuple[str, str, str, int]] = []
+        seen: set[str] = set()
+        for item in aliases:
+            alias_text = str(item.get("alias_text") or "").strip()
+            if not alias_text:
+                continue
+            key = alias_text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                (
+                    entity_id,
+                    alias_text,
+                    str(item.get("alias_language") or ""),
+                    1 if item.get("is_canonical") else 0,
+                )
+            )
+        with self._connect() as conn:
+            conn.execute("DELETE FROM entity_aliases WHERE entity_id = ?", (entity_id,))
+            if rows:
+                conn.executemany(
+                    """
+                    INSERT INTO entity_aliases(entity_id, alias_text, alias_language, is_canonical)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+
+    def list_graph_aliases(self, entity_id: str) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT entity_id, alias_text, alias_language, is_canonical, updated_at
+                FROM entity_aliases
+                WHERE entity_id = ?
+                ORDER BY is_canonical DESC, alias_text ASC
+                """,
+                (entity_id,),
+            ).fetchall()
+
     def upsert_graph_edge(
         self,
         source_id: str,
@@ -309,14 +359,15 @@ class MemoryRegistry:
         with self._connect() as conn:
             return conn.execute(
                 """
-                SELECT n.id, n.label, n.metadata_json, e.target_id, e.relation, e.weight, e.metadata_json AS edge_metadata
+                SELECT DISTINCT n.id, n.label, n.metadata_json, e.target_id, e.relation, e.weight, e.metadata_json AS edge_metadata
                 FROM graph_nodes n
+                LEFT JOIN entity_aliases a ON a.entity_id = n.id
                 LEFT JOIN graph_edges e ON e.source_id = n.id
-                WHERE lower(n.label) LIKE ? OR lower(n.metadata_json) LIKE ?
+                WHERE lower(n.label) LIKE ? OR lower(n.metadata_json) LIKE ? OR lower(COALESCE(a.alias_text, '')) LIKE ?
                 ORDER BY e.weight DESC
                 LIMIT ?
                 """,
-                (like, like, limit),
+                (like, like, like, limit),
             ).fetchall()
 
     def get_graph_node(self, node_id: str) -> sqlite3.Row | None:
@@ -331,12 +382,14 @@ class MemoryRegistry:
         with self._connect() as conn:
             return conn.execute(
                 """
-                SELECT * FROM graph_nodes
-                WHERE lower(id) LIKE ? OR lower(label) LIKE ? OR lower(metadata_json) LIKE ?
+                SELECT DISTINCT n.*
+                FROM graph_nodes n
+                LEFT JOIN entity_aliases a ON a.entity_id = n.id
+                WHERE lower(n.id) LIKE ? OR lower(n.label) LIKE ? OR lower(n.metadata_json) LIKE ? OR lower(COALESCE(a.alias_text, '')) LIKE ?
                 ORDER BY label ASC
                 LIMIT ?
                 """,
-                (like, like, like, limit),
+                (like, like, like, like, limit),
             ).fetchall()
 
     def get_graph_edges_for_node(self, node_id: str, limit: int = 16) -> list[sqlite3.Row]:
@@ -381,8 +434,16 @@ class MemoryRegistry:
         clauses: list[str] = []
         if query:
             like = f"%{query.lower()}%"
-            clauses.append("(lower(n.id) LIKE ? OR lower(n.label) LIKE ? OR lower(n.metadata_json) LIKE ?)")
-            params.extend([like, like, like])
+            clauses.append(
+                """(
+                    lower(n.id) LIKE ? OR lower(n.label) LIKE ? OR lower(n.metadata_json) LIKE ?
+                    OR EXISTS (
+                        SELECT 1 FROM entity_aliases a
+                        WHERE a.entity_id = n.id AND lower(a.alias_text) LIKE ?
+                    )
+                )"""
+            )
+            params.extend([like, like, like, like])
         if node_ids:
             placeholders = ", ".join("?" for _ in node_ids)
             clauses.append(f"n.id IN ({placeholders})")
@@ -458,6 +519,7 @@ class MemoryRegistry:
         with self._connect() as conn:
             conn.execute("DELETE FROM graph_edges WHERE source_id = ? OR target_id = ?", (node_id, node_id))
             conn.execute("DELETE FROM graph_layouts WHERE node_id = ?", (node_id,))
+            conn.execute("DELETE FROM entity_aliases WHERE entity_id = ?", (node_id,))
             conn.execute("DELETE FROM graph_nodes WHERE id = ?", (node_id,))
 
     def delete_graph_edge(self, source_id: str, target_id: str, relation: str) -> None:

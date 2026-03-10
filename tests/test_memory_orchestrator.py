@@ -192,6 +192,13 @@ async def test_vector_failure_does_not_break_file_memory(
 def test_export_graph_subgraph_returns_latest_graph_without_filters(tmp_path: Path) -> None:
     orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
     orchestrator.registry.upsert_graph_node("entity:ssh", "SSH", {"kind": "entity"})
+    orchestrator.registry.replace_graph_aliases(
+        "entity:ssh",
+        [
+            {"alias_text": "SSH", "alias_language": "en", "is_canonical": True},
+            {"alias_text": "ссш", "alias_language": "ru", "is_canonical": False},
+        ],
+    )
     orchestrator.registry.upsert_graph_node("fact:ssh-port", "SSH listens on 22/tcp", {"kind": "fact"})
     orchestrator.registry.upsert_graph_edge("entity:ssh", "fact:ssh-port", "described_by", 1.0, {})
 
@@ -200,6 +207,34 @@ def test_export_graph_subgraph_returns_latest_graph_without_filters(tmp_path: Pa
     assert len(payload["nodes"]) == 2
     assert len(payload["edges"]) == 1
     assert payload["message"] == "Loaded latest graph snapshot."
+
+
+def test_get_entity_and_query_resolve_russian_alias_to_english_canonical_node(tmp_path: Path) -> None:
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
+    orchestrator.registry.upsert_graph_node(
+        "entity:shadow-context",
+        "shadow context",
+        {
+            "kind": "workflow",
+            "canonical_name": "shadow context",
+            "aliases": ["shadow context", "теневой контекст"],
+        },
+    )
+    orchestrator.registry.replace_graph_aliases(
+        "entity:shadow-context",
+        [
+            {"alias_text": "shadow context", "alias_language": "en", "is_canonical": True},
+            {"alias_text": "теневой контекст", "alias_language": "ru", "is_canonical": False},
+        ],
+    )
+
+    entity = orchestrator.get_entity("теневой контекст")
+    results = orchestrator.search("теневой контекст", stores=["graph"], top_k=5)
+
+    assert entity is not None
+    assert entity["id"] == "entity:shadow-context"
+    assert entity["label"] == "shadow context"
+    assert any(item.artifact_id == "entity:shadow-context" for item in results)
 
 
 @pytest.mark.asyncio
