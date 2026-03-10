@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import unicodedata
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -14,6 +15,7 @@ from loguru import logger
 from fagent.memory.policy import MemoryPolicy
 from fagent.memory.registry import MemoryRegistry
 from fagent.memory.types import EpisodeRecord, GraphExtractionJob, RetrievedMemory
+from fagent.memory.vector import _cosine_similarity
 from fagent.prompts import PromptLoader
 from fagent.providers.base import LLMProvider
 
@@ -91,7 +93,7 @@ _GRAPH_AGENT_TOOLS = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 8, "default": 5},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 32, "default": 20},
                 },
                 "required": ["query"],
             },
@@ -205,6 +207,7 @@ class LocalGraphBackend:
         extract_model: str | None = None,
         normalize_model: str | None = None,
         prompt_loader: PromptLoader | None = None,
+        semantic_embedder: Any | None = None,
     ):
         self.workspace = workspace
         self.registry = registry
@@ -213,6 +216,7 @@ class LocalGraphBackend:
         self.extract_model = extract_model
         self.normalize_model = normalize_model
         self.prompt_loader = prompt_loader or PromptLoader.from_package()
+        self.semantic_embedder = semantic_embedder
 
     @staticmethod
     def _looks_english(value: str) -> bool:
@@ -299,12 +303,100 @@ class LocalGraphBackend:
         return rows
 
     def _find_existing_entity_id(self, canonical_label: str) -> str | None:
-        rows = self.registry.find_graph_nodes(canonical_label, limit=8)
+        rows = self._search_graph_candidates(canonical_label, limit=8)
         for row in rows:
             metadata = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
+            score = float(row.get("search_score", 0.0))
+            semantic_score = float(row.get("semantic_score", 0.0))
             if self._normalize_text(str(metadata.get("canonical_name") or row["label"])) == self._normalize_text(canonical_label):
                 return str(row["id"])
+            if score >= 0.84 or semantic_score >= 0.9:
+                return str(row["id"])
         return None
+
+    def _compact_key(self, value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", self._normalize_text(value))
+
+    def _candidate_texts(self, row: Any) -> list[str]:
+        metadata = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
+        texts = [str(row["label"])]
+        canonical_name = str(metadata.get("canonical_name") or "").strip()
+        if canonical_name:
+            texts.append(canonical_name)
+        for alias in metadata.get("aliases") or []:
+            alias_text = str(alias).strip()
+            if alias_text:
+                texts.append(alias_text)
+        return list(dict.fromkeys(texts))
+
+    def _score_graph_row(self, query: str, row: Any) -> float:
+        normalized_query = self._normalize_text(query)
+        compact_query = self._compact_key(query)
+        best = 0.0
+        for text in self._candidate_texts(row):
+            normalized_text = self._normalize_text(text)
+            compact_text = self._compact_key(text)
+            if normalized_text == normalized_query:
+                best = max(best, 1.0)
+            elif compact_text and compact_text == compact_query:
+                best = max(best, 0.985)
+            elif normalized_query in normalized_text or normalized_text in normalized_query:
+                best = max(best, 0.94)
+            elif compact_query and compact_query in compact_text:
+                best = max(best, 0.91)
+            else:
+                best = max(best, SequenceMatcher(None, compact_query or normalized_query, compact_text or normalized_text).ratio())
+        return best
+
+    def _semantic_score_graph_rows(self, query: str, rows: list[Any]) -> dict[str, float]:
+        if not rows or self.semantic_embedder is None or getattr(self.semantic_embedder, "embedding_client", None) is None:
+            return {}
+        try:
+            query_vector = self.semantic_embedder.embedding_client.embed_texts([query])[0]
+            payloads = []
+            keys = []
+            for row in rows:
+                metadata = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
+                payload = " | ".join(self._candidate_texts(row) + [str(metadata.get("kind") or "")])
+                payloads.append(payload)
+                keys.append((str(row["id"]), payload))
+            vectors = self.semantic_embedder.embedding_client.embed_texts(payloads)
+            scores: dict[str, float] = {}
+            for (node_id, _payload), vector in zip(keys, vectors):
+                scores[node_id] = _cosine_similarity(query_vector, vector)
+            return scores
+        except Exception as exc:
+            logger.debug("Graph semantic search skipped: {}", exc)
+            return {}
+
+    def _search_graph_candidates(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+        raw_rows = self.registry.list_graph_nodes(query=None, limit=400)
+        preliminary: list[dict[str, Any]] = []
+        for row in raw_rows:
+            lexical = self._score_graph_row(query, row)
+            preliminary.append(
+                {
+                    "id": str(row["id"]),
+                    "label": str(row["label"]),
+                    "metadata_json": str(row["metadata_json"] or "{}"),
+                    "search_score": lexical,
+                    "lexical_score": lexical,
+                    "semantic_score": 0.0,
+                }
+            )
+        if not preliminary:
+            return []
+        preliminary.sort(key=lambda item: (item["lexical_score"], item["label"]), reverse=True)
+        semantic_scores = self._semantic_score_graph_rows(query, preliminary[:160])
+        ranked: list[dict[str, Any]] = []
+        for item in preliminary:
+            semantic = semantic_scores.get(item["id"], 0.0)
+            item["semantic_score"] = semantic
+            item["search_score"] = max(item["search_score"], semantic, 0.72 * item["lexical_score"] + 0.28 * semantic)
+            if item["lexical_score"] >= 0.52 or semantic >= 0.72 or item["search_score"] >= 0.7:
+                ranked.append(item)
+        ranked.sort(key=lambda item: (item["search_score"], item["semantic_score"], item["label"]), reverse=True)
+        return ranked[:limit]
 
     def healthcheck(self) -> bool:
         return True
@@ -488,14 +580,17 @@ class LocalGraphBackend:
     ) -> tuple[dict[str, Any], bool]:
         if name == "search_graph":
             query = str(arguments.get("query", "")).strip()
-            limit = max(1, min(8, int(arguments.get("limit", 5) or 5)))
-            rows = self.registry.find_graph_nodes(query, limit=limit) if query else []
+            limit = max(1, min(32, int(arguments.get("limit", 20) or 20)))
+            rows = self._search_graph_candidates(query, limit=limit) if query else []
             return {
                 "matches": [
                     {
                         "id": str(row["id"]),
                         "label": str(row["label"]),
                         "metadata": json.loads(row["metadata_json"]) if row["metadata_json"] else {},
+                        "search_score": float(row.get("search_score", 0.0)),
+                        "semantic_score": float(row.get("semantic_score", 0.0)),
+                        "lexical_score": float(row.get("lexical_score", 0.0)),
                     }
                     for row in rows
                 ]
