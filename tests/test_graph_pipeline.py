@@ -35,9 +35,11 @@ async def test_graph_pipeline_skips_without_llm(tmp_path: Path) -> None:
 class _ToolGraphProvider:
     def __init__(self) -> None:
         self.calls = 0
+        self.last_tool_choice = None
 
     async def chat(self, *args, **kwargs):
         self.calls += 1
+        self.last_tool_choice = kwargs.get("tool_choice")
         if self.calls == 1:
             return LLMResponse(
                 content=None,
@@ -112,6 +114,7 @@ async def test_graph_pipeline_creates_job_and_edges_with_tool_agent(tmp_path: Pa
 
     assert job is not None
     assert job.status == "done"
+    assert orchestrator.provider.last_tool_choice == "required"
     assert any("LanceDB" in item.snippet for item in results)
     assert orchestrator.registry.get_graph_node("entity:lancedb") is not None
     assert orchestrator.registry.get_graph_edge("entity:lancedb", "entity:shadow-context", "supports") is not None

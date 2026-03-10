@@ -118,6 +118,7 @@ class AzureOpenAIProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request to Azure OpenAI.
@@ -139,6 +140,8 @@ class AzureOpenAIProvider(LLMProvider):
         payload = self._prepare_request_payload(
             deployment_name, messages, tools, max_tokens, temperature, reasoning_effort
         )
+        if tools:
+            payload["tool_choice"] = tool_choice or "auto"
 
         try:
             async with httpx.AsyncClient(timeout=60.0, verify=True) as client:

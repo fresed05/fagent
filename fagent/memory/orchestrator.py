@@ -1197,7 +1197,18 @@ class MemoryOrchestrator:
                 detail="skipped: disabled",
             )
             return {"status": "skipped", "artifact_id": None}
-        current_tokens = int(session.metadata.get("estimated_context_tokens", 0))
+        current_tokens = int(session.metadata.get("last_prompt_tokens", 0) or session.metadata.get("estimated_context_tokens", 0) or 0)
+        peak_tokens = int(session.metadata.get("max_prompt_tokens_in_turn", 0) or current_tokens)
+        if current_tokens <= 0:
+            await self._emit_stage(
+                on_progress,
+                stage=stage,
+                status="not_triggered",
+                session_key=session.key,
+                turn_id=turn_id,
+                detail="not_triggered: usage_unavailable",
+            )
+            return {"status": "not_triggered", "artifact_id": None}
         threshold = int(self.config.auto_summarize.max_context_tokens * self.config.auto_summarize.trigger_ratio)
         last_cutoff = int(session.metadata.get("summary_cutoff_idx", 0))
         if current_tokens < threshold:
@@ -1207,7 +1218,7 @@ class MemoryOrchestrator:
                 status="not_triggered",
                 session_key=session.key,
                 turn_id=turn_id,
-                detail=f"not_triggered: {current_tokens}/{threshold} tokens",
+                detail=f"not_triggered: last_prompt_tokens={current_tokens}, peak_prompt_tokens={peak_tokens}, threshold={threshold}",
             )
             return {"status": "not_triggered", "artifact_id": None}
         if len(session.messages) - last_cutoff < self.config.auto_summarize.min_new_messages:
@@ -1271,11 +1282,6 @@ class MemoryOrchestrator:
             self.vector_backend.ingest_artifact(artifact)
         if self.config.auto_summarize.archive_mode == "archive_continue":
             session.metadata["summary_cutoff_idx"] = max(last_cutoff, last_cutoff + len(slice_messages))
-            trimmed_tokens = sum(len(str(msg.get("content", ""))) for msg in slice_messages) // 4
-            session.metadata["estimated_context_tokens"] = max(
-                0,
-                int(session.metadata.get("estimated_context_tokens", 0)) - trimmed_tokens,
-            )
         await self._emit_stage(
             on_progress,
             stage=stage,
@@ -1295,9 +1301,12 @@ class MemoryOrchestrator:
 
     async def _build_session_summary_text(self, session_key: str, messages: list[dict]) -> str:
         auto_role = self.app_config.resolve_model_role("auto_summarize", self.model) if self.app_config else None
-        prompt_text = self.prompts.load("system/auto-summarize.md").text if (self.prompts.root / "system" / "auto-summarize.md").exists() else (
-            "Summarize the covered session slice with durable decisions, active threads, unresolved blockers, task outputs, and citations."
-        )
+        try:
+            prompt_text = self.prompts.load("system/auto-summarize.md").text
+        except Exception:
+            prompt_text = (
+                "Summarize the covered session slice with durable decisions, active threads, unresolved blockers, task outputs, and citations."
+            )
         payload = "\n".join(
             f"[{msg.get('turn_id','?')}] {msg.get('role','?')}: {str(msg.get('content',''))[:500]}"
             for msg in messages

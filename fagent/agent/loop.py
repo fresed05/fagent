@@ -278,6 +278,9 @@ class AgentLoop:
         final_content = None
         tools_used: list[str] = []
         usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        max_prompt_tokens = 0
+        last_prompt_tokens = 0
+        usage_seen = False
         tool_call_count = 0
 
         while iteration < self.max_iterations:
@@ -293,6 +296,11 @@ class AgentLoop:
             )
             for key in usage_totals:
                 usage_totals[key] += int(response.usage.get(key, 0))
+            current_prompt_tokens = int(response.usage.get("prompt_tokens", 0) or 0)
+            if current_prompt_tokens > 0:
+                usage_seen = True
+                last_prompt_tokens = current_prompt_tokens
+                max_prompt_tokens = max(max_prompt_tokens, current_prompt_tokens)
 
             if response.has_tool_calls:
                 tool_call_count += len(response.tool_calls)
@@ -389,6 +397,9 @@ class AgentLoop:
                 "without completing the task. You can try breaking the task into smaller steps."
             )
 
+        usage_totals["last_prompt_tokens"] = last_prompt_tokens
+        usage_totals["max_prompt_tokens"] = max_prompt_tokens
+        usage_totals["usage_seen"] = 1 if usage_seen else 0
         return final_content, tools_used, messages, usage_totals, tool_call_count
 
     async def run(self) -> None:
@@ -685,13 +696,22 @@ class AgentLoop:
         )
 
     def _update_session_usage(self, session: Session, usage_totals: dict[str, int]) -> None:
-        estimated = int(session.metadata.get("estimated_context_tokens", 0))
-        prompt_tokens = int(usage_totals.get("prompt_tokens", 0))
-        if prompt_tokens <= 0:
-            recent_text = "\n".join(str(msg.get("content", "")) for msg in session.messages[-24:])
-            prompt_tokens = max(1, len(recent_text) // 4)
-        session.metadata["estimated_context_tokens"] = estimated + prompt_tokens
-        session.metadata["last_usage"] = usage_totals
+        prompt_tokens = int(usage_totals.get("last_prompt_tokens", 0) or 0)
+        max_prompt_tokens = int(usage_totals.get("max_prompt_tokens", 0) or 0)
+        usage_seen = bool(int(usage_totals.get("usage_seen", 0) or 0))
+        total_prompt_tokens = int(session.metadata.get("total_prompt_tokens", 0))
+        total_completion_tokens = int(session.metadata.get("total_completion_tokens", 0))
+        if usage_seen and prompt_tokens > 0:
+            session.metadata["estimated_context_tokens"] = prompt_tokens
+            session.metadata["last_prompt_tokens"] = prompt_tokens
+            session.metadata["max_prompt_tokens_in_turn"] = max_prompt_tokens or prompt_tokens
+        else:
+            session.metadata["estimated_context_tokens"] = 0
+            session.metadata["last_prompt_tokens"] = 0
+            session.metadata["max_prompt_tokens_in_turn"] = 0
+        session.metadata["total_prompt_tokens"] = total_prompt_tokens + int(usage_totals.get("prompt_tokens", 0))
+        session.metadata["total_completion_tokens"] = total_completion_tokens + int(usage_totals.get("completion_tokens", 0))
+        session.metadata["last_usage"] = dict(usage_totals)
 
     async def _post_turn_memory_tasks(
         self,

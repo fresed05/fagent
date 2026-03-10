@@ -259,6 +259,7 @@ class LocalGraphBackend:
                 model=self.extract_model,
                 temperature=0.0,
                 max_tokens=900,
+                tool_choice="required",
             )
             assistant_message: dict[str, Any] = {
                 "role": "assistant",
@@ -279,7 +280,13 @@ class LocalGraphBackend:
             messages.append(assistant_message)
 
             if not response.has_tool_calls:
-                raise ValueError("graph_agent_no_tool_calls")
+                content_preview = (response.content or "").strip().replace("\n", " ")
+                finish_reason = response.finish_reason or "stop"
+                raise ValueError(
+                    "graph_agent_no_tool_calls"
+                    + (f": finish_reason={finish_reason}" if finish_reason else "")
+                    + (f": content={content_preview[:180]}" if content_preview else "")
+                )
 
             finished = False
             for call in response.tool_calls:

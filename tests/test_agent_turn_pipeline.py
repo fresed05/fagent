@@ -88,3 +88,26 @@ async def test_process_direct_emits_presearch_and_turn_complete(tmp_path: Path) 
 
     assert ("Pre-search", "ok") in events
     assert ("Turn complete", "done") in events
+
+
+def test_update_session_usage_prefers_real_prompt_tokens() -> None:
+    from fagent.session.manager import Session
+
+    loop = AgentLoop.__new__(AgentLoop)
+    session = Session(key="cli:direct")
+
+    loop._update_session_usage(
+        session,
+        {
+            "prompt_tokens": 1400,
+            "completion_tokens": 200,
+            "total_tokens": 1600,
+            "last_prompt_tokens": 900,
+            "max_prompt_tokens": 1100,
+            "usage_seen": 1,
+        },
+    )
+
+    assert session.metadata["estimated_context_tokens"] == 900
+    assert session.metadata["last_prompt_tokens"] == 900
+    assert session.metadata["max_prompt_tokens_in_turn"] == 1100
