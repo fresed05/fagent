@@ -459,9 +459,4 @@ edgeForm.addEventListener("submit", async (event) => {
 });
 
 renderInspectorEmpty();
-if (queryInput.value.trim() || sessionInput.value.trim()) {
-  loadGraph().catch(showError);
-} else {
-  updateStats({ nodes: [], edges: [] });
-  setStatus("Use /graph inside a session or enter a query before loading the graph.");
-}
+loadGraph().catch(showError);

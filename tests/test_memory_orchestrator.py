@@ -6,6 +6,7 @@ from fagent.config.schema import MemoryConfig
 from fagent.memory.file_store import FileMemoryStore
 from fagent.memory.orchestrator import MemoryOrchestrator
 from fagent.memory.types import EpisodeRecord
+from fagent.providers.base import LLMResponse, ToolCallRequest
 from fagent.session.manager import Session
 
 
@@ -186,3 +187,69 @@ async def test_vector_failure_does_not_break_file_memory(
     assert (tmp_path / "memory" / "HISTORY.md").exists()
     assert orchestrator.registry.get_job_status("ep-4") == "retry"
     assert any("[file]" in item for item in orchestrator.query("fallback behavior"))
+
+
+def test_export_graph_subgraph_returns_latest_graph_without_filters(tmp_path: Path) -> None:
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
+    orchestrator.registry.upsert_graph_node("entity:ssh", "SSH", {"kind": "entity"})
+    orchestrator.registry.upsert_graph_node("fact:ssh-port", "SSH listens on 22/tcp", {"kind": "fact"})
+    orchestrator.registry.upsert_graph_edge("entity:ssh", "fact:ssh-port", "described_by", 1.0, {})
+
+    payload = orchestrator.export_graph_subgraph()
+
+    assert len(payload["nodes"]) == 2
+    assert len(payload["edges"]) == 1
+    assert payload["message"] == "Loaded latest graph snapshot."
+
+
+@pytest.mark.asyncio
+async def test_graph_stage_skips_repeated_turns_in_same_session(tmp_path: Path) -> None:
+    class _GraphProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, *args, **kwargs):
+            self.calls += 1
+            return LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(id="1", name="create_entity", arguments={"entity_id": "entity:ssh", "label": "SSH", "kind": "entity"}),
+                    ToolCallRequest(id="2", name="finish_graph_plan", arguments={"reason": "done"}),
+                ],
+            )
+
+        def get_default_model(self) -> str:
+            return "stub"
+
+    provider = _GraphProvider()
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=provider, model="test-model")
+    orchestrator.graph_backend.extract_model = "stub-graph"
+    first = EpisodeRecord(
+        episode_id="ep-r1",
+        session_key="cli:direct",
+        turn_id="turn-000101",
+        channel="cli",
+        chat_id="direct",
+        user_text="повтори снова",
+        assistant_text="22 — SSH, 3389 — XRDP, 8000 — cliproxyapi.",
+        timestamp="2026-03-10T06:00:00",
+    )
+    second = EpisodeRecord(
+        episode_id="ep-r2",
+        session_key="cli:direct",
+        turn_id="turn-000102",
+        channel="cli",
+        chat_id="direct",
+        user_text="повтори в одну строку",
+        assistant_text="22 — SSH, 3389 — XRDP, 8000 — cliproxyapi",
+        timestamp="2026-03-10T06:01:00",
+    )
+
+    orchestrator._ensure_session_artifact(first)
+    status_first = await orchestrator._run_graph_stage(first)
+    orchestrator._ensure_session_artifact(second)
+    status_second = await orchestrator._run_graph_stage(second)
+
+    assert status_first == "done"
+    assert status_second == "skipped"
+    assert provider.calls == 1

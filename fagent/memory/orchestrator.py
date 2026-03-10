@@ -6,7 +6,9 @@ import json
 import asyncio
 import hashlib
 import time
+import re
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable
 
@@ -141,6 +143,50 @@ class MemoryOrchestrator:
             extra=extra or {},
         )
 
+    @staticmethod
+    def _normalize_repeat_text(value: str) -> str:
+        text = re.sub(r"\s+", " ", (value or "").strip().lower())
+        return re.sub(r"[^\w\s:/.-]+", "", text)
+
+    def _is_repeat_request(self, user_text: str) -> bool:
+        normalized = self._normalize_repeat_text(user_text)
+        markers = (
+            "повтори",
+            "еще раз",
+            "ещё раз",
+            "еще",
+            "ещё",
+            "коротко",
+            "в одну строку",
+            "снова",
+            "repeat",
+            "again",
+            "restate",
+        )
+        return any(marker in normalized for marker in markers)
+
+    def _should_skip_graph_for_repeat(self, episode: EpisodeRecord) -> bool:
+        if not episode.session_key or not self._is_repeat_request(episode.user_text):
+            return False
+        current = self._normalize_repeat_text(episode.assistant_text)
+        if not current:
+            return False
+        recent = self.registry.list_session_artifacts(
+            episode.session_key,
+            artifact_type="session_turn",
+            limit=8,
+        )
+        for artifact in recent:
+            if artifact.id == episode.episode_id:
+                continue
+            previous = self._normalize_repeat_text(str(artifact.metadata.get("assistant_text") or ""))
+            if not previous:
+                continue
+            similarity = SequenceMatcher(None, current, previous).ratio()
+            if similarity >= 0.86 or current in previous or previous in current:
+                return True
+        return False
+
     def _ensure_session_artifact(self, episode: EpisodeRecord) -> MemoryArtifact:
         summary = self.policy.build_summary(episode)
         artifact = MemoryArtifact(
@@ -153,6 +199,8 @@ class MemoryOrchestrator:
                 "turn_id": episode.turn_id,
                 "chat_id": episode.chat_id,
                 "channel": episode.channel,
+                "user_text": episode.user_text,
+                "assistant_text": episode.assistant_text,
                 "topic_tags": episode.metadata.get("topic_tags", []),
             },
             source_ref=episode.metadata.get("source_path", ""),
@@ -182,6 +230,16 @@ class MemoryOrchestrator:
     ) -> str:
         stage = "Building graph"
         started_at = time.perf_counter()
+        if self._should_skip_graph_for_repeat(episode):
+            await self._emit_stage(
+                on_progress,
+                stage=stage,
+                status="skipped",
+                session_key=episode.session_key,
+                turn_id=episode.turn_id,
+                detail="skipped: repeated_turn_already_in_graph",
+            )
+            return "skipped"
         await self._emit_stage(
             on_progress,
             stage=stage,
@@ -875,12 +933,6 @@ class MemoryOrchestrator:
         node_limit: int = 200,
         edge_limit: int = 400,
     ) -> dict[str, object]:
-        if not query and not session_key:
-            return {
-                "nodes": [],
-                "edges": [],
-                "message": "Provide a session or query to load graph data.",
-            }
         node_ids = self.registry.recent_graph_node_ids_for_session(session_key, limit=node_limit) if session_key else None
         raw_nodes = self.registry.list_graph_nodes(query=query, node_ids=node_ids, limit=node_limit)
         nodes = []
@@ -925,7 +977,11 @@ class MemoryOrchestrator:
                 }
                 for row in edges
             ],
-            "message": "" if resolved_ids else "No graph items matched the current scope.",
+            "message": (
+                "Loaded latest graph snapshot."
+                if resolved_ids and not query and not session_key
+                else ("" if resolved_ids else "No graph items matched the current scope.")
+            ),
         }
 
     def _sync_graph_node(self, node_id: str) -> list[str]:

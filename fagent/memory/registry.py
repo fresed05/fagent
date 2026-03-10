@@ -216,6 +216,35 @@ class MemoryRegistry:
             for row in rows
         ]
 
+    def list_session_artifacts(
+        self,
+        session_key: str,
+        *,
+        artifact_type: str | None = None,
+        limit: int = 50,
+    ) -> list[MemoryArtifact]:
+        sql = "SELECT * FROM artifacts WHERE lower(metadata_json) LIKE ?"
+        params: list[Any] = [f"%{session_key.lower()}%"]
+        if artifact_type:
+            sql += " AND type = ?"
+            params.append(artifact_type)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [
+            MemoryArtifact(
+                id=row["id"],
+                type=row["type"],
+                content=row["content"],
+                summary=row["summary"],
+                metadata=json.loads(row["metadata_json"]),
+                source_ref=row["source_ref"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
     def set_job_status(self, episode_id: str, status: str, error: str | None = None) -> None:
         with self._connect() as conn:
             conn.execute(
