@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -14,6 +16,69 @@ from fagent.memory.registry import MemoryRegistry
 from fagent.memory.types import EpisodeRecord, GraphExtractionJob, RetrievedMemory
 from fagent.prompts import PromptLoader
 from fagent.providers.base import LLMProvider
+
+
+_RELATION_SYNONYMS = {
+    "uses": "uses",
+    "use": "uses",
+    "utilizes": "uses",
+    "is using": "uses",
+    "works with": "uses",
+    "использует": "uses",
+    "зависит от": "depends_on",
+    "depends on": "depends_on",
+    "depends_on": "depends_on",
+    "supports": "supports",
+    "support": "supports",
+    "поддерживает": "supports",
+    "belongs to": "belongs_to",
+    "belongs_to": "belongs_to",
+    "отноcится к": "belongs_to",
+    "supersedes": "supersedes",
+    "mentions": "mentions",
+    "упоминает": "mentions",
+    "runs on": "runs_on",
+    "runs_on": "runs_on",
+    "работает на": "runs_on",
+    "connects to": "connects_to",
+    "connects_to": "connects_to",
+    "подключается к": "connects_to",
+    "stores in": "stores_in",
+    "stores_in": "stores_in",
+    "хранит в": "stores_in",
+    "blocked by": "blocked_by",
+    "blocked_by": "blocked_by",
+    "blocked_by": "blocked_by",
+    "блокируется": "blocked_by",
+    "decided": "decided",
+    "решили": "decided",
+    "configured with": "configured_with",
+    "configured_with": "configured_with",
+    "configured": "configured_with",
+    "настроен через": "configured_with",
+    "relates_to": "mentions",
+}
+
+_ENGLISH_CANONICAL_MAP = {
+    "теневой контекст": "shadow context",
+    "shadow context": "shadow context",
+    "графовая память": "graph memory",
+    "graph memory": "graph memory",
+    "память графа": "graph memory",
+    "ланседб": "lancedb",
+    "лэнсдб": "lancedb",
+    "использует lancedb": "uses lancedb",
+    "использует": "uses",
+    "решение": "decision",
+    "рабочий процесс": "workflow",
+    "проект": "project",
+    "сессия": "session",
+}
+
+_GENERIC_ENTITY_WORDS = {
+    "good", "look", "thing", "remember", "future", "project", "memory", "graph", "system",
+    "штука", "вещь", "память", "граф", "система", "проект",
+}
 
 
 _GRAPH_AGENT_TOOLS = [
@@ -54,11 +119,16 @@ _GRAPH_AGENT_TOOLS = [
                 "properties": {
                     "entity_id": {"type": "string"},
                     "label": {"type": "string"},
+                    "surface_label": {"type": "string"},
+                    "canonical_english_label": {"type": "string"},
                     "kind": {"type": "string"},
                     "aliases": {"type": "array", "items": {"type": "string"}},
+                    "source_language": {"type": "string"},
+                    "language_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "ambiguous_language": {"type": "boolean"},
                     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 },
-                "required": ["label", "kind"],
+                "required": ["kind"],
             },
         },
     },
@@ -72,11 +142,16 @@ _GRAPH_AGENT_TOOLS = [
                 "properties": {
                     "fact_id": {"type": "string"},
                     "statement": {"type": "string"},
+                    "statement_english": {"type": "string"},
+                    "surface_statement": {"type": "string"},
                     "subject_id": {"type": "string"},
+                    "source_language": {"type": "string"},
+                    "language_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "ambiguous_language": {"type": "boolean"},
                     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                     "supersedes": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["statement"],
+                "required": [],
             },
         },
     },
@@ -91,6 +166,9 @@ _GRAPH_AGENT_TOOLS = [
                     "source_id": {"type": "string"},
                     "target_id": {"type": "string"},
                     "relation": {"type": "string"},
+                    "source_language": {"type": "string"},
+                    "language_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "ambiguous_language": {"type": "boolean"},
                     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 },
                 "required": ["source_id", "target_id", "relation"],
@@ -135,6 +213,98 @@ class LocalGraphBackend:
         self.extract_model = extract_model
         self.normalize_model = normalize_model
         self.prompt_loader = prompt_loader or PromptLoader.from_package()
+
+    @staticmethod
+    def _looks_english(value: str) -> bool:
+        text = (value or "").strip()
+        if not text:
+            return False
+        return bool(re.fullmatch(r"[A-Za-z0-9 _./:+#()-]+", text))
+
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        text = unicodedata.normalize("NFKC", value or "").strip().lower()
+        text = re.sub(r"\s+", " ", text)
+        return text
+
+    def _detect_language(self, value: str) -> str:
+        text = value or ""
+        has_cyrillic = any("CYRILLIC" in unicodedata.name(ch, "") for ch in text if ch.isalpha())
+        has_latin = any("LATIN" in unicodedata.name(ch, "") for ch in text if ch.isalpha())
+        if has_cyrillic and not has_latin:
+            return "ru"
+        if has_latin and not has_cyrillic:
+            return "en"
+        if has_cyrillic and has_latin:
+            return "mixed"
+        return "unknown"
+
+    def _canonicalize_english(self, value: str) -> tuple[str, str, float, str]:
+        raw = (value or "").strip()
+        normalized = self._normalize_text(raw)
+        if not normalized:
+            return "", "unknown", 0.0, "empty"
+        language = self._detect_language(raw)
+        if normalized in _ENGLISH_CANONICAL_MAP:
+            return _ENGLISH_CANONICAL_MAP[normalized], language, 0.96, "dictionary"
+        if self._looks_english(raw):
+            english = re.sub(r"\s+", " ", raw).strip()
+            return english, "en", 0.98, "exact"
+        token_parts: list[str] = []
+        for token in normalized.split():
+            mapped = _ENGLISH_CANONICAL_MAP.get(token)
+            if mapped:
+                token_parts.append(mapped)
+            elif re.fullmatch(r"[a-z0-9._:/+-]+", token):
+                token_parts.append(token)
+            else:
+                return "", language, 0.0, "unsupported_language"
+        english = re.sub(r"\s+", " ", " ".join(token_parts)).strip()
+        if not english or not self._looks_english(english):
+            return "", language, 0.0, "unsupported_language"
+        confidence = 0.82 if language != "en" else 0.95
+        return english, language, confidence, "token_map"
+
+    def _normalize_relation(self, relation: str) -> tuple[str, float]:
+        candidate = self._normalize_text(relation).replace("-", "_")
+        if candidate in _RELATION_SYNONYMS:
+            return _RELATION_SYNONYMS[candidate], 0.98
+        if candidate.replace("_", " ") in _RELATION_SYNONYMS:
+            return _RELATION_SYNONYMS[candidate.replace("_", " ")], 0.94
+        return "", 0.0
+
+    def _build_alias_rows(
+        self,
+        canonical_label: str,
+        aliases: list[str],
+        source_label: str,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for alias_text in [canonical_label, source_label, *aliases]:
+            alias = str(alias_text or "").strip()
+            if not alias:
+                continue
+            key = alias.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                {
+                    "alias_text": alias,
+                    "alias_language": self._detect_language(alias),
+                    "is_canonical": alias == canonical_label,
+                }
+            )
+        return rows
+
+    def _find_existing_entity_id(self, canonical_label: str) -> str | None:
+        rows = self.registry.find_graph_nodes(canonical_label, limit=8)
+        for row in rows:
+            metadata = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
+            if self._normalize_text(str(metadata.get("canonical_name") or row["label"])) == self._normalize_text(canonical_label):
+                return str(row["id"])
+        return None
 
     def healthcheck(self) -> bool:
         return True
@@ -356,30 +526,62 @@ class LocalGraphBackend:
             }, False
 
         if name == "create_entity":
-            label = str(arguments.get("label", "")).strip()
+            surface_label = str(arguments.get("surface_label") or arguments.get("label") or "").strip()
+            requested_canonical = str(arguments.get("canonical_english_label") or arguments.get("label") or "").strip()
             kind = str(arguments.get("kind", "")).strip() or "entity"
-            if not label:
+            surface_language = self._detect_language(surface_label) if surface_label else "unknown"
+            english_label, source_language, language_confidence, normalization_method = self._canonicalize_english(
+                requested_canonical or surface_label
+            )
+            if not english_label and surface_label:
+                english_label, source_language, language_confidence, normalization_method = self._canonicalize_english(surface_label)
+            if not english_label:
+                return {"ok": False, "error": "english_canonicalization_required"}, False
+            if language_confidence < 0.75 or self._normalize_text(surface_label or english_label) in _GENERIC_ENTITY_WORDS:
+                return {"ok": False, "error": "ambiguous_or_generic_entity"}, False
+            if not surface_label:
+                surface_label = english_label
+            if not english_label:
                 return {"ok": False, "error": "label_required"}, False
-            entity_id = str(arguments.get("entity_id") or f"entity:{self._slug(label)}")
+            entity_id = str(arguments.get("entity_id") or self._find_existing_entity_id(english_label) or f"entity:{self._slug(english_label)}")
             aliases = [str(item).strip() for item in (arguments.get("aliases") or []) if str(item).strip()]
             stage["entities"][entity_id] = {
                 "id": entity_id,
-                "name": label,
+                "name": english_label,
+                "surface_label": surface_label,
                 "kind": kind,
                 "aliases": aliases,
+                "source_language": str(arguments.get("source_language") or (surface_language if surface_language != "unknown" else source_language)),
+                "language_confidence": float(arguments.get("language_confidence", language_confidence) or language_confidence),
+                "normalization_method": normalization_method,
+                "ambiguous_language": bool(arguments.get("ambiguous_language", language_confidence < 0.75)),
                 "confidence": float(arguments.get("confidence", 0.7) or 0.7),
             }
             return {"ok": True, "entity_id": entity_id}, False
 
         if name == "create_fact":
-            statement = str(arguments.get("statement", "")).strip()
+            surface_statement = str(arguments.get("surface_statement") or arguments.get("statement") or "").strip()
+            requested_english = str(arguments.get("statement_english") or arguments.get("statement") or "").strip()
+            surface_language = self._detect_language(surface_statement) if surface_statement else "unknown"
+            statement, source_language, language_confidence, normalization_method = self._canonicalize_english(
+                requested_english or surface_statement
+            )
+            if not statement and surface_statement:
+                statement, source_language, language_confidence, normalization_method = self._canonicalize_english(surface_statement)
             if not statement:
                 return {"ok": False, "error": "statement_required"}, False
+            if language_confidence < 0.75:
+                return {"ok": False, "error": "ambiguous_fact_language"}, False
             fact_id = str(arguments.get("fact_id") or f"fact:{self._slug(statement)}")
             stage["facts"][fact_id] = {
                 "id": fact_id,
                 "statement": statement,
+                "surface_statement": surface_statement or statement,
                 "subject": str(arguments.get("subject_id") or ""),
+                "source_language": str(arguments.get("source_language") or (surface_language if surface_language != "unknown" else source_language)),
+                "language_confidence": float(arguments.get("language_confidence", language_confidence) or language_confidence),
+                "normalization_method": normalization_method,
+                "ambiguous_language": bool(arguments.get("ambiguous_language", language_confidence < 0.75)),
                 "confidence": float(arguments.get("confidence", 0.8) or 0.8),
                 "supersedes": [str(item).strip() for item in (arguments.get("supersedes") or []) if str(item).strip()],
             }
@@ -388,14 +590,16 @@ class LocalGraphBackend:
         if name == "create_relation":
             source_id = str(arguments.get("source_id", "")).strip()
             target_id = str(arguments.get("target_id", "")).strip()
-            relation = str(arguments.get("relation", "")).strip()
+            relation, relation_conf = self._normalize_relation(str(arguments.get("relation", "")).strip())
             if not source_id or not target_id or not relation:
                 return {"ok": False, "error": "source_target_relation_required"}, False
+            if relation_conf < 0.75:
+                return {"ok": False, "error": "relation_not_allowed"}, False
             relation_item = {
                 "source": source_id,
                 "target": target_id,
                 "type": relation,
-                "confidence": float(arguments.get("confidence", 0.75) or 0.75),
+                "confidence": float(arguments.get("confidence", relation_conf) or relation_conf),
             }
             if relation_item not in stage["relations"]:
                 stage["relations"].append(relation_item)
@@ -451,14 +655,24 @@ class LocalGraphBackend:
         for entity in entities:
             entity_id = str(entity.get("id") or f"entity:{self._slug(entity.get('name', 'unknown'))}")
             label = str(entity.get("name") or entity_id)
+            aliases = self._build_alias_rows(
+                label,
+                list(entity.get("aliases") or []),
+                str(entity.get("surface_label") or label),
+            )
             metadata = {
                 "kind": entity.get("kind", "entity"),
-                "aliases": entity.get("aliases", []),
+                "aliases": [item["alias_text"] for item in aliases],
+                "canonical_name": label,
+                "source_language": entity.get("source_language", "en"),
+                "language_confidence": entity.get("language_confidence", 1.0),
+                "normalization_method": entity.get("normalization_method", "exact"),
                 "confidence": entity.get("confidence", 0.7),
                 "provenance_episode": episode.episode_id,
                 "source": "llm_graph_agent",
             }
             self.registry.upsert_graph_node(entity_id, label=label, metadata=metadata)
+            self.registry.replace_graph_aliases(entity_id, aliases)
             self.registry.upsert_graph_edge(
                 episode_node,
                 entity_id,
@@ -476,6 +690,11 @@ class LocalGraphBackend:
                 metadata={
                     "kind": "fact",
                     "statement": statement,
+                    "canonical_statement_en": statement,
+                    "surface_statement": fact.get("surface_statement", statement),
+                    "source_language": fact.get("source_language", "en"),
+                    "language_confidence": fact.get("language_confidence", 1.0),
+                    "normalization_method": fact.get("normalization_method", "exact"),
                     "confidence": fact.get("confidence", 0.8),
                     "provenance_episode": episode.episode_id,
                     "supersedes": fact.get("supersedes", []),
@@ -510,7 +729,7 @@ class LocalGraphBackend:
             self.registry.upsert_graph_edge(
                 str(relation.get("source") or episode_node),
                 str(relation.get("target") or episode_node),
-                relation=str(relation.get("type") or "relates_to"),
+                relation=str(relation.get("type") or "mentions"),
                 weight=float(relation.get("confidence", 0.75)),
                 metadata={"episode_id": episode.episode_id, "source": "relation"},
             )

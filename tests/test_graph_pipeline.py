@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from fagent.config.schema import Config
+from fagent.memory.graph import LocalGraphBackend
 from fagent.memory.orchestrator import MemoryOrchestrator
 from fagent.memory.types import EpisodeRecord
 from fagent.providers.base import LLMResponse, ToolCallRequest
@@ -175,3 +176,57 @@ async def test_graph_pipeline_uses_graph_extract_role_provider(tmp_path: Path) -
     assert orchestrator.graph_backend.provider is graph_provider
     assert graph_provider.calls > 0
     assert main_provider.calls == 0
+
+
+def test_graph_tool_normalizes_russian_entity_and_relation_to_english(tmp_path: Path) -> None:
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
+    backend = LocalGraphBackend(tmp_path, orchestrator.registry)
+    stage = {"summary": "", "reason": "", "entities": {}, "facts": {}, "relations": []}
+
+    entity_result, finished = backend._run_graph_tool(
+        "create_entity",
+        {
+            "surface_label": "теневой контекст",
+            "canonical_english_label": "shadow context",
+            "kind": "workflow",
+            "aliases": ["теневой контекст", "shadow context"],
+        },
+        stage,
+    )
+    relation_result, relation_finished = backend._run_graph_tool(
+        "create_relation",
+        {
+            "source_id": "entity:a",
+            "target_id": "entity:b",
+            "relation": "использует",
+        },
+        stage,
+    )
+
+    assert entity_result["ok"] is True
+    assert finished is False
+    assert relation_result["ok"] is True
+    assert relation_finished is False
+    entity = next(iter(stage["entities"].values()))
+    assert entity["name"] == "shadow context"
+    assert entity["source_language"] == "ru"
+    assert stage["relations"][0]["type"] == "uses"
+
+
+def test_graph_tool_skips_low_confidence_non_english_entity(tmp_path: Path) -> None:
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
+    backend = LocalGraphBackend(tmp_path, orchestrator.registry)
+    stage = {"summary": "", "reason": "", "entities": {}, "facts": {}, "relations": []}
+
+    result, _ = backend._run_graph_tool(
+        "create_entity",
+        {
+            "surface_label": "непонятная сущность",
+            "kind": "concept",
+        },
+        stage,
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "english_canonicalization_required"
+    assert stage["entities"] == {}
