@@ -701,6 +701,7 @@ def agent(
 
     async def _cli_progress(content: str, **kwargs) -> None:
         ch = agent_loop.channels_config
+        event_channel = str(kwargs.get("channel", "cli") or "cli")
         event = {
             "content": content,
             "stage": kwargs.get("stage", ""),
@@ -714,9 +715,9 @@ def agent(
             "error": kwargs.get("error", ""),
         }
         is_tool_hint = event["event"] == "tool"
-        if ch and is_tool_hint and not ch.send_tool_hints:
+        if ch and is_tool_hint and event_channel != "cli" and not ch.send_tool_hints:
             return
-        if ch and not is_tool_hint and not ch.send_progress:
+        if ch and event_channel != "cli" and not is_tool_hint and not ch.send_progress:
             return
         timeline.handle_event(event)
 
@@ -773,9 +774,10 @@ def agent(
                             event = dict(msg.metadata.get("_progress_event") or {})
                             is_tool_hint = event.get("event") == "tool"
                             ch = agent_loop.channels_config
-                            if ch and is_tool_hint and not ch.send_tool_hints:
+                            event_channel = str(msg.channel or "cli")
+                            if ch and is_tool_hint and event_channel != "cli" and not ch.send_tool_hints:
                                 pass
-                            elif ch and not is_tool_hint and not ch.send_progress:
+                            elif ch and event_channel != "cli" and not is_tool_hint and not ch.send_progress:
                                 pass
                             else:
                                 event.setdefault("content", msg.content)
