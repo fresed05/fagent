@@ -33,6 +33,7 @@ from fagent.agent.tools.web import WebFetchTool, WebSearchTool
 from fagent.agent.tools.workflow import WorkflowTool
 from fagent.bus.events import InboundMessage, OutboundMessage
 from fagent.bus.queue import MessageBus
+from fagent.memory.graph_ui import get_graph_ui_manager
 from fagent.providers.factory import ProviderFactory
 from fagent.providers.base import LLMProvider
 from fagent.memory.orchestrator import MemoryOrchestrator, NullMemoryOrchestrator
@@ -166,6 +167,7 @@ class AgentLoop:
             workflow_provider = self.provider_factory.build_from_profile(workflow_light_role)
         self.tools.register(WorkflowTool(
             tool_registry=self.tools,
+            workspace=self.workspace,
             provider=workflow_provider,
             model=(workflow_light_role.model if workflow_light_role and workflow_light_role.model else self.model),
             max_tokens=min(1200, self.max_tokens),
@@ -465,8 +467,25 @@ class AgentLoop:
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 fagent commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="🐈 fagent commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/graph [query] — Open local graph UI\n/help — Show available commands",
+            )
+        if cmd.startswith("/graph"):
+            query = msg.content.strip()[len("/graph"):].strip() or None
+            manager = get_graph_ui_manager(self.workspace)
+            url = manager.start(
+                self.memory,
+                query=query,
+                session_key=key,
+                open_browser=(msg.channel == "cli"),
+            )
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"Graph UI: {url}",
+            )
 
         unconsolidated = len(session.messages) - session.last_consolidated
         if (unconsolidated >= self.memory_window and session.key not in self._consolidating):

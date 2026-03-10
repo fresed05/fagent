@@ -581,10 +581,27 @@ class MemoryOrchestrator:
             row = candidates[0] if candidates else None
         if row is not None:
             edges = self.registry.get_graph_edges_for_node(row["id"])
+            neighbor_ids = {
+                str(edge["target_id"]) if str(edge["source_id"]) == str(row["id"]) else str(edge["source_id"])
+                for edge in edges
+            }
+            neighbors = []
+            for neighbor_id in neighbor_ids:
+                neighbor_row = self.registry.get_graph_node(neighbor_id)
+                if neighbor_row is None:
+                    continue
+                neighbors.append(
+                    {
+                        "id": neighbor_row["id"],
+                        "label": neighbor_row["label"],
+                        "metadata": json.loads(neighbor_row["metadata_json"]) if neighbor_row["metadata_json"] else {},
+                    }
+                )
             return {
                 "id": row["id"],
                 "label": row["label"],
                 "metadata": json.loads(row["metadata_json"]),
+                "neighbors": neighbors,
                 "edges": [
                     {
                         "source_id": edge["source_id"],
@@ -616,6 +633,116 @@ class MemoryOrchestrator:
                     "edges": edges,
                 }
         return None
+
+    def export_graph_subgraph(
+        self,
+        *,
+        query: str | None = None,
+        session_key: str | None = None,
+        node_limit: int = 200,
+        edge_limit: int = 400,
+    ) -> dict[str, object]:
+        node_ids = self.registry.recent_graph_node_ids_for_session(session_key, limit=node_limit) if session_key else None
+        nodes = self.registry.list_graph_nodes(query=query, node_ids=node_ids, limit=node_limit)
+        resolved_ids = [str(row["id"]) for row in nodes]
+        edges = self.registry.list_graph_edges(node_ids=resolved_ids if resolved_ids else node_ids, limit=edge_limit)
+        layouts = self.registry.load_graph_layouts(resolved_ids)
+        layout_map = {
+            str(row["node_id"]): {
+                "x": float(row["x"]),
+                "y": float(row["y"]),
+                "pinned": bool(row["pinned"]),
+                "updated_at": str(row["updated_at"]),
+            }
+            for row in layouts
+        }
+        return {
+            "nodes": [
+                {
+                    "id": str(row["id"]),
+                    "label": str(row["label"]),
+                    "metadata": json.loads(row["metadata_json"]) if row["metadata_json"] else {},
+                    "degree": int(row["degree"]) if "degree" in row.keys() else 0,
+                    "layout": layout_map.get(str(row["id"])),
+                }
+                for row in nodes
+            ],
+            "edges": [
+                {
+                    "source_id": str(row["source_id"]),
+                    "target_id": str(row["target_id"]),
+                    "relation": str(row["relation"]),
+                    "weight": float(row["weight"]),
+                    "metadata": json.loads(row["metadata_json"]) if row["metadata_json"] else {},
+                }
+                for row in edges
+            ],
+        }
+
+    def _sync_graph_node(self, node_id: str) -> list[str]:
+        warning = self.graph_backend.sync_node(node_id)
+        return [warning] if warning else []
+
+    def _sync_graph_edge(self, source_id: str, target_id: str, relation: str) -> list[str]:
+        warning = self.graph_backend.sync_edge(source_id, target_id, relation)
+        return [warning] if warning else []
+
+    def _delete_graph_node_mirror(self, node_id: str) -> list[str]:
+        warning = self.graph_backend.delete_node(node_id)
+        return [warning] if warning else []
+
+    def _delete_graph_edge_mirror(self, source_id: str, target_id: str, relation: str) -> list[str]:
+        warning = self.graph_backend.delete_edge(source_id, target_id, relation)
+        return [warning] if warning else []
+
+    def upsert_graph_node(
+        self,
+        *,
+        node_id: str,
+        label: str,
+        metadata: dict[str, object],
+    ) -> dict[str, object]:
+        self.registry.upsert_graph_node(node_id, label=label, metadata=metadata)
+        return {"node": self.get_entity(node_id), "warnings": self._sync_graph_node(node_id)}
+
+    def delete_graph_node(self, node_id: str) -> dict[str, object]:
+        self.registry.delete_graph_node(node_id)
+        return {"deleted": True, "warnings": self._delete_graph_node_mirror(node_id)}
+
+    def upsert_graph_edge(
+        self,
+        *,
+        source_id: str,
+        target_id: str,
+        relation: str,
+        weight: float,
+        metadata: dict[str, object],
+    ) -> dict[str, object]:
+        self.registry.upsert_graph_edge(
+            source_id,
+            target_id,
+            relation=relation,
+            weight=weight,
+            metadata=metadata,
+        )
+        return {
+            "edge": {
+                "source_id": source_id,
+                "target_id": target_id,
+                "relation": relation,
+                "weight": weight,
+                "metadata": metadata,
+            },
+            "warnings": self._sync_graph_edge(source_id, target_id, relation),
+        }
+
+    def delete_graph_edge(self, source_id: str, target_id: str, relation: str) -> dict[str, object]:
+        self.registry.delete_graph_edge(source_id, target_id, relation)
+        return {"deleted": True, "warnings": self._delete_graph_edge_mirror(source_id, target_id, relation)}
+
+    def save_graph_layouts(self, items: list[dict[str, object]]) -> dict[str, object]:
+        self.registry.save_graph_layouts(items)
+        return {"saved": len(items)}
 
     def get_daily_note(self, day: str) -> dict | None:
         note_path = self.file_store.daily_dir / f"{day}.md"

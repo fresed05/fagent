@@ -46,6 +46,18 @@ class LocalGraphBackend:
     def healthcheck(self) -> bool:
         return True
 
+    def sync_node(self, node_id: str) -> str | None:
+        return None
+
+    def sync_edge(self, source_id: str, target_id: str, relation: str) -> str | None:
+        return None
+
+    def delete_node(self, node_id: str) -> str | None:
+        return None
+
+    def delete_edge(self, source_id: str, target_id: str, relation: str) -> str | None:
+        return None
+
     async def ingest_episode_async(self, episode: EpisodeRecord) -> None:
         summary = self.policy.build_summary(episode)
         extractor_prompt = self.prompt_loader.load("system/memory-extractor.md")
@@ -350,3 +362,97 @@ class Neo4jGraphBackend(LocalGraphBackend):
                     )
         except Exception as exc:
             logger.warning("Neo4j ingest failed for {}: {}", episode.episode_id, exc)
+
+    def sync_node(self, node_id: str) -> str | None:
+        if not self.healthcheck():
+            return None
+        row = self.registry.get_graph_node(node_id)
+        if row is None:
+            return self.delete_node(node_id)
+        assert self._driver is not None
+        try:
+            with self._driver.session() as session:
+                session.run(
+                    """
+                    MERGE (n:Node {id: $id})
+                    SET n.label = $label,
+                        n.metadata_json = $metadata_json
+                    """,
+                    id=row["id"],
+                    label=row["label"],
+                    metadata_json=row["metadata_json"],
+                )
+            return None
+        except Exception as exc:
+            logger.warning("Neo4j node sync failed for {}: {}", node_id, exc)
+            return str(exc)
+
+    def sync_edge(self, source_id: str, target_id: str, relation: str) -> str | None:
+        if not self.healthcheck():
+            return None
+        row = self.registry.get_graph_edge(source_id, target_id, relation)
+        if row is None:
+            return self.delete_edge(source_id, target_id, relation)
+        source = self.registry.get_graph_node(source_id)
+        target = self.registry.get_graph_node(target_id)
+        if source is None or target is None:
+            return "source_or_target_missing"
+        assert self._driver is not None
+        try:
+            with self._driver.session() as session:
+                session.run(
+                    """
+                    MERGE (s:Node {id: $source_id})
+                    SET s.label = $source_label
+                    WITH s
+                    MERGE (t:Node {id: $target_id})
+                    SET t.label = $target_label
+                    WITH s, t
+                    MERGE (s)-[r:RELATED {type: $relation}]->(t)
+                    SET r.weight = $weight,
+                        r.metadata_json = $metadata_json
+                    """,
+                    source_id=source["id"],
+                    source_label=source["label"],
+                    target_id=target["id"],
+                    target_label=target["label"],
+                    relation=row["relation"],
+                    weight=float(row["weight"] or 0.0),
+                    metadata_json=row["metadata_json"],
+                )
+            return None
+        except Exception as exc:
+            logger.warning("Neo4j edge sync failed for {}-{}-{}: {}", source_id, relation, target_id, exc)
+            return str(exc)
+
+    def delete_node(self, node_id: str) -> str | None:
+        if not self.healthcheck():
+            return None
+        assert self._driver is not None
+        try:
+            with self._driver.session() as session:
+                session.run("MATCH (n:Node {id: $id}) DETACH DELETE n", id=node_id)
+            return None
+        except Exception as exc:
+            logger.warning("Neo4j node delete failed for {}: {}", node_id, exc)
+            return str(exc)
+
+    def delete_edge(self, source_id: str, target_id: str, relation: str) -> str | None:
+        if not self.healthcheck():
+            return None
+        assert self._driver is not None
+        try:
+            with self._driver.session() as session:
+                session.run(
+                    """
+                    MATCH (s:Node {id: $source_id})-[r:RELATED {type: $relation}]->(t:Node {id: $target_id})
+                    DELETE r
+                    """,
+                    source_id=source_id,
+                    target_id=target_id,
+                    relation=relation,
+                )
+            return None
+        except Exception as exc:
+            logger.warning("Neo4j edge delete failed for {}-{}-{}: {}", source_id, relation, target_id, exc)
+            return str(exc)

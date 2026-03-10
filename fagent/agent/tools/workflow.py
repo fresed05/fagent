@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any, Callable
 
 from fagent.agent.tools.base import Tool
 from fagent.agent.tools.registry import ToolRegistry
 from fagent.prompts import PromptLoader
 from fagent.providers.base import LLMProvider
+from fagent.workflows import load_workflow_file, resolve_workflow_path
 
 
 class WorkflowTool(Tool):
@@ -18,6 +20,7 @@ class WorkflowTool(Tool):
     def __init__(
         self,
         tool_registry: ToolRegistry,
+        workspace: Path,
         provider: LLMProvider | None = None,
         *,
         model: str | None = None,
@@ -25,6 +28,7 @@ class WorkflowTool(Tool):
         repair_callback: Callable[[str, str, str, str | None], None] | None = None,
     ):
         self.tool_registry = tool_registry
+        self.workspace = workspace
         self.provider = provider
         self.model = model
         self.max_tokens = max_tokens
@@ -42,7 +46,7 @@ class WorkflowTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Execute an ordered workflow of tool steps with optional light-LLM interpretation and recovery."
+        return "Execute inline workflow steps or load them from workflow.json."
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -50,16 +54,21 @@ class WorkflowTool(Tool):
             "type": "object",
             "properties": {
                 "goal": {"type": "string", "minLength": 3},
+                "workflow_path": {"type": "string"},
+                "workflow_ref": {"type": "string"},
                 "steps": {
                     "type": "array",
                     "items": {
                         "type": "object",
                         "properties": {
+                            "id": {"type": "string"},
                             "action": {"type": "string"},
                             "args": {"type": "object"},
                             "needs_llm": {"type": "boolean"},
+                            "prompt_ref": {"type": "string"},
+                            "on_error": {"type": "object"},
                         },
-                        "required": ["action"],
+                        "required": ["id"],
                     },
                 },
                 "allowed_tools": {
@@ -75,20 +84,42 @@ class WorkflowTool(Tool):
                     "enum": ["return_control", "fail_fast"],
                 },
             },
-            "required": ["goal", "steps", "allowed_tools"],
+            "required": ["goal"],
         }
 
     async def execute(
         self,
         goal: str,
-        steps: list[dict[str, Any] | str],
-        allowed_tools: list[str],
+        steps: list[dict[str, Any] | str] | None = None,
+        allowed_tools: list[str] | None = None,
         llm_assist_mode: str = "on_error",
         escalation_policy: str = "return_control",
+        workflow_path: str | None = None,
+        workflow_ref: str | None = None,
     ) -> str:
+        loaded = None
+        if workflow_path or workflow_ref:
+            resolved = resolve_workflow_path(
+                self.workspace,
+                workflow_path=workflow_path,
+                workflow_ref=workflow_ref,
+            )
+            loaded = load_workflow_file(resolved)
+            if not steps:
+                steps = loaded.steps
+            if not allowed_tools:
+                allowed_tools = list(loaded.defaults["allowed_tools"])
+            llm_assist_mode = loaded.defaults.get("llm_assist_mode", llm_assist_mode)
+            escalation_policy = loaded.defaults.get("escalation_policy", escalation_policy)
+
+        if steps is None:
+            steps = []
+        if allowed_tools is None:
+            allowed_tools = []
+
         execution_log: list[dict[str, Any]] = []
         for index, raw_step in enumerate(steps, start=1):
-            step = self._normalize_step(raw_step)
+            step = self._normalize_step(raw_step, prompt_map=(loaded.prompts if loaded else None))
             handled = await self._execute_step(
                 goal=goal,
                 index=index,
@@ -102,7 +133,12 @@ class WorkflowTool(Tool):
             if handled is not None:
                 return handled
         return json.dumps(
-            {"status": "completed", "goal": goal, "execution_log": execution_log},
+            {
+                "status": "completed",
+                "goal": goal,
+                "workflow_path": str(loaded.path) if loaded else None,
+                "execution_log": execution_log,
+            },
             ensure_ascii=False,
             indent=2,
         )
@@ -123,6 +159,20 @@ class WorkflowTool(Tool):
         args = step.get("args") or {}
         needs_llm = bool(step.get("needs_llm", False))
 
+        if not action:
+            return json.dumps(
+                {
+                    "status": "blocked",
+                    "goal": goal,
+                    "failed_step": index,
+                    "reason": "Workflow step is missing action",
+                    "normalized_step": step,
+                    "execution_log": execution_log,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+
         if action not in allowed_tools:
             repaired = await self._repair_step(goal, execution_log, step, allowed_tools, "tool_not_allowed")
             if repaired is not None and repair_budget > 0 and repaired != step:
@@ -133,7 +183,7 @@ class WorkflowTool(Tool):
                         json.dumps(repaired, ensure_ascii=False),
                         self._session_key,
                     )
-                execution_log.append({"step": index, "repair_applied": repaired})
+                execution_log.append({"step": index, "id": step.get("id"), "repair_applied": repaired})
                 return await self._execute_step(
                     goal=goal,
                     index=index,
@@ -159,10 +209,17 @@ class WorkflowTool(Tool):
 
         if needs_llm and llm_assist_mode in {"allow", "required"}:
             llm_note = await self._ask_light_llm(goal, execution_log, step)
-            execution_log.append({"step": index, "action": action, "llm_note": llm_note})
+            execution_log.append({"step": index, "id": step.get("id"), "action": action, "llm_note": llm_note})
 
         result = await self.tool_registry.execute(action, args)
-        entry = {"step": index, "action": action, "args": args, "result": result}
+        entry = {
+            "step": index,
+            "id": step.get("id"),
+            "action": action,
+            "args": args,
+            "prompt_ref": step.get("prompt_ref"),
+            "result": result,
+        }
         execution_log.append(entry)
         if isinstance(result, str) and result.startswith("Error"):
             repaired = await self._repair_step(goal, execution_log, step, allowed_tools, result)
@@ -211,10 +268,22 @@ class WorkflowTool(Tool):
             )
         return None
 
-    def _normalize_step(self, step: dict[str, Any] | str) -> dict[str, Any]:
+    def _normalize_step(
+        self,
+        step: dict[str, Any] | str,
+        prompt_map: dict[str, dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
         if isinstance(step, str):
             action, args = self._parse_action_and_args(step)
-            return {"action": action, "args": args, "needs_llm": False}
+            return {
+                "id": action or "step",
+                "action": action,
+                "args": args,
+                "needs_llm": False,
+                "prompt_ref": None,
+                "on_error": None,
+                "_prompt_text": None,
+            }
 
         normalized = dict(step)
         action_text = str(normalized.get("action", ""))
@@ -227,6 +296,14 @@ class WorkflowTool(Tool):
             normalized["args"] = {**parsed_args, **args}
         else:
             normalized["args"] = args
+        prompt_ref = normalized.get("prompt_ref")
+        normalized.setdefault("id", normalized.get("action") or "step")
+        normalized["prompt_ref"] = prompt_ref if isinstance(prompt_ref, str) else None
+        normalized["_prompt_text"] = (
+            prompt_map[prompt_ref]["text"]
+            if isinstance(prompt_ref, str) and prompt_map and prompt_ref in prompt_map
+            else None
+        )
         return normalized
 
     def _parse_action_and_args(self, text: str) -> tuple[str, dict[str, Any]]:
@@ -290,6 +367,7 @@ class WorkflowTool(Tool):
                             "goal": goal,
                             "execution_log": execution_log,
                             "step": step,
+                            "step_prompt": step.get("_prompt_text"),
                         },
                         ensure_ascii=False,
                     ),
@@ -324,6 +402,7 @@ class WorkflowTool(Tool):
                             "goal": goal,
                             "execution_log": execution_log,
                             "step": step,
+                            "step_prompt": step.get("_prompt_text"),
                             "allowed_tools": allowed_tools,
                             "error": error_text,
                             "task": "Repair this workflow step and return one JSON object with action, args, needs_llm.",
@@ -349,9 +428,12 @@ class WorkflowTool(Tool):
                 parsed_action, parsed_args = self._parse_action_and_args(action)
                 if parsed_action == tool_name:
                     return {
+                        "id": step.get("id") or tool_name,
                         "action": tool_name,
                         "args": {**parsed_args, **args},
                         "needs_llm": bool(step.get("needs_llm", False)),
+                        "prompt_ref": step.get("prompt_ref"),
+                        "on_error": step.get("on_error"),
                     }
         return None
 

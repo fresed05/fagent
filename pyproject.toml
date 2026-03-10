@@ -79,6 +79,9 @@ packages = ["fagent"]
 [tool.hatch.build]
 include = [
     "fagent/**/*.py",
+    "fagent/prompts/**/*.json",
+    "fagent/prompts/**/*.md",
+    "fagent/static/**/*",
     "fagent/templates/**/*.md",
     "fagent/skills/**/*.md",
     "fagent/skills/**/*.sh",

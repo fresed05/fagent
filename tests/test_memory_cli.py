@@ -18,6 +18,7 @@ def test_memory_help_lists_commands() -> None:
     assert "inspect-session" in result.stdout
     assert "inspect-task-graph" in result.stdout
     assert "inspect-experience" in result.stdout
+    assert "graph-ui" in result.stdout
 
 
 def test_memory_query_v2_command_renders_results(monkeypatch, tmp_path) -> None:
@@ -97,3 +98,34 @@ def test_memory_inspect_experience_command_renders_patterns(monkeypatch) -> None
     assert "Experience Patterns" in result.stdout
     assert "pat1" in result.stdout
     assert "switch model" in result.stdout
+
+
+def test_memory_graph_ui_command_prints_url(monkeypatch, tmp_path) -> None:
+    class _StubMemory:
+        registry = object()
+
+    class _Manager:
+        def start(self, orchestrator, *, port=0, query=None, session_key=None, open_browser=True):
+            assert orchestrator is not None
+            assert query == "neo4j"
+            assert session_key == "cli:direct"
+            assert open_browser is False
+            return "http://127.0.0.1:9999/?query=neo4j&session=cli%3Adirect"
+
+        def wait_forever(self):
+            return None
+
+    monkeypatch.setattr(
+        "fagent.cli.commands._build_memory_orchestrator",
+        lambda config, workspace: (type("Cfg", (), {"workspace_path": tmp_path})(), _StubMemory()),
+    )
+    monkeypatch.setattr("fagent.cli.commands._get_graph_ui_manager", lambda _workspace: _Manager())
+
+    result = runner.invoke(
+        app,
+        ["memory", "graph-ui", "--query", "neo4j", "--session", "cli:direct", "--no-open"],
+    )
+
+    assert result.exit_code == 0
+    assert "Graph UI" in result.stdout
+    assert "127.0.0.1:9999" in result.stdout

@@ -63,6 +63,13 @@ class MemoryRegistry:
                     metadata_json TEXT NOT NULL,
                     PRIMARY KEY (source_id, target_id, relation)
                 );
+                CREATE TABLE IF NOT EXISTS graph_layouts (
+                    node_id TEXT PRIMARY KEY,
+                    x REAL NOT NULL,
+                    y REAL NOT NULL,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE TABLE IF NOT EXISTS embedding_cache (
                     artifact_id TEXT NOT NULL,
                     content_hash TEXT NOT NULL,
@@ -308,6 +315,158 @@ class MemoryRegistry:
                 """,
                 (node_id, node_id, limit),
             ).fetchall()
+
+    def get_graph_edge(self, source_id: str, target_id: str, relation: str) -> sqlite3.Row | None:
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT source_id, target_id, relation, weight, metadata_json
+                FROM graph_edges
+                WHERE source_id = ? AND target_id = ? AND relation = ?
+                """,
+                (source_id, target_id, relation),
+            ).fetchone()
+
+    def list_graph_nodes(
+        self,
+        *,
+        query: str | None = None,
+        node_ids: list[str] | None = None,
+        limit: int = 200,
+    ) -> list[sqlite3.Row]:
+        sql = """
+            SELECT n.*, (
+                SELECT COUNT(*) FROM graph_edges e
+                WHERE e.source_id = n.id OR e.target_id = n.id
+            ) AS degree
+            FROM graph_nodes n
+        """
+        params: list[Any] = []
+        clauses: list[str] = []
+        if query:
+            like = f"%{query.lower()}%"
+            clauses.append("(lower(n.id) LIKE ? OR lower(n.label) LIKE ? OR lower(n.metadata_json) LIKE ?)")
+            params.extend([like, like, like])
+        if node_ids:
+            placeholders = ", ".join("?" for _ in node_ids)
+            clauses.append(f"n.id IN ({placeholders})")
+            params.extend(node_ids)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY degree DESC, n.rowid DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            return conn.execute(sql, tuple(params)).fetchall()
+
+    def list_graph_edges(
+        self,
+        *,
+        node_ids: list[str] | None = None,
+        limit: int = 400,
+    ) -> list[sqlite3.Row]:
+        sql = """
+            SELECT source_id, target_id, relation, weight, metadata_json
+            FROM graph_edges
+        """
+        params: list[Any] = []
+        if node_ids:
+            placeholders = ", ".join("?" for _ in node_ids)
+            sql += f" WHERE source_id IN ({placeholders}) AND target_id IN ({placeholders})"
+            params.extend(node_ids)
+            params.extend(node_ids)
+        sql += " ORDER BY weight DESC, rowid DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            return conn.execute(sql, tuple(params)).fetchall()
+
+    def recent_graph_node_ids_for_session(self, session_key: str, limit: int = 200) -> list[str]:
+        if not session_key:
+            return []
+        like = f"%{session_key.lower()}%"
+        with self._connect() as conn:
+            episode_rows = conn.execute(
+                """
+                SELECT id FROM graph_nodes
+                WHERE lower(metadata_json) LIKE ?
+                ORDER BY rowid DESC
+                LIMIT ?
+                """,
+                (like, max(1, limit // 4)),
+            ).fetchall()
+            episode_ids = [str(row["id"]) for row in episode_rows]
+            if not episode_ids:
+                return []
+            placeholders = ", ".join("?" for _ in episode_ids)
+            neighbor_rows = conn.execute(
+                f"""
+                SELECT DISTINCT CASE
+                    WHEN source_id IN ({placeholders}) THEN target_id
+                    ELSE source_id
+                END AS id
+                FROM graph_edges
+                WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})
+                LIMIT ?
+                """,
+                tuple(episode_ids + episode_ids + episode_ids + [limit]),
+            ).fetchall()
+        ids = episode_ids + [str(row["id"]) for row in neighbor_rows if row["id"]]
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in ids:
+            if item not in seen:
+                seen.add(item)
+                result.append(item)
+        return result[:limit]
+
+    def delete_graph_node(self, node_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM graph_edges WHERE source_id = ? OR target_id = ?", (node_id, node_id))
+            conn.execute("DELETE FROM graph_layouts WHERE node_id = ?", (node_id,))
+            conn.execute("DELETE FROM graph_nodes WHERE id = ?", (node_id,))
+
+    def delete_graph_edge(self, source_id: str, target_id: str, relation: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM graph_edges
+                WHERE source_id = ? AND target_id = ? AND relation = ?
+                """,
+                (source_id, target_id, relation),
+            )
+
+    def save_graph_layouts(self, items: list[dict[str, Any]]) -> None:
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO graph_layouts(node_id, x, y, pinned, updated_at)
+                VALUES (?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+                ON CONFLICT(node_id) DO UPDATE SET
+                    x=excluded.x,
+                    y=excluded.y,
+                    pinned=excluded.pinned,
+                    updated_at=COALESCE(excluded.updated_at, CURRENT_TIMESTAMP)
+                """,
+                [
+                    (
+                        str(item["node_id"]),
+                        float(item["x"]),
+                        float(item["y"]),
+                        1 if item.get("pinned") else 0,
+                        item.get("updated_at"),
+                    )
+                    for item in items
+                ],
+            )
+
+    def load_graph_layouts(self, node_ids: list[str] | None = None) -> list[sqlite3.Row]:
+        sql = "SELECT node_id, x, y, pinned, updated_at FROM graph_layouts"
+        params: list[Any] = []
+        if node_ids:
+            placeholders = ", ".join("?" for _ in node_ids)
+            sql += f" WHERE node_id IN ({placeholders})"
+            params.extend(node_ids)
+        with self._connect() as conn:
+            return conn.execute(sql, tuple(params)).fetchall()
 
     def put_embedding_cache(self, entry: EmbeddingCacheEntry) -> None:
         with self._connect() as conn:

@@ -301,6 +301,29 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
     return loaded
 
 
+def _get_graph_ui_manager(workspace: Path):
+    from fagent.memory.graph_ui import get_graph_ui_manager
+
+    return get_graph_ui_manager(workspace)
+
+
+workflow_app = typer.Typer(help="Manage workflow.json definitions")
+app.add_typer(workflow_app, name="workflow")
+
+
+@workflow_app.command("migrate")
+def workflow_migrate(
+    target: str = typer.Argument(..., help="Legacy workflow markdown file or directory"),
+):
+    """Migrate legacy workflow prompt markdown files to one workflow.json."""
+    from fagent.workflows import migrate_legacy_workflow_path
+
+    workflow_path, deleted = migrate_legacy_workflow_path(Path(target))
+    console.print(f"[green]✓[/green] Created {workflow_path}")
+    for item in deleted:
+        console.print(f"[dim]deleted[/dim] {item}")
+
+
 # ============================================================================
 # Gateway / Server
 # ============================================================================
@@ -960,6 +983,32 @@ def memory_rebuild_graph(
 
     count = asyncio.run(_run())
     console.print(f"[green]✓[/green] Rebuilt graph memory for {count} episode(s).")
+
+
+@memory_app.command("graph-ui")
+def memory_graph_ui(
+    query: str | None = typer.Option(None, "--query", help="Initial graph search query"),
+    session_scope: str | None = typer.Option(None, "--session", "-s", help="Optional session filter"),
+    port: int = typer.Option(0, "--port", "-p", help="Preferred local port (0 = auto)"),
+    open_browser: bool = typer.Option(True, "--open/--no-open", help="Open browser automatically"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+):
+    """Start the local graph viewer/editor."""
+    loaded, orchestrator = _build_memory_orchestrator(config, workspace)
+    manager = _get_graph_ui_manager(loaded.workspace_path)
+    url = manager.start(
+        orchestrator,
+        port=port,
+        query=query,
+        session_key=session_scope,
+        open_browser=open_browser,
+    )
+    console.print(f"[green]✓[/green] Graph UI: {url}")
+    try:
+        manager.wait_forever()
+    except KeyboardInterrupt:
+        manager.stop()
 
 
 # ============================================================================

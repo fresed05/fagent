@@ -192,7 +192,7 @@ async def test_memory_get_entity_tool_returns_graph_node(tmp_path: Path) -> None
 async def test_workflow_tool_runs_steps_and_records_llm_help() -> None:
     registry = ToolRegistry()
     registry.register(EchoTool())
-    workflow = WorkflowTool(registry, provider=StubProvider(), model="stub")
+    workflow = WorkflowTool(registry, workspace=Path.cwd(), provider=StubProvider(), model="stub")
 
     payload = json.loads(
         await workflow.execute(
@@ -211,7 +211,7 @@ async def test_workflow_tool_runs_steps_and_records_llm_help() -> None:
 async def test_workflow_tool_normalizes_string_steps() -> None:
     registry = ToolRegistry()
     registry.register(EchoTool())
-    workflow = WorkflowTool(registry, provider=StubProvider(), model="stub")
+    workflow = WorkflowTool(registry, workspace=Path.cwd(), provider=StubProvider(), model="stub")
 
     payload = json.loads(
         await workflow.execute(
@@ -229,7 +229,7 @@ async def test_workflow_tool_normalizes_string_steps() -> None:
 async def test_workflow_tool_normalizes_embedded_action_text() -> None:
     registry = ToolRegistry()
     registry.register(EchoTool())
-    workflow = WorkflowTool(registry, provider=StubProvider(), model="stub")
+    workflow = WorkflowTool(registry, workspace=Path.cwd(), provider=StubProvider(), model="stub")
 
     payload = json.loads(
         await workflow.execute(
@@ -247,7 +247,7 @@ async def test_workflow_tool_normalizes_embedded_action_text() -> None:
 async def test_workflow_tool_repairs_blocked_step_with_light_llm() -> None:
     registry = ToolRegistry()
     registry.register(EchoTool())
-    workflow = WorkflowTool(registry, provider=StubProvider(), model="stub")
+    workflow = WorkflowTool(registry, workspace=Path.cwd(), provider=StubProvider(), model="stub")
 
     payload = json.loads(
         await workflow.execute(
@@ -266,7 +266,7 @@ async def test_workflow_tool_repairs_blocked_step_with_light_llm() -> None:
 async def test_workflow_tool_repairs_failed_execution_and_retries() -> None:
     registry = ToolRegistry()
     registry.register(StrictEchoTool())
-    workflow = WorkflowTool(registry, provider=StubProvider(), model="stub")
+    workflow = WorkflowTool(registry, workspace=Path.cwd(), provider=StubProvider(), model="stub")
 
     payload = json.loads(
         await workflow.execute(
