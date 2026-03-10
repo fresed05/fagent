@@ -52,6 +52,7 @@ class WorkflowTool(Tool):
     def parameters(self) -> dict[str, Any]:
         return {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "goal": {"type": "string", "minLength": 3},
                 "workflow_path": {"type": "string"},
@@ -60,6 +61,7 @@ class WorkflowTool(Tool):
                     "type": "array",
                     "items": {
                         "type": "object",
+                        "additionalProperties": False,
                         "properties": {
                             "id": {"type": "string"},
                             "action": {"type": "string"},
@@ -68,7 +70,7 @@ class WorkflowTool(Tool):
                             "prompt_ref": {"type": "string"},
                             "on_error": {"type": "object"},
                         },
-                        "required": ["id"],
+                        "required": ["action"],
                     },
                 },
                 "allowed_tools": {

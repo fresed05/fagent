@@ -36,6 +36,8 @@ class EpisodeRecord:
     user_text: str
     assistant_text: str
     tool_trace: list[str] = field(default_factory=list)
+    tool_summaries: list[dict[str, Any]] = field(default_factory=list)
+    evidence_blocks: list[str] = field(default_factory=list)
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -48,6 +50,20 @@ class EpisodeRecord:
         ]
         if self.tool_trace:
             parts.append(f"Tools: {', '.join(self.tool_trace)}")
+        if self.tool_summaries:
+            summary_lines = []
+            for item in self.tool_summaries[:8]:
+                tool_name = str(item.get("name") or "tool")
+                status = str(item.get("status") or "ok")
+                snippet = str(item.get("summary") or "").strip()
+                if snippet:
+                    summary_lines.append(f"{tool_name}[{status}]: {snippet}")
+                else:
+                    summary_lines.append(f"{tool_name}[{status}]")
+            if summary_lines:
+                parts.append("Tool Results:\n" + "\n".join(f"- {line}" for line in summary_lines))
+        if self.evidence_blocks:
+            parts.append("Evidence:\n" + "\n".join(f"- {block}" for block in self.evidence_blocks[:8]))
         return "\n".join(part for part in parts if part.strip())
 
 
@@ -258,3 +274,15 @@ class SessionSummaryArtifact:
     summary: str
     open_items: list[str]
     source_refs: list[str]
+
+
+@dataclass(slots=True)
+class TurnIngestPlan:
+    """Decision-complete batch of post-turn memory artifacts."""
+
+    episode: EpisodeRecord
+    artifacts: list[MemoryArtifact] = field(default_factory=list)
+    graph_requested: bool = True
+    vector_requested: bool = True
+    summary_requested: bool = True
+    job_ids: list[str] = field(default_factory=list)

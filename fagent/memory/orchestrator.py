@@ -29,6 +29,7 @@ from fagent.memory.types import (
     SessionSummaryArtifact,
     ShadowBrief,
     TaskNode,
+    TurnIngestPlan,
     WorkflowStateArtifact,
 )
 from fagent.memory.vector import VectorMemoryBackend
@@ -202,6 +203,63 @@ class MemoryOrchestrator:
         self.registry.upsert_artifact(artifact)
         return artifact
 
+    @staticmethod
+    def _extract_message_text(content: object) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type") or "")
+                if item_type == "text":
+                    text = str(item.get("text") or "").strip()
+                    if text:
+                        parts.append(text)
+                elif item_type == "image_url":
+                    image_url = str((item.get("image_url") or {}).get("url") or "")
+                    if image_url.startswith("data:image/"):
+                        parts.append("[image]")
+                    elif image_url:
+                        parts.append(f"[image:{image_url[:80]}]")
+            return "\n".join(part for part in parts if part)
+        return str(content or "")
+
+    @staticmethod
+    def _summarize_tool_result(tool_name: str, content: str) -> dict[str, object]:
+        text = str(content or "").strip()
+        status = "error" if text.startswith("Error") else "ok"
+        if len(text) > 420:
+            head = text[:280].rstrip()
+            tail = text[-100:].lstrip()
+            snippet = f"{head}\n...\n{tail}"
+        else:
+            snippet = text
+        return {
+            "name": tool_name,
+            "status": status,
+            "summary": snippet[:420],
+            "content_hash": hashlib.sha1(text.encode("utf-8")).hexdigest()[:12] if text else "",
+        }
+
+    def _build_turn_ingest_plan(
+        self,
+        episode: EpisodeRecord,
+        *,
+        session: "Session",
+        seed_artifacts: list[MemoryArtifact] | None = None,
+    ) -> TurnIngestPlan:
+        artifacts = list(seed_artifacts or [])
+        return TurnIngestPlan(
+            episode=episode,
+            artifacts=artifacts,
+            graph_requested=True,
+            vector_requested=True,
+            summary_requested=bool(self.config.auto_summarize.enabled and session is not None),
+            job_ids=[f"turn_ingest:{episode.episode_id}"],
+        )
+
     def _ingest_file_memory(self, episode: EpisodeRecord, summary: str) -> list[MemoryArtifact]:
         file_artifacts: list[MemoryArtifact] = []
         if not self.registry.get_artifact(f"{episode.episode_id}:history"):
@@ -286,6 +344,7 @@ class MemoryOrchestrator:
         session: "Session",
         episode: EpisodeRecord | None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        seed_artifacts: list[MemoryArtifact] | None = None,
     ) -> dict[str, object]:
         if not self.config.enabled or episode is None:
             return {
@@ -309,10 +368,27 @@ class MemoryOrchestrator:
             "vector": {"status": "skipped", "artifacts": 0},
             "summary": {"status": "not_triggered", "artifact_id": None},
         }
+        job_id = f"turn_ingest:{episode.episode_id}"
+        stage_state = {
+            "file_memory": "pending",
+            "graph": "pending",
+            "vector": "pending",
+            "summary": "pending",
+        }
+        self.registry.upsert_post_turn_job(
+            job_id=job_id,
+            episode_id=episode.episode_id,
+            session_key=episode.session_key,
+            turn_id=episode.turn_id,
+            stages=stage_state,
+            status="running",
+            attempt=0,
+        )
         self.registry.set_job_status(episode.episode_id, "running")
         summary = self.policy.build_summary(episode)
         try:
-            self._ensure_session_artifact(episode)
+            ingest_plan = self._build_turn_ingest_plan(episode, session=session, seed_artifacts=seed_artifacts)
+            ingest_plan.artifacts.append(self._ensure_session_artifact(episode))
 
             started_at = time.perf_counter()
             await self._emit_stage(
@@ -324,7 +400,9 @@ class MemoryOrchestrator:
                 detail="Writing file artifacts",
             )
             file_artifacts = self._ingest_file_memory(episode, summary=summary)
+            ingest_plan.artifacts.extend(file_artifacts)
             results["file_memory"] = {"status": "ok", "artifacts": len(file_artifacts)}
+            stage_state["file_memory"] = "ok"
             await self._emit_stage(
                 on_progress,
                 stage="Saving file memory",
@@ -335,8 +413,19 @@ class MemoryOrchestrator:
                 duration_ms=int((time.perf_counter() - started_at) * 1000),
                 extra={"artifacts": len(file_artifacts)},
             )
+            self.registry.upsert_post_turn_job(
+                job_id=job_id,
+                episode_id=episode.episode_id,
+                session_key=episode.session_key,
+                turn_id=episode.turn_id,
+                stages=stage_state,
+                status="running",
+                attempt=0,
+            )
 
-            results["graph"] = {"status": await self._run_graph_stage(episode, on_progress=on_progress)}
+            graph_status = await self._run_graph_stage(episode, on_progress=on_progress)
+            results["graph"] = {"status": graph_status}
+            stage_state["graph"] = graph_status
 
             started_at = time.perf_counter()
             await self._emit_stage(
@@ -345,11 +434,12 @@ class MemoryOrchestrator:
                 status="started",
                 session_key=episode.session_key,
                 turn_id=episode.turn_id,
-                detail="Embedding session and file artifacts",
+                detail="Embedding post-turn artifact batch",
             )
-            vector_artifacts = len(file_artifacts) + 1
+            vector_artifacts = len(ingest_plan.artifacts)
             if self.vector_backend.embedding_client is None:
                 results["vector"] = {"status": "skipped", "artifacts": 0, "reason": "vector_unavailable"}
+                stage_state["vector"] = "skipped"
                 await self._emit_stage(
                     on_progress,
                     stage="Writing vectors",
@@ -361,10 +451,10 @@ class MemoryOrchestrator:
                 )
             else:
                 try:
-                    self.vector_backend.ingest_artifacts(file_artifacts)
-                    self.vector_backend.ingest_episode(episode)
+                    self.vector_backend.ingest_artifacts(ingest_plan.artifacts)
                 except Exception as exc:
                     results["vector"] = {"status": "retry", "artifacts": 0, "error": str(exc)}
+                    stage_state["vector"] = "retry"
                     await self._emit_stage(
                         on_progress,
                         stage="Writing vectors",
@@ -377,6 +467,7 @@ class MemoryOrchestrator:
                     )
                     raise
                 results["vector"] = {"status": "ok", "artifacts": vector_artifacts}
+                stage_state["vector"] = "ok"
                 await self._emit_stage(
                     on_progress,
                     stage="Writing vectors",
@@ -387,11 +478,40 @@ class MemoryOrchestrator:
                     duration_ms=int((time.perf_counter() - started_at) * 1000),
                     extra={"artifacts": vector_artifacts},
                 )
+            self.registry.upsert_post_turn_job(
+                job_id=job_id,
+                episode_id=episode.episode_id,
+                session_key=episode.session_key,
+                turn_id=episode.turn_id,
+                stages=stage_state,
+                status="running",
+                attempt=0,
+            )
 
             try:
                 results["summary"] = await self.run_auto_summary_stage(session, on_progress=on_progress, turn_id=episode.turn_id)
+                artifact = results["summary"].get("artifact") if isinstance(results["summary"], dict) else None
+                if isinstance(artifact, MemoryArtifact):
+                    ingest_plan.artifacts.append(artifact)
+                stage_state["summary"] = str(results["summary"].get("status", "done")) if isinstance(results["summary"], dict) else "done"
+                if self.vector_backend.embedding_client is not None and isinstance(artifact, MemoryArtifact):
+                    started_at = time.perf_counter()
+                    self.vector_backend.ingest_artifacts([artifact])
+                    results["vector"]["artifacts"] = int(results["vector"].get("artifacts", 0)) + 1 if isinstance(results["vector"], dict) else 1
+                    results["vector"]["status"] = "ok"
+                    await self._emit_stage(
+                        on_progress,
+                        stage="Writing vectors",
+                        status="ok",
+                        session_key=episode.session_key,
+                        turn_id=episode.turn_id,
+                        detail="Embedded summary artifact",
+                        duration_ms=int((time.perf_counter() - started_at) * 1000),
+                        extra={"artifacts": 1},
+                    )
             except Exception as exc:
                 results["summary"] = {"status": "failed", "artifact_id": None, "error": str(exc)}
+                stage_state["summary"] = "failed"
                 await self._emit_stage(
                     on_progress,
                     stage="Summarizing session",
@@ -401,6 +521,15 @@ class MemoryOrchestrator:
                     detail=str(exc)[:180],
                 )
                 raise
+            self.registry.upsert_post_turn_job(
+                job_id=job_id,
+                episode_id=episode.episode_id,
+                session_key=episode.session_key,
+                turn_id=episode.turn_id,
+                stages=stage_state,
+                status="done",
+                attempt=0,
+            )
             self.registry.set_job_status(episode.episode_id, "done")
             return results
         except Exception as exc:
@@ -410,6 +539,20 @@ class MemoryOrchestrator:
                 trigger_text=f"ingest failed: {exc}",
                 recovery_text="retry ingest later",
                 metadata={"episode_id": episode.episode_id},
+            )
+            stage_state = {
+                **stage_state,
+                "error": str(exc)[:240],
+            }
+            self.registry.upsert_post_turn_job(
+                job_id=job_id,
+                episode_id=episode.episode_id,
+                session_key=episode.session_key,
+                turn_id=episode.turn_id,
+                stages=stage_state,
+                status="retry",
+                attempt=1,
+                last_error=str(exc)[:500],
             )
             self.registry.set_job_status(episode.episode_id, "retry", error=str(exc))
             logger.exception("Memory ingest failed for {}", episode.episode_id)
@@ -509,13 +652,19 @@ class MemoryOrchestrator:
         user_text = ""
         assistant_text = ""
         tools: list[str] = []
+        tool_summaries: list[dict[str, object]] = []
+        evidence_blocks: list[str] = []
         timestamp = None
         source_path = str(self.workspace / "sessions")
         for entry in saved_entries:
             role = entry.get("role")
             content = entry.get("content")
-            if role == "user" and isinstance(content, str):
-                user_text = content
+            if role == "user":
+                extracted = self._extract_message_text(content)
+                if extracted:
+                    user_text = extracted
+                    if isinstance(content, list):
+                        evidence_blocks.append(f"user_media: {extracted[:220]}")
                 timestamp = entry.get("timestamp", timestamp)
             elif role == "assistant" and isinstance(content, str):
                 assistant_text = content
@@ -523,11 +672,18 @@ class MemoryOrchestrator:
             elif role == "assistant" and entry.get("tool_calls"):
                 tools.extend(call["function"]["name"] for call in entry["tool_calls"])
             elif role == "tool":
-                tools.append(entry.get("name", "tool"))
+                tool_name = str(entry.get("name", "tool"))
+                tools.append(tool_name)
+                tool_summary = self._summarize_tool_result(tool_name, self._extract_message_text(content))
+                tool_summaries.append(tool_summary)
+                if tool_summary.get("summary"):
+                    evidence_blocks.append(f"{tool_name}: {str(tool_summary['summary'])[:220]}")
         if not user_text and not assistant_text:
             return None
         episode_id = hashlib.sha1(f"{session_key}:{turn_id}".encode("utf-8")).hexdigest()[:16]
-        topic_tags = self.policy.extract_topic_tags(f"{user_text}\n{assistant_text}")
+        topic_tags = self.policy.extract_topic_tags(
+            "\n".join(part for part in [user_text, assistant_text, *[str(block) for block in evidence_blocks]] if part)
+        )
         return EpisodeRecord(
             episode_id=episode_id,
             session_key=session_key,
@@ -537,22 +693,31 @@ class MemoryOrchestrator:
             user_text=user_text,
             assistant_text=assistant_text,
             tool_trace=tools,
+            tool_summaries=tool_summaries,
+            evidence_blocks=evidence_blocks,
             timestamp=timestamp or "",
             metadata={"topic_tags": topic_tags, "source_path": source_path},
         )
 
-    async def enqueue_post_turn_ingest(self, episode: EpisodeRecord | None) -> None:
+    async def enqueue_post_turn_ingest(
+        self,
+        *,
+        session: "Session",
+        episode: EpisodeRecord | None,
+        seed_artifacts: list[MemoryArtifact] | None = None,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
+    ) -> None:
         if not self.config.enabled or episode is None:
             return
         if self.registry.get_job_status(episode.episode_id) == "done":
             return
         if not self.config.ingest.async_enabled:
-            await self.ingest_episode(episode)
+            await self.ingest_episode(session=session, episode=episode, seed_artifacts=seed_artifacts, on_progress=on_progress)
             return
 
         async def _runner() -> None:
             try:
-                await self.ingest_episode(episode)
+                await self.ingest_episode(session=session, episode=episode, seed_artifacts=seed_artifacts, on_progress=on_progress)
             finally:
                 task = asyncio.current_task()
                 if task is not None:
@@ -561,14 +726,26 @@ class MemoryOrchestrator:
         task = asyncio.create_task(_runner())
         self._tasks.add(task)
 
-    async def ingest_episode(self, episode: EpisodeRecord) -> None:
+    async def ingest_episode(
+        self,
+        episode: EpisodeRecord,
+        *,
+        session: "Session | None" = None,
+        seed_artifacts: list[MemoryArtifact] | None = None,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
+    ) -> None:
         class _SyntheticSession:
             def __init__(self, key: str) -> None:
                 self.key = key
                 self.messages: list[dict[str, object]] = []
                 self.metadata: dict[str, object] = {}
 
-        await self.run_post_turn_pipeline(session=_SyntheticSession(episode.session_key), episode=episode)
+        await self.run_post_turn_pipeline(
+            session=session or _SyntheticSession(episode.session_key),
+            episode=episode,
+            on_progress=on_progress,
+            seed_artifacts=seed_artifacts,
+        )
 
     async def consolidate_session(self, session: "Session") -> bool:
         """Best-effort compatibility hook for old consolidation paths."""
@@ -580,7 +757,7 @@ class MemoryOrchestrator:
             saved = [msg for msg in session.messages if msg.get("turn_id") == turn_id]
             episode = self.build_episode(session.key, turn_id, "", "", saved)
             if episode:
-                await self.enqueue_post_turn_ingest(episode)
+                await self.enqueue_post_turn_ingest(session=session, episode=episode)
             return True
         except Exception:
             logger.exception("Session consolidation failed")
@@ -595,7 +772,7 @@ class MemoryOrchestrator:
                 episode = self.build_episode(session.key, turn_id, "", "", saved)
                 if episode is None:
                     continue
-                await self.ingest_episode(episode)
+                await self.ingest_episode(episode, session=session)
                 count += 1
         return count
 
@@ -615,7 +792,12 @@ class MemoryOrchestrator:
             results.extend(self.file_store.retrieve(query, limit=top_k))
         try:
             if "vector" in selected:
-                results.extend(self.vector_backend.retrieve(query, limit=top_k))
+                vector_filters: dict[str, object] = {}
+                if session_scope:
+                    vector_filters["session_key"] = session_scope
+                if artifact_types:
+                    vector_filters["artifact_type"] = artifact_types
+                results.extend(self.vector_backend.retrieve(query, limit=top_k, filters=vector_filters or None))
         except Exception as exc:
             logger.warning("Vector retrieval failed for query '{}': {}", query, exc)
         try:
@@ -629,13 +811,7 @@ class MemoryOrchestrator:
                 if item.metadata.get("session_key") in ("", None, session_scope)
             ]
         if artifact_types:
-            results = [
-                item for item in results
-                if item.metadata.get("artifact_type") in artifact_types
-                or item.metadata.get("kind") in artifact_types
-                or item.store == "file"
-                or (item.store == "file" and "daily_note" in artifact_types and item.metadata.get("path", "").endswith(".md"))
-            ]
+            results = [item for item in results if self._artifact_matches_filters(item, artifact_types)]
         if time_range and (start := time_range.get("start")):
             end = time_range.get("end", "9999-12-31T23:59:59")
             filtered: list[RetrievedMemory] = []
@@ -646,6 +822,22 @@ class MemoryOrchestrator:
             results = filtered
         results.sort(key=lambda item: item.score, reverse=True)
         return results[:top_k]
+
+    @staticmethod
+    def _artifact_matches_filters(item: RetrievedMemory, artifact_types: list[str]) -> bool:
+        if not artifact_types:
+            return True
+        item_type = str(item.metadata.get("artifact_type") or "")
+        item_kind = str(item.metadata.get("kind") or "")
+        if item_type in artifact_types or item_kind in artifact_types:
+            return True
+        if item.store == "file":
+            path = str(item.metadata.get("path") or "")
+            if "daily_note" in artifact_types and path.endswith(".md") and "\\daily\\" in path.replace("/", "\\"):
+                return True
+            if "file_note" in artifact_types and path.endswith(".md"):
+                return True
+        return False
 
     def _session_working_set(self, session_key: str) -> dict[str, object]:
         active_task_state = self.get_task_state_summary(session_key)
@@ -939,12 +1131,19 @@ class MemoryOrchestrator:
         selected_types = artifact_types or request.artifact_types
         limit = top_k or request.candidate_budget.get("final") or self.config.search_v2.default_top_k
         store_rank = {store: index for index, store in enumerate(selected_stores)}
+        if hasattr(self.vector_backend, "reset_query_embedding_stats"):
+            self.vector_backend.reset_query_embedding_stats()
         variant_queries = [query]
         initial_structured = self._structured_results_for_query(query, request, session_scope=session_scope)
         initial_store_lists: list[list[RetrievedMemory]] = []
+        store_contributions: dict[str, int] = {}
+        store_queries = 0
         if initial_structured:
             initial_store_lists.append(initial_structured)
+            for item in initial_structured:
+                store_contributions[item.store] = store_contributions.get(item.store, 0) + 1
         for store in selected_stores:
+            store_queries += 1
             pool_limit = request.candidate_budget.get(store, max(limit, 4))
             hits = self._search_store(
                 query,
@@ -956,20 +1155,21 @@ class MemoryOrchestrator:
             )
             if hits:
                 initial_store_lists.append(hits)
+                store_contributions[store] = store_contributions.get(store, 0) + len(hits)
         first_pass = self._rrf_merge(initial_store_lists) if initial_store_lists else []
         for variant in self._expand_query_variants(query, request, first_pass_count=len(first_pass)):
             if variant not in variant_queries:
                 variant_queries.append(variant)
 
-        ranked_lists: list[list[RetrievedMemory]] = []
-        store_contributions: dict[str, int] = {}
-        for variant in variant_queries:
+        ranked_lists: list[list[RetrievedMemory]] = list(initial_store_lists)
+        for variant in variant_queries[1:]:
             structured = self._structured_results_for_query(variant, request, session_scope=session_scope)
             if structured:
                 ranked_lists.append(structured)
                 for item in structured:
                     store_contributions[item.store] = store_contributions.get(item.store, 0) + 1
             for store in selected_stores:
+                store_queries += 1
                 pool_limit = request.candidate_budget.get(store, max(limit, 4))
                 hits = self._search_store(
                     variant,
@@ -986,12 +1186,7 @@ class MemoryOrchestrator:
 
         results = self._rrf_merge(ranked_lists) if ranked_lists else []
         if selected_types:
-            results = [
-                item for item in results
-                if item.metadata.get("artifact_type") in selected_types
-                or item.metadata.get("kind") in selected_types
-                or item.store == "file"
-            ]
+            results = [item for item in results if self._artifact_matches_filters(item, selected_types)]
         shadow_state = self.shadow.session_history.get(session_scope or "") if session_scope else None
         recent_citations = set(shadow_state.last_citations if shadow_state else [])
         rescored = [
@@ -1060,14 +1255,23 @@ class MemoryOrchestrator:
             "candidate_budget": request.candidate_budget,
             "novelty_target": request.novelty_target,
             "store_contributions": store_contributions,
+            "variant_count": max(0, len(variant_queries) - 1),
+            "store_queries_per_search": store_queries,
+            "embedding_requests_per_search": self.vector_backend.query_embedding_stats().get("requests", 0),
+            "embedding_cache_hits_per_search": self.vector_backend.query_embedding_stats().get("cache_hits", 0),
+            "raw_escalations": 1 if raw_escalated else 0,
+            "graph_search_candidates_scanned": getattr(self.graph_backend, "last_search_candidate_count", 0),
         }
 
     def _fetch_raw_session_artifacts(self, session_key: str, query: str, limit: int = 4) -> list[RetrievedMemory]:
         query_lower = query.lower()
         matches: list[RetrievedMemory] = []
-        for artifact in self.registry.list_artifacts("session_turn", limit=1000):
-            if artifact.metadata.get("session_key") != session_key:
-                continue
+        for artifact in self.registry.search_artifacts(
+            query,
+            session_key=session_key,
+            artifact_type="session_turn",
+            limit=max(limit * 4, limit),
+        ):
             haystack = f"{artifact.content}\n{artifact.summary}".lower()
             if query_lower not in haystack:
                 continue
@@ -1163,6 +1367,35 @@ class MemoryOrchestrator:
                     "metadata": {**json.loads(task_row["metadata_json"]), "task_id": task_id, "status": task_row["status"]},
                     "edges": edges,
                 }
+        artifact_matches = self.registry.search_artifacts(entity_ref, limit=3)
+        if artifact_matches:
+            primary = artifact_matches[0]
+            return {
+                "id": f"artifact:{primary.id}",
+                "label": entity_ref,
+                "metadata": {
+                    "kind": "artifact_fallback",
+                    "degraded": True,
+                    "confidence": 0.45,
+                    "artifact_id": primary.id,
+                    "artifact_type": primary.type,
+                    "source_ref": primary.source_ref,
+                    **primary.metadata,
+                },
+                "neighbors": [
+                    {
+                        "id": item.id,
+                        "label": item.summary[:180] or item.id,
+                        "metadata": {
+                            **item.metadata,
+                            "artifact_type": item.type,
+                            "source_ref": item.source_ref,
+                        },
+                    }
+                    for item in artifact_matches[1:]
+                ],
+                "edges": [],
+            }
         return None
 
     def export_graph_subgraph(
@@ -1173,6 +1406,12 @@ class MemoryOrchestrator:
         node_limit: int = 200,
         edge_limit: int = 400,
     ) -> dict[str, object]:
+        if not query and not session_key:
+            return {
+                "nodes": [],
+                "edges": [],
+                "message": "Provide a session or query to load a graph snapshot.",
+            }
         node_ids = self.registry.recent_graph_node_ids_for_session(session_key, limit=node_limit) if session_key else None
         raw_nodes = self.registry.list_graph_nodes(query=query, node_ids=node_ids, limit=node_limit)
         nodes = []
@@ -1357,7 +1596,6 @@ class MemoryOrchestrator:
             created_at=created_at,
         )
         self.registry.upsert_artifact(artifact)
-        self.vector_backend.ingest_artifact(artifact)
         self._upsert_task_graph_for_snapshot(session_key, goal, artifact, open_blockers, next_step)
         return WorkflowStateArtifact(
             snapshot_id=snapshot_id,
@@ -1476,7 +1714,6 @@ class MemoryOrchestrator:
             created_at=pattern.last_seen_at,
         )
         self.registry.upsert_artifact(artifact)
-        self.vector_backend.ingest_artifact(artifact)
         return artifact
 
     async def run_auto_summary_stage(
@@ -1578,8 +1815,6 @@ class MemoryOrchestrator:
             created_at=datetime.now().isoformat(),
         )
         self.registry.upsert_artifact(artifact)
-        if self.vector_backend.embedding_client is not None:
-            self.vector_backend.ingest_artifact(artifact)
         if self.config.auto_summarize.archive_mode == "archive_continue":
             session.metadata["summary_cutoff_idx"] = max(last_cutoff, last_cutoff + len(slice_messages))
         await self._emit_stage(

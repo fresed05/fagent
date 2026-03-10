@@ -159,6 +159,10 @@ class Tool(ABC):
             for k in schema.get("required", []):
                 if k not in val:
                     errors.append(f"missing required {path + '.' + k if path else k}")
+            if schema.get("additionalProperties") is False:
+                for k in val:
+                    if k not in props:
+                        errors.append(f"unexpected field {path + '.' + k if path else k}")
             for k, v in val.items():
                 if k in props:
                     errors.extend(self._validate(v, props[k], path + "." + k if path else k))
@@ -171,11 +175,14 @@ class Tool(ABC):
 
     def to_schema(self) -> dict[str, Any]:
         """Convert tool to OpenAI function schema format."""
+        parameters = dict(self.parameters)
+        if parameters.get("type") == "object" and "additionalProperties" not in parameters:
+            parameters["additionalProperties"] = False
         return {
             "type": "function",
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": self.parameters,
+                "parameters": parameters,
             },
         }

@@ -256,7 +256,8 @@ class MemoryGetEntityTool(Tool):
         entity = self.memory.get_entity(entity_ref)
         if entity is None:
             return json.dumps({"status": "not_found", "entity_ref": entity_ref}, ensure_ascii=False, indent=2)
-        return json.dumps({"status": "ok", "entity": entity}, ensure_ascii=False, indent=2)
+        status = "degraded" if bool((entity.get("metadata") or {}).get("degraded")) else "ok"
+        return json.dumps({"status": status, "entity": entity}, ensure_ascii=False, indent=2)
 
 
 class MemoryGetDailyNoteTool(Tool):

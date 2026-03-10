@@ -82,6 +82,25 @@ def test_validate_params_ignores_unknown_fields() -> None:
     assert errors == []
 
 
+class StrictSampleTool(SampleTool):
+    @property
+    def parameters(self) -> dict[str, Any]:
+        schema = dict(super().parameters)
+        schema["additionalProperties"] = False
+        return schema
+
+
+def test_validate_params_rejects_unknown_fields_when_strict() -> None:
+    tool = StrictSampleTool()
+    errors = tool.validate_params({"query": "hi", "count": 2, "extra": "x"})
+    assert any("unexpected field extra" in e for e in errors)
+
+
+def test_tool_schema_defaults_to_strict_additional_properties() -> None:
+    schema = SampleTool().to_schema()
+    assert schema["function"]["parameters"]["additionalProperties"] is False
+
+
 async def test_registry_returns_validation_error() -> None:
     reg = ToolRegistry()
     reg.register(SampleTool())

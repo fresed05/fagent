@@ -40,6 +40,11 @@ class MemoryRegistry:
                     content TEXT NOT NULL,
                     summary TEXT NOT NULL,
                     metadata_json TEXT NOT NULL,
+                    session_key TEXT NOT NULL DEFAULT '',
+                    turn_id TEXT NOT NULL DEFAULT '',
+                    channel TEXT NOT NULL DEFAULT '',
+                    chat_id TEXT NOT NULL DEFAULT '',
+                    search_text TEXT NOT NULL DEFAULT '',
                     source_ref TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
@@ -48,6 +53,18 @@ class MemoryRegistry:
                     status TEXT NOT NULL,
                     retries INTEGER NOT NULL DEFAULT 0,
                     last_error TEXT,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS post_turn_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    episode_id TEXT NOT NULL,
+                    session_key TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    stages_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS graph_nodes (
@@ -152,26 +169,111 @@ class MemoryRegistry:
                     source_refs_json TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE INDEX IF NOT EXISTS idx_artifacts_type_created_at ON artifacts(type, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_artifacts_session_type_created_at ON artifacts(session_key, type, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_artifacts_session_created_at ON artifacts(session_key, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_post_turn_jobs_episode ON post_turn_jobs(episode_id, updated_at DESC);
                 """
             )
+            artifact_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(artifacts)").fetchall()
+            }
+            artifact_column_defs = {
+                "session_key": "TEXT NOT NULL DEFAULT ''",
+                "turn_id": "TEXT NOT NULL DEFAULT ''",
+                "channel": "TEXT NOT NULL DEFAULT ''",
+                "chat_id": "TEXT NOT NULL DEFAULT ''",
+                "search_text": "TEXT NOT NULL DEFAULT ''",
+            }
+            for column_name, definition in artifact_column_defs.items():
+                if column_name not in artifact_columns:
+                    conn.execute(f"ALTER TABLE artifacts ADD COLUMN {column_name} {definition}")
             columns = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(graph_jobs)").fetchall()
             }
             if "error" not in columns:
                 conn.execute("ALTER TABLE graph_jobs ADD COLUMN error TEXT NOT NULL DEFAULT ''")
+            rows = conn.execute(
+                """
+                SELECT id, type, content, summary, metadata_json
+                FROM artifacts
+                WHERE session_key = '' OR turn_id = '' OR channel = '' OR chat_id = '' OR search_text = ''
+                """
+            ).fetchall()
+            if rows:
+                conn.executemany(
+                    """
+                    UPDATE artifacts
+                    SET session_key = ?,
+                        turn_id = ?,
+                        channel = ?,
+                        chat_id = ?,
+                        search_text = ?
+                    WHERE id = ?
+                    """,
+                    [
+                        (
+                            str((metadata := json.loads(row["metadata_json"] or "{}")).get("session_key") or ""),
+                            str(metadata.get("turn_id") or ""),
+                            str(metadata.get("channel") or ""),
+                            str(metadata.get("chat_id") or ""),
+                            self._artifact_search_text(
+                                str(row["content"] or ""),
+                                str(row["summary"] or ""),
+                                metadata,
+                                str(row["type"] or ""),
+                            ),
+                            str(row["id"]),
+                        )
+                        for row in rows
+                    ],
+                )
+
+    @staticmethod
+    def _artifact_search_text(
+        content: str,
+        summary: str,
+        metadata: dict[str, Any],
+        artifact_type: str,
+    ) -> str:
+        parts = [
+            content,
+            summary,
+            artifact_type,
+            str(metadata.get("session_key") or ""),
+            str(metadata.get("turn_id") or ""),
+            str(metadata.get("channel") or ""),
+            str(metadata.get("chat_id") or ""),
+            str(metadata.get("source_path") or ""),
+            json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+        ]
+        return "\n".join(part for part in parts if part).lower()
 
     def upsert_artifact(self, artifact: MemoryArtifact) -> None:
+        session_key = str(artifact.metadata.get("session_key") or "")
+        turn_id = str(artifact.metadata.get("turn_id") or "")
+        channel = str(artifact.metadata.get("channel") or "")
+        chat_id = str(artifact.metadata.get("chat_id") or "")
+        search_text = self._artifact_search_text(artifact.content, artifact.summary, artifact.metadata, artifact.type)
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO artifacts(id, type, content, summary, metadata_json, source_ref, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO artifacts(
+                    id, type, content, summary, metadata_json, session_key, turn_id, channel, chat_id, search_text, source_ref, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     type=excluded.type,
                     content=excluded.content,
                     summary=excluded.summary,
                     metadata_json=excluded.metadata_json,
+                    session_key=excluded.session_key,
+                    turn_id=excluded.turn_id,
+                    channel=excluded.channel,
+                    chat_id=excluded.chat_id,
+                    search_text=excluded.search_text,
                     source_ref=excluded.source_ref,
                     created_at=excluded.created_at
                 """,
@@ -181,6 +283,11 @@ class MemoryRegistry:
                     artifact.content,
                     artifact.summary,
                     json.dumps(artifact.metadata, ensure_ascii=False),
+                    session_key,
+                    turn_id,
+                    channel,
+                    chat_id,
+                    search_text,
                     artifact.source_ref,
                     artifact.created_at,
                 ),
@@ -231,8 +338,44 @@ class MemoryRegistry:
         artifact_type: str | None = None,
         limit: int = 50,
     ) -> list[MemoryArtifact]:
-        sql = "SELECT * FROM artifacts WHERE lower(metadata_json) LIKE ?"
-        params: list[Any] = [f"%{session_key.lower()}%"]
+        sql = "SELECT * FROM artifacts WHERE session_key = ?"
+        params: list[Any] = [session_key]
+        if artifact_type:
+            sql += " AND type = ?"
+            params.append(artifact_type)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [
+            MemoryArtifact(
+                id=row["id"],
+                type=row["type"],
+                content=row["content"],
+                summary=row["summary"],
+                metadata=json.loads(row["metadata_json"]),
+                source_ref=row["source_ref"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    def search_artifacts(
+        self,
+        query: str,
+        *,
+        session_key: str | None = None,
+        artifact_type: str | None = None,
+        limit: int = 50,
+    ) -> list[MemoryArtifact]:
+        normalized = query.strip().lower()
+        if not normalized:
+            return []
+        sql = "SELECT * FROM artifacts WHERE search_text LIKE ?"
+        params: list[Any] = [f"%{normalized}%"]
+        if session_key:
+            sql += " AND session_key = ?"
+            params.append(session_key)
         if artifact_type:
             sql += " AND type = ?"
             params.append(artifact_type)
@@ -279,6 +422,54 @@ class MemoryRegistry:
             ).fetchone()
         return row["status"] if row else None
 
+    def upsert_post_turn_job(
+        self,
+        *,
+        job_id: str,
+        episode_id: str,
+        session_key: str,
+        turn_id: str,
+        stages: dict[str, Any],
+        status: str,
+        attempt: int = 0,
+        last_error: str = "",
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO post_turn_jobs(job_id, episode_id, session_key, turn_id, stages_json, status, attempt, last_error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    stages_json=excluded.stages_json,
+                    status=excluded.status,
+                    attempt=excluded.attempt,
+                    last_error=excluded.last_error,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    job_id,
+                    episode_id,
+                    session_key,
+                    turn_id,
+                    json.dumps(stages, ensure_ascii=False),
+                    status,
+                    attempt,
+                    last_error,
+                ),
+            )
+
+    def get_post_turn_job(self, episode_id: str) -> sqlite3.Row | None:
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM post_turn_jobs
+                WHERE episode_id = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (episode_id,),
+            ).fetchone()
+
     def upsert_graph_node(self, node_id: str, label: str, metadata: dict[str, Any]) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -290,6 +481,24 @@ class MemoryRegistry:
                     metadata_json=excluded.metadata_json
                 """,
                 (node_id, label, json.dumps(metadata, ensure_ascii=False)),
+            )
+
+    def bulk_upsert_graph_nodes(self, rows: list[tuple[str, str, dict[str, Any]]]) -> None:
+        if not rows:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO graph_nodes(id, label, metadata_json)
+                VALUES (?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    label=excluded.label,
+                    metadata_json=excluded.metadata_json
+                """,
+                [
+                    (node_id, label, json.dumps(metadata, ensure_ascii=False))
+                    for node_id, label, metadata in rows
+                ],
             )
 
     def replace_graph_aliases(self, entity_id: str, aliases: list[dict[str, Any]]) -> None:
@@ -322,6 +531,42 @@ class MemoryRegistry:
                     rows,
                 )
 
+    def bulk_replace_graph_aliases(self, alias_rows_by_entity: dict[str, list[dict[str, Any]]]) -> None:
+        if not alias_rows_by_entity:
+            return
+        insert_rows: list[tuple[str, str, str, int]] = []
+        with self._connect() as conn:
+            conn.executemany(
+                "DELETE FROM entity_aliases WHERE entity_id = ?",
+                [(entity_id,) for entity_id in alias_rows_by_entity],
+            )
+            for entity_id, aliases in alias_rows_by_entity.items():
+                seen: set[str] = set()
+                for item in aliases:
+                    alias_text = str(item.get("alias_text") or "").strip()
+                    if not alias_text:
+                        continue
+                    key = alias_text.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    insert_rows.append(
+                        (
+                            entity_id,
+                            alias_text,
+                            str(item.get("alias_language") or ""),
+                            1 if item.get("is_canonical") else 0,
+                        )
+                    )
+            if insert_rows:
+                conn.executemany(
+                    """
+                    INSERT INTO entity_aliases(entity_id, alias_text, alias_language, is_canonical)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    insert_rows,
+                )
+
     def list_graph_aliases(self, entity_id: str) -> list[sqlite3.Row]:
         with self._connect() as conn:
             return conn.execute(
@@ -352,6 +597,27 @@ class MemoryRegistry:
                     metadata_json=excluded.metadata_json
                 """,
                 (source_id, target_id, relation, weight, json.dumps(metadata, ensure_ascii=False)),
+            )
+
+    def bulk_upsert_graph_edges(
+        self,
+        rows: list[tuple[str, str, str, float, dict[str, Any]]],
+    ) -> None:
+        if not rows:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO graph_edges(source_id, target_id, relation, weight, metadata_json)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(source_id, target_id, relation) DO UPDATE SET
+                    weight=excluded.weight,
+                    metadata_json=excluded.metadata_json
+                """,
+                [
+                    (source_id, target_id, relation, weight, json.dumps(metadata, ensure_ascii=False))
+                    for source_id, target_id, relation, weight, metadata in rows
+                ],
             )
 
     def query_graph(self, query: str, limit: int = 8) -> list[sqlite3.Row]:
@@ -433,7 +699,9 @@ class MemoryRegistry:
         params: list[Any] = []
         clauses: list[str] = []
         if query:
-            like = f"%{query.lower()}%"
+            normalized = query.lower()
+            like = f"%{normalized}%"
+            compact = "".join(ch for ch in normalized if ch.isalnum())
             clauses.append(
                 """(
                     lower(n.id) LIKE ? OR lower(n.label) LIKE ? OR lower(n.metadata_json) LIKE ?
@@ -441,9 +709,16 @@ class MemoryRegistry:
                         SELECT 1 FROM entity_aliases a
                         WHERE a.entity_id = n.id AND lower(a.alias_text) LIKE ?
                     )
+                    OR (? != '' AND replace(replace(replace(replace(lower(n.label), ' ', ''), '-', ''), '_', ''), '.', '') LIKE ?)
+                    OR (? != '' AND EXISTS (
+                        SELECT 1 FROM entity_aliases a
+                        WHERE a.entity_id = n.id
+                          AND replace(replace(replace(replace(lower(a.alias_text), ' ', ''), '-', ''), '_', ''), '.', '') LIKE ?
+                    ))
                 )"""
             )
-            params.extend([like, like, like, like])
+            compact_like = f"%{compact}%"
+            params.extend([like, like, like, like, compact, compact_like, compact, compact_like])
         if node_ids:
             placeholders = ", ".join("?" for _ in node_ids)
             clauses.append(f"n.id IN ({placeholders})")

@@ -19,6 +19,8 @@ class ContextBuilder:
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
+    _MAX_MEMORY_CONTEXT_CHARS = 1200
+    _MAX_ALWAYS_SKILL_CHARS = 900
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
@@ -44,7 +46,7 @@ class ContextBuilder:
         if bootstrap:
             parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context()
+        memory = self._compact_memory_context()
         if memory:
             parts.append(f"# Memory\n\n{memory}")
 
@@ -52,7 +54,10 @@ class ContextBuilder:
         if always_skills:
             always_content = self.skills.load_skills_for_context(always_skills)
             if always_content:
-                parts.append(f"# Active Skills\n\n{always_content}")
+                compact_always = always_content[:self._MAX_ALWAYS_SKILL_CHARS].rstrip()
+                if len(always_content) > self._MAX_ALWAYS_SKILL_CHARS:
+                    compact_always += "\n\n[Always-skill content truncated. Use read_file for full details.]"
+                parts.append(f"# Active Skills\n\n{compact_always}")
 
         skills_summary = self.skills.build_skills_summary()
         if skills_summary:
@@ -69,6 +74,16 @@ Skills with available="false" need dependencies installed first - you can try in
             parts.append(f"# Runtime Memory State\n\n```text\n{runtime_memory_context}\n```")
 
         return "\n\n---\n\n".join(parts)
+
+    def _compact_memory_context(self) -> str:
+        raw = self.memory.get_memory_context()
+        if not raw:
+            return ""
+        if len(raw) <= self._MAX_MEMORY_CONTEXT_CHARS:
+            return raw
+        head = raw[: self._MAX_MEMORY_CONTEXT_CHARS - 160].rstrip()
+        tail = raw[-120:].lstrip()
+        return f"{head}\n\n[Long-term memory truncated for prompt efficiency]\n\n{tail}"
 
     def _get_identity(self) -> str:
         """Get the core identity section."""

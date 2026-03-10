@@ -107,13 +107,13 @@ _INTENT_STORE_MAP: dict[str, list[str]] = {
 }
 
 _INTENT_ARTIFACT_MAP: dict[str, list[str]] = {
-    "temporal_recall": ["daily_note", "session_turn", "session_summary"],
+    "temporal_recall": ["daily_note", "summary_note", "session_turn", "session_summary"],
     "relationship_recall": ["entity", "relationship", "fact", "task_state"],
-    "workflow_recall": ["workflow_state", "task_state", "task_step", "experience_pattern"],
-    "factual_recall": ["fact", "summary_note", "session_summary"],
+    "workflow_recall": ["workflow_state", "task_state", "task_step", "experience_pattern", "session_turn"],
+    "factual_recall": ["fact", "summary_note", "daily_note", "session_turn", "session_summary"],
     "preference_recall": ["fact", "experience_pattern"],
-    "continuity": ["session_summary", "task_state", "workflow_state", "fact"],
-    "broad_synthesis": ["session_summary", "summary_note", "workflow_state", "fact"],
+    "continuity": ["session_summary", "task_state", "workflow_state", "fact", "summary_note", "daily_note", "session_turn"],
+    "broad_synthesis": ["session_summary", "summary_note", "daily_note", "workflow_state", "fact", "session_turn"],
     "fresh_request": [],
 }
 
@@ -170,6 +170,8 @@ class MemoryRoute:
 class MemoryRouter:
     """Hybrid semantic router with deterministic rule fallback."""
 
+    _PROTOTYPE_CACHE: dict[str, tuple[dict[str, list[float]], dict[str, list[list[float]]]]] = {}
+
     def __init__(
         self,
         *,
@@ -201,6 +203,11 @@ class MemoryRouter:
         return re.sub(r"\s+", " ", text).strip()
 
     def _query_embedding(self, text: str) -> list[float]:
+        if self.embedder is not None and hasattr(self.embedder, "embed_query"):
+            try:
+                return self.embedder.embed_query(text)
+            except Exception:
+                return []
         client = getattr(self.embedder, "embedding_client", None)
         if client is None:
             return []
@@ -214,6 +221,16 @@ class MemoryRouter:
             return
         client = getattr(self.embedder, "embedding_client", None)
         if client is None:
+            self._prototype_ready = True
+            return
+        cache_key = getattr(client, "embedding_version", "")
+        if cache_key and cache_key in self._PROTOTYPE_CACHE:
+            centroids, vectors = self._PROTOTYPE_CACHE[cache_key]
+            self._prototype_centroids = {intent: list(values) for intent, values in centroids.items()}
+            self._prototype_vectors = {
+                intent: [list(vector) for vector in items]
+                for intent, items in vectors.items()
+            }
             self._prototype_ready = True
             return
         for intent, exemplars in _INTENT_PROTOTYPES.items():
@@ -231,6 +248,11 @@ class MemoryRouter:
                 for idx, value in enumerate(vector):
                     centroid[idx] += value
             self._prototype_centroids[intent] = [value / len(vectors) for value in centroid]
+        if cache_key and self._prototype_centroids:
+            self._PROTOTYPE_CACHE[cache_key] = (
+                {intent: list(values) for intent, values in self._prototype_centroids.items()},
+                {intent: [list(vector) for vector in values] for intent, values in self._prototype_vectors.items()},
+            )
         self._prototype_ready = True
 
     def _semantic_scores(self, query: str) -> tuple[dict[str, float], list[float]]:

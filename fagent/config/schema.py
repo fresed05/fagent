@@ -255,7 +255,6 @@ class ModelProfileConfig(Base):
     provider: str | None = None
     provider_kind: str = "inherit"
     api_base: str | None = None
-    provider_kind: str = ""
     api_key: str = ""
     model: str = ""
     extra_headers: dict[str, str] = Field(default_factory=dict)

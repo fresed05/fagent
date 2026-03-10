@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from fagent.memory.policy import MemoryPolicy
@@ -100,15 +101,30 @@ class FileMemoryStore:
 
     def retrieve(self, query: str, limit: int = 5) -> list[RetrievedMemory]:
         query_lower = query.lower()
+        normalized_query = self._normalize_text(query)
+        compact_query = self._compact_text(query)
+        query_tokens = self._query_tokens(query)
         results: list[RetrievedMemory] = []
         candidates = [self.memory_file, self.history_file, *sorted(self.daily_dir.glob("*.md"), reverse=True)[:10]]
         for path in candidates:
             if not path.exists():
                 continue
             content = path.read_text(encoding="utf-8")
-            if query_lower not in content.lower():
+            lower_content = content.lower()
+            normalized_content = self._normalize_text(content)
+            compact_content = self._compact_text(content)
+
+            exact_match = query_lower in lower_content
+            compact_match = compact_query and compact_query in compact_content
+            token_overlap = self._token_overlap(query_tokens, self._query_tokens(content))
+            if not exact_match and not compact_match and token_overlap < 0.34:
                 continue
-            idx = content.lower().find(query_lower)
+            idx = lower_content.find(query_lower)
+            if idx < 0 and compact_query:
+                normalized_idx = normalized_content.find(normalized_query)
+                idx = normalized_idx if normalized_idx >= 0 else 0
+            if idx < 0:
+                idx = 0
             start = max(0, idx - 140)
             end = min(len(content), idx + 260)
             snippet = content[start:end].strip()
@@ -116,12 +132,47 @@ class FileMemoryStore:
                 RetrievedMemory(
                     artifact_id=f"file:{path.name}",
                     store="file",
-                    score=1.0 if path == self.memory_file else 0.8,
+                    score=self._score_path(path, exact_match=exact_match, compact_match=compact_match, token_overlap=token_overlap),
                     snippet=snippet,
                     reason=f"Matched file memory in {path.name}",
-                    metadata={"path": str(path)},
+                    metadata={"path": str(path), "artifact_type": self._artifact_type_for_path(path)},
                 )
             )
             if len(results) >= limit:
                 break
         return results
+
+    def _artifact_type_for_path(self, path: Path) -> str:
+        if path.parent == self.daily_dir:
+            return "daily_note"
+        if path == self.history_file:
+            return "summary_note"
+        if path == self.memory_file:
+            return "fact"
+        return "file_note"
+
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        return re.sub(r"\s+", " ", (value or "").lower()).strip()
+
+    @staticmethod
+    def _compact_text(value: str) -> str:
+        return "".join(ch for ch in (value or "").lower() if ch.isalnum())
+
+    @staticmethod
+    def _query_tokens(value: str) -> set[str]:
+        return {token for token in re.split(r"\W+", (value or "").lower()) if len(token) >= 3}
+
+    @staticmethod
+    def _token_overlap(left: set[str], right: set[str]) -> float:
+        if not left or not right:
+            return 0.0
+        return len(left & right) / max(len(left), len(right))
+
+    def _score_path(self, path: Path, *, exact_match: bool, compact_match: bool, token_overlap: float) -> float:
+        base = 1.0 if path == self.memory_file else 0.82
+        if exact_match:
+            return min(1.0, base + 0.12)
+        if compact_match:
+            return min(0.96, base + 0.08)
+        return min(0.92, base + token_overlap * 0.18)

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import inspect
 import json
 import re
 import time
@@ -57,7 +59,7 @@ class AgentLoop:
     5. Sends responses back
     """
 
-    _TOOL_RESULT_MAX_CHARS = 500
+    _TOOL_RESULT_MAX_CHARS = 1600
 
     def __init__(
         self,
@@ -139,7 +141,8 @@ class AgentLoop:
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
-        self._processing_lock = asyncio.Lock()
+        self._session_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        self._post_turn_tasks: set[asyncio.Task] = set()
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -265,7 +268,25 @@ class AgentLoop:
         ).info("turn_stage")
         if callback is None:
             return
-        await callback(content, stage=stage, status=status, event=event, **extra)
+        tool_hint = event == "tool"
+        try:
+            signature = inspect.signature(callback)
+        except (TypeError, ValueError):
+            signature = None
+        if signature is None:
+            await callback(content, stage=stage, status=status, event=event, tool_hint=tool_hint, **extra)
+            return
+        params = signature.parameters
+        accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values())
+        if accepts_kwargs or "stage" in params or "status" in params or "event" in params:
+            await callback(content, stage=stage, status=status, event=event, tool_hint=tool_hint, **extra)
+            return
+        if "tool_hint" in params:
+            if tool_hint and status not in {"running", "started"}:
+                return
+            await callback(content, tool_hint=tool_hint)
+            return
+        await callback(content)
 
     async def _run_agent_loop(
         self,
@@ -438,8 +459,10 @@ class AgentLoop:
         ))
 
     async def _dispatch(self, msg: InboundMessage) -> None:
-        """Process a message under the global lock."""
-        async with self._processing_lock:
+        """Process a message under a session-scoped lock."""
+        lock_key = msg.chat_id if msg.channel == "system" else msg.session_key
+        lock = self._session_locks.setdefault(lock_key, asyncio.Lock())
+        async with lock:
             try:
                 response = await self._process_message(msg)
                 if response is not None:
@@ -461,6 +484,8 @@ class AgentLoop:
 
     async def close_mcp(self) -> None:
         """Close MCP connections."""
+        if self._post_turn_tasks:
+            await asyncio.gather(*self._post_turn_tasks, return_exceptions=True)
         await self.memory.drain()
         self.memory.close()
         if self._mcp_stack:
@@ -727,6 +752,7 @@ class AgentLoop:
         episode: Any = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> None:
+        seed_artifacts = []
         if (
             tools_used
             and self.memory_config
@@ -738,7 +764,7 @@ class AgentLoop:
                 for entry in saved_entries
                 if entry.get("role") == "tool" and str(entry.get("content", "")).startswith("Error")
             ]
-            self.memory.record_workflow_snapshot(
+            workflow_artifact = self.memory.record_workflow_snapshot(
                 session_key=session.key,
                 turn_id=turn_id,
                 step_index=tool_call_count,
@@ -749,16 +775,46 @@ class AgentLoop:
                 citations=[entry.get("turn_id", turn_id) for entry in saved_entries[-4:]],
                 tools_used=tools_used,
             )
-        started_at = time.perf_counter()
-        pipeline = await self.memory.run_post_turn_pipeline(session=session, episode=episode, on_progress=on_progress)
-        logger.bind(
-            session_key=session.key,
-            turn_id=turn_id,
-            stage="post_turn_pipeline",
-            status="done",
-            duration_ms=int((time.perf_counter() - started_at) * 1000),
-            detail=json.dumps(pipeline, ensure_ascii=False)[:500],
-        ).info("turn_stage")
+            if workflow_artifact is not None:
+                seed_artifacts.append(workflow_artifact)
+
+        if episode is None:
+            return
+
+        async def _runner() -> None:
+            started_at = time.perf_counter()
+            try:
+                await self.memory.run_post_turn_pipeline(
+                    session=session,
+                    episode=episode,
+                    on_progress=on_progress,
+                    seed_artifacts=seed_artifacts,
+                )
+                self.sessions.save(session)
+                logger.bind(
+                    session_key=session.key,
+                    turn_id=turn_id,
+                    stage="post_turn_pipeline",
+                    status="done",
+                    duration_ms=int((time.perf_counter() - started_at) * 1000),
+                    detail="background pipeline completed",
+                ).info("turn_stage")
+            except Exception as exc:
+                logger.bind(
+                    session_key=session.key,
+                    turn_id=turn_id,
+                    stage="post_turn_pipeline",
+                    status="failed",
+                    duration_ms=int((time.perf_counter() - started_at) * 1000),
+                    detail=str(exc)[:240],
+                ).warning("turn_stage")
+            finally:
+                task = asyncio.current_task()
+                if task is not None:
+                    self._post_turn_tasks.discard(task)
+
+        task = asyncio.create_task(_runner())
+        self._post_turn_tasks.add(task)
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> tuple[str, list[dict]]:
         """Save new-turn messages into session, truncating large tool results."""
@@ -773,7 +829,10 @@ class AgentLoop:
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
             if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
-                entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+                head = content[:900].rstrip()
+                tail = content[-260:].lstrip()
+                digest = json.dumps({"sha1": hashlib.sha1(content.encode("utf-8")).hexdigest()[:12]})
+                entry["content"] = f"{head}\n...\n{tail}\n[tool_result_summary] {digest}"
             elif role == "user":
                 if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
                     # Strip the runtime-context prefix, keep only the user text.

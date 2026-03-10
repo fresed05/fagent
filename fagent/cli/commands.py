@@ -82,8 +82,8 @@ class _TurnTimeline:
         if self._last_tool_key is None:
             return
         tool_name, preview = self._last_tool_key
-        suffix = f" ×{self._last_tool_count}" if self._last_tool_count > 1 else ""
-        self.console.print(f"  ⚙️ {tool_name} / {preview}{suffix}")
+        suffix = f" x{self._last_tool_count}" if self._last_tool_count > 1 else ""
+        self.console.print(f"  [tool] {tool_name} / {preview}{suffix}")
         self._last_tool_key = None
         self._last_tool_count = 0
         self._pending_tool_status = "running"
@@ -98,21 +98,21 @@ class _TurnTimeline:
         count = int(extra.get("count", 0) or 0)
         confidence = float(extra.get("confidence", 0.0) or 0.0)
         stores_text = ", ".join(str(item) for item in stores) if stores else "none"
-        self.console.print(f"  🔎 Memory Lookup: {stores_text}")
-        self.console.print(f"  📚 Results: {count} • confidence {confidence:.2f}")
+        self.console.print(f"  [search] Memory lookup: {stores_text}")
+        self.console.print(f"  [search] Results: {count}; confidence {confidence:.2f}")
 
     def _render_thinking(self, content: str) -> None:
         text = content.strip()
         if not text or text == "Running main loop":
-            self.console.print("  🧠 Planning response")
+            self.console.print("  [think] Planning response")
             return
-        self.console.print(f"  🧠 {text}")
+        self.console.print(f"  [think] {text}")
 
     def _render_post_turn_summary(self) -> None:
-        self.console.print("  💾 Indexing complete")
-        self.console.print(f"  🕸 Graph: {self._clean_summary_value(self._summary.get('graph', 'n/a'))}")
-        self.console.print(f"  🧬 Vector: {self._clean_summary_value(self._summary.get('vector', 'n/a'))}")
-        self.console.print(f"  📝 Summary: {self._clean_summary_value(self._summary.get('summary', 'n/a'))}")
+        self.console.print("  [index] Indexing complete")
+        self.console.print(f"  [graph] Graph: {self._clean_summary_value(self._summary.get('graph', 'n/a'))}")
+        self.console.print(f"  [vector] Vector: {self._clean_summary_value(self._summary.get('vector', 'n/a'))}")
+        self.console.print(f"  [summary] Summary: {self._clean_summary_value(self._summary.get('summary', 'n/a'))}")
 
     def handle_event(self, event: dict[str, object]) -> None:
         stage = str(event.get("stage", "") or "")
@@ -158,8 +158,8 @@ class _TurnTimeline:
         if stage == "Turn complete":
             elapsed = time.perf_counter() - self._turn_started_at
             self._render_post_turn_summary()
-            self.console.print("  ✅ Done")
-            self.console.print(f"  ⏱ {elapsed:.1f}s")
+            self.console.print("  [done] Done")
+            self.console.print(f"  [time] {elapsed:.1f}s")
             return
         style = self._stage_style(status)
         self.console.print(f"  [{style}]{stage}[/{style}] {content}")

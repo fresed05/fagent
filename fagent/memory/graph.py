@@ -137,6 +137,37 @@ _GRAPH_AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "create_entities",
+            "description": "Stage multiple durable entity nodes in one call.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "entity_id": {"type": "string"},
+                                "label": {"type": "string"},
+                                "surface_label": {"type": "string"},
+                                "canonical_english_label": {"type": "string"},
+                                "kind": {"type": "string"},
+                                "aliases": {"type": "array", "items": {"type": "string"}},
+                                "source_language": {"type": "string"},
+                                "language_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                                "ambiguous_language": {"type": "boolean"},
+                                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                            },
+                        },
+                    },
+                },
+                "required": ["items"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_fact",
             "description": "Stage one durable fact node tied to an entity or episode subject.",
             "parameters": {
@@ -160,6 +191,37 @@ _GRAPH_AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "create_facts",
+            "description": "Stage multiple durable fact nodes in one call.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "fact_id": {"type": "string"},
+                                "statement": {"type": "string"},
+                                "statement_english": {"type": "string"},
+                                "surface_statement": {"type": "string"},
+                                "subject_id": {"type": "string"},
+                                "source_language": {"type": "string"},
+                                "language_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                                "ambiguous_language": {"type": "boolean"},
+                                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                                "supersedes": {"type": "array", "items": {"type": "string"}},
+                            },
+                        },
+                    },
+                },
+                "required": ["items"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_relation",
             "description": "Stage one directed relation between existing or staged nodes.",
             "parameters": {
@@ -174,6 +236,35 @@ _GRAPH_AGENT_TOOLS = [
                     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 },
                 "required": ["source_id", "target_id", "relation"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_relations",
+            "description": "Stage multiple directed relations in one call.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "source_id": {"type": "string"},
+                                "target_id": {"type": "string"},
+                                "relation": {"type": "string"},
+                                "source_language": {"type": "string"},
+                                "language_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                                "ambiguous_language": {"type": "boolean"},
+                                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                            },
+                            "required": ["source_id", "target_id", "relation"],
+                        },
+                    },
+                },
+                "required": ["items"],
             },
         },
     },
@@ -217,6 +308,8 @@ class LocalGraphBackend:
         self.normalize_model = normalize_model
         self.prompt_loader = prompt_loader or PromptLoader.from_package()
         self.semantic_embedder = semantic_embedder
+        self._semantic_payload_cache: dict[str, list[float]] = {}
+        self.last_search_candidate_count = 0
 
     @staticmethod
     def _looks_english(value: str) -> bool:
@@ -304,6 +397,30 @@ class LocalGraphBackend:
 
     def _find_existing_entity_id(self, canonical_label: str) -> str | None:
         rows = self._search_graph_candidates(canonical_label, limit=8)
+        if not rows:
+            fallback_rows = self.registry.list_graph_nodes(limit=96)
+            rescored: list[dict[str, Any]] = []
+            for row in fallback_rows:
+                lexical = self._score_graph_row(canonical_label, row)
+                if lexical < 0.58:
+                    continue
+                rescored.append(
+                    {
+                        "id": str(row["id"]),
+                        "label": str(row["label"]),
+                        "metadata_json": str(row["metadata_json"] or "{}"),
+                        "search_score": lexical,
+                        "semantic_score": 0.0,
+                    }
+                )
+            if rescored:
+                semantic_scores = self._semantic_score_graph_rows(canonical_label, rescored[:48])
+                for item in rescored:
+                    semantic = semantic_scores.get(item["id"], 0.0)
+                    item["semantic_score"] = semantic
+                    item["search_score"] = max(item["search_score"], semantic, 0.72 * item["search_score"] + 0.28 * semantic)
+                rescored.sort(key=lambda item: (item["search_score"], item["semantic_score"], item["label"]), reverse=True)
+                rows = rescored[:8]
         for row in rows:
             metadata = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
             score = float(row.get("search_score", 0.0))
@@ -352,17 +469,29 @@ class LocalGraphBackend:
         if not rows or self.semantic_embedder is None or getattr(self.semantic_embedder, "embedding_client", None) is None:
             return {}
         try:
-            query_vector = self.semantic_embedder.embedding_client.embed_texts([query])[0]
+            if hasattr(self.semantic_embedder, "embed_query"):
+                query_vector = self.semantic_embedder.embed_query(query)
+            else:
+                query_vector = self.semantic_embedder.embedding_client.embed_texts([query])[0]
             payloads = []
             keys = []
+            payload_vectors: list[list[float] | None] = []
             for row in rows:
                 metadata = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
                 payload = " | ".join(self._candidate_texts(row) + [str(metadata.get("kind") or "")])
                 payloads.append(payload)
                 keys.append((str(row["id"]), payload))
-            vectors = self.semantic_embedder.embedding_client.embed_texts(payloads)
+                payload_vectors.append(self._semantic_payload_cache.get(payload))
+            missing_payloads = [payload for payload, vector in zip(payloads, payload_vectors) if vector is None]
+            if missing_payloads:
+                new_vectors = self.semantic_embedder.embedding_client.embed_texts(missing_payloads)
+                for payload, vector in zip(missing_payloads, new_vectors):
+                    self._semantic_payload_cache[payload] = vector
             scores: dict[str, float] = {}
-            for (node_id, _payload), vector in zip(keys, vectors):
+            for node_id, payload in keys:
+                vector = self._semantic_payload_cache.get(payload)
+                if vector is None:
+                    continue
                 scores[node_id] = _cosine_similarity(query_vector, vector)
             return scores
         except Exception as exc:
@@ -370,7 +499,9 @@ class LocalGraphBackend:
             return {}
 
     def _search_graph_candidates(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
-        raw_rows = self.registry.list_graph_nodes(query=None, limit=400)
+        raw_limit = max(limit * 12, 240)
+        raw_rows = self.registry.list_graph_nodes(query=query, limit=raw_limit)
+        self.last_search_candidate_count = len(raw_rows)
         preliminary: list[dict[str, Any]] = []
         for row in raw_rows:
             lexical = self._score_graph_row(query, row)
@@ -654,6 +785,14 @@ class LocalGraphBackend:
             }
             return {"ok": True, "entity_id": entity_id}, False
 
+        if name == "create_entities":
+            created: list[str] = []
+            for item in arguments.get("items") or []:
+                result, _ = self._run_graph_tool("create_entity", item, stage)
+                if result.get("ok") and result.get("entity_id"):
+                    created.append(str(result["entity_id"]))
+            return {"ok": True, "entity_ids": created}, False
+
         if name == "create_fact":
             surface_statement = str(arguments.get("surface_statement") or arguments.get("statement") or "").strip()
             requested_english = str(arguments.get("statement_english") or arguments.get("statement") or "").strip()
@@ -682,6 +821,14 @@ class LocalGraphBackend:
             }
             return {"ok": True, "fact_id": fact_id}, False
 
+        if name == "create_facts":
+            created: list[str] = []
+            for item in arguments.get("items") or []:
+                result, _ = self._run_graph_tool("create_fact", item, stage)
+                if result.get("ok") and result.get("fact_id"):
+                    created.append(str(result["fact_id"]))
+            return {"ok": True, "fact_ids": created}, False
+
         if name == "create_relation":
             source_id = str(arguments.get("source_id", "")).strip()
             target_id = str(arguments.get("target_id", "")).strip()
@@ -699,6 +846,14 @@ class LocalGraphBackend:
             if relation_item not in stage["relations"]:
                 stage["relations"].append(relation_item)
             return {"ok": True}, False
+
+        if name == "create_relations":
+            created = 0
+            for item in arguments.get("items") or []:
+                result, _ = self._run_graph_tool("create_relation", item, stage)
+                if result.get("ok"):
+                    created += 1
+            return {"ok": True, "relations": created}, False
 
         if name == "finish_graph_plan":
             stage["reason"] = str(arguments.get("reason", "")).strip()
@@ -729,19 +884,23 @@ class LocalGraphBackend:
 
     def _persist_graph(self, episode: EpisodeRecord, summary: str, extraction: dict[str, Any]) -> None:
         episode_node = f"episode:{episode.episode_id}"
-        self.registry.upsert_graph_node(
-            episode_node,
-            label=episode.turn_id,
-            metadata={
-                "kind": "episode",
-                "summary": summary,
-                "session_key": episode.session_key,
-                "episode_id": episode.episode_id,
-                "turn_id": episode.turn_id,
-                "timestamp": episode.timestamp,
-                "source": "llm_graph_agent",
-            },
-        )
+        node_rows: list[tuple[str, str, dict[str, Any]]] = [
+            (
+                episode_node,
+                episode.turn_id,
+                {
+                    "kind": "episode",
+                    "summary": summary,
+                    "session_key": episode.session_key,
+                    "episode_id": episode.episode_id,
+                    "turn_id": episode.turn_id,
+                    "timestamp": episode.timestamp,
+                    "source": "llm_graph_agent",
+                },
+            )
+        ]
+        alias_rows_by_entity: dict[str, list[dict[str, Any]]] = {}
+        edge_rows: list[tuple[str, str, str, float, dict[str, Any]]] = []
 
         entities = extraction.get("entities") or []
         facts = extraction.get("facts") or []
@@ -766,68 +925,83 @@ class LocalGraphBackend:
                 "provenance_episode": episode.episode_id,
                 "source": "llm_graph_agent",
             }
-            self.registry.upsert_graph_node(entity_id, label=label, metadata=metadata)
-            self.registry.replace_graph_aliases(entity_id, aliases)
-            self.registry.upsert_graph_edge(
-                episode_node,
-                entity_id,
-                relation="mentions",
-                weight=float(entity.get("confidence", 0.7)),
-                metadata={"episode_id": episode.episode_id, "source": "entity"},
+            node_rows.append((entity_id, label, metadata))
+            alias_rows_by_entity[entity_id] = aliases
+            edge_rows.append(
+                (
+                    episode_node,
+                    entity_id,
+                    "mentions",
+                    float(entity.get("confidence", 0.7)),
+                    {"episode_id": episode.episode_id, "source": "entity"},
+                )
             )
 
         for fact in facts:
             fact_id = str(fact.get("id") or f"fact:{self._slug(fact.get('statement', 'fact'))}")
             statement = str(fact.get("statement") or summary)
-            self.registry.upsert_graph_node(
-                fact_id,
-                label=statement[:180],
-                metadata={
-                    "kind": "fact",
-                    "statement": statement,
-                    "canonical_statement_en": statement,
-                    "surface_statement": fact.get("surface_statement", statement),
-                    "source_language": fact.get("source_language", "en"),
-                    "language_confidence": fact.get("language_confidence", 1.0),
-                    "normalization_method": fact.get("normalization_method", "exact"),
-                    "confidence": fact.get("confidence", 0.8),
-                    "provenance_episode": episode.episode_id,
-                    "supersedes": fact.get("supersedes", []),
-                    "source": "llm_graph_agent",
-                },
+            node_rows.append(
+                (
+                    fact_id,
+                    statement[:180],
+                    {
+                        "kind": "fact",
+                        "statement": statement,
+                        "canonical_statement_en": statement,
+                        "surface_statement": fact.get("surface_statement", statement),
+                        "source_language": fact.get("source_language", "en"),
+                        "language_confidence": fact.get("language_confidence", 1.0),
+                        "normalization_method": fact.get("normalization_method", "exact"),
+                        "confidence": fact.get("confidence", 0.8),
+                        "provenance_episode": episode.episode_id,
+                        "supersedes": fact.get("supersedes", []),
+                        "source": "llm_graph_agent",
+                    },
+                )
             )
             subject = str(fact.get("subject") or episode_node)
-            self.registry.upsert_graph_edge(
-                subject,
-                fact_id,
-                relation="decided",
-                weight=float(fact.get("confidence", 0.8)),
-                metadata={"episode_id": episode.episode_id},
+            edge_rows.append(
+                (
+                    subject,
+                    fact_id,
+                    "decided",
+                    float(fact.get("confidence", 0.8)),
+                    {"episode_id": episode.episode_id},
+                )
             )
-            self.registry.upsert_graph_edge(
-                episode_node,
-                fact_id,
-                relation="mentions",
-                weight=float(fact.get("confidence", 0.8)),
-                metadata={"episode_id": episode.episode_id},
+            edge_rows.append(
+                (
+                    episode_node,
+                    fact_id,
+                    "mentions",
+                    float(fact.get("confidence", 0.8)),
+                    {"episode_id": episode.episode_id},
+                )
             )
             for superseded in fact.get("supersedes", []):
-                self.registry.upsert_graph_edge(
-                    fact_id,
-                    str(superseded),
-                    relation="supersedes",
-                    weight=1.0,
-                    metadata={"episode_id": episode.episode_id, "superseded": True},
+                edge_rows.append(
+                    (
+                        fact_id,
+                        str(superseded),
+                        "supersedes",
+                        1.0,
+                        {"episode_id": episode.episode_id, "superseded": True},
+                    )
                 )
 
         for relation in relations:
-            self.registry.upsert_graph_edge(
-                str(relation.get("source") or episode_node),
-                str(relation.get("target") or episode_node),
-                relation=str(relation.get("type") or "mentions"),
-                weight=float(relation.get("confidence", 0.75)),
-                metadata={"episode_id": episode.episode_id, "source": "relation"},
+            edge_rows.append(
+                (
+                    str(relation.get("source") or episode_node),
+                    str(relation.get("target") or episode_node),
+                    str(relation.get("type") or "mentions"),
+                    float(relation.get("confidence", 0.75)),
+                    {"episode_id": episode.episode_id, "source": "relation"},
+                )
             )
+        self.registry.bulk_upsert_graph_nodes(node_rows)
+        self.registry.bulk_replace_graph_aliases(alias_rows_by_entity)
+        self.registry.bulk_upsert_graph_edges(edge_rows)
 
     def _slug(self, value: str) -> str:
         return hashlib.sha1(value.encode("utf-8")).hexdigest()[:12]

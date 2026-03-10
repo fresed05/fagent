@@ -191,7 +191,7 @@ async def test_vector_failure_does_not_break_file_memory(
     assert any("[file]" in item for item in orchestrator.query("fallback behavior"))
 
 
-def test_export_graph_subgraph_returns_latest_graph_without_filters(tmp_path: Path) -> None:
+def test_export_graph_subgraph_requires_scope_or_query_for_snapshot(tmp_path: Path) -> None:
     orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
     orchestrator.registry.upsert_graph_node("entity:ssh", "SSH", {"kind": "entity"})
     orchestrator.registry.replace_graph_aliases(
@@ -206,9 +206,9 @@ def test_export_graph_subgraph_returns_latest_graph_without_filters(tmp_path: Pa
 
     payload = orchestrator.export_graph_subgraph()
 
-    assert len(payload["nodes"]) == 2
-    assert len(payload["edges"]) == 1
-    assert payload["message"] == "Loaded latest graph snapshot."
+    assert payload["nodes"] == []
+    assert payload["edges"] == []
+    assert payload["message"] == "Provide a session or query to load a graph snapshot."
 
 
 def test_get_entity_and_query_resolve_russian_alias_to_english_canonical_node(tmp_path: Path) -> None:

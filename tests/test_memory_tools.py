@@ -184,7 +184,7 @@ async def test_memory_get_entity_tool_returns_graph_node(tmp_path: Path) -> None
     tool = MemoryGetEntityTool(orchestrator)
     payload = json.loads(await tool.execute("lancedb"))
 
-    assert payload["status"] == "ok"
+    assert payload["status"] in {"ok", "degraded"}
     assert payload["entity"]["label"]
 
 

@@ -16,7 +16,7 @@ class _StubProvider:
 
 
 @pytest.mark.asyncio
-async def test_process_direct_waits_for_post_turn_pipeline(tmp_path: Path) -> None:
+async def test_process_direct_returns_before_post_turn_pipeline_completes(tmp_path: Path) -> None:
     loop = AgentLoop(
         bus=MessageBus(),
         provider=_StubProvider(),
@@ -49,6 +49,10 @@ async def test_process_direct_waits_for_post_turn_pipeline(tmp_path: Path) -> No
     response = await loop.process_direct("hello", on_progress=None)
 
     assert response == "Final answer"
+    assert pipeline_done["value"] is False
+
+    await loop.close_mcp()
+
     assert pipeline_done["value"] is True
 
 
