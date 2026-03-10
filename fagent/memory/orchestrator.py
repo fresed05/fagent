@@ -1584,6 +1584,7 @@ class MemoryOrchestrator:
                 "priority_score": int((node.get("metadata") or {}).get("priority_score") or self._graph_priority_score(node)),
             }
             for node in payload.get("nodes", [])
+            if self._include_graph_search_result(node)
         ]
         search_results.sort(
             key=lambda item: (
@@ -1595,6 +1596,27 @@ class MemoryOrchestrator:
         payload["search_results"] = search_results[:18]
         payload["view"] = "overview"
         return payload
+
+    def _include_graph_search_result(self, node: dict[str, object]) -> bool:
+        metadata = dict(node.get("metadata") or {})
+        node_id = str(node.get("id") or "")
+        label = str(node.get("label") or "").strip()
+        kind = str(metadata.get("kind") or "node").lower()
+
+        if not label:
+            return False
+        if metadata.get("is_cluster"):
+            return False
+        if node_id.startswith("turn-") or label.startswith("turn-"):
+            return False
+        if kind in {"episode", "session_turn", "workflow_state", "artifact_fallback"}:
+            return False
+
+        low_signal_prefixes = ("episode-", "artifact:", "session:", "turn:")
+        if any(node_id.startswith(prefix) for prefix in low_signal_prefixes):
+            return False
+
+        return True
 
     def export_graph_focus(
         self,

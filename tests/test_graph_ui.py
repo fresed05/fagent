@@ -171,6 +171,29 @@ def test_graph_ui_focus_and_details_support_cluster_nodes(tmp_path: Path) -> Non
     assert "cluster_bridge_targets" in details["metadata"]
 
 
+def test_graph_overview_search_results_hide_turn_nodes_and_clusters(tmp_path: Path) -> None:
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="stub")
+    orchestrator.upsert_graph_node(node_id="software:cliproxyapi", label="CLIProxyAPI", metadata={"kind": "software"})
+    orchestrator.upsert_graph_node(node_id="turn-000015", label="turn-000015", metadata={"kind": "episode"})
+    for index in range(8):
+        node_id = f"fact:{index}"
+        orchestrator.upsert_graph_node(node_id=node_id, label=f"Fact {index}", metadata={"kind": "fact"})
+        orchestrator.upsert_graph_edge(
+            source_id="software:cliproxyapi",
+            target_id=node_id,
+            relation="decided",
+            weight=1.0,
+            metadata={"source": "test"},
+        )
+
+    payload = orchestrator.export_graph_overview(query=":", mode="global-clustered")
+
+    labels = {item["label"] for item in payload["search_results"]}
+    assert "CLIProxyAPI" in labels
+    assert "turn-000015" not in labels
+    assert not any(item["is_cluster"] for item in payload["search_results"])
+
+
 def test_graph_ui_assets_do_not_contain_common_mojibake_sequences() -> None:
     app_js = (_STATIC_DIR / "assets" / "app.js").read_text(encoding="utf-8")
 
