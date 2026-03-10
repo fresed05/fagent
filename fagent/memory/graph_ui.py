@@ -48,8 +48,9 @@ class GraphUiRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/assets/"):
             asset_rel = parsed.path.removeprefix("/assets/")
-            asset_path = (_STATIC_DIR / asset_rel).resolve()
-            if not str(asset_path).startswith(str(_STATIC_DIR.resolve())) or not asset_path.exists():
+            asset_root = (_STATIC_DIR / "assets").resolve()
+            asset_path = (asset_root / asset_rel).resolve()
+            if not str(asset_path).startswith(str(asset_root)) or not asset_path.exists():
                 self._send_json({"error": "asset_not_found"}, status=HTTPStatus.NOT_FOUND)
                 return
             content_type = "application/octet-stream"
@@ -57,7 +58,7 @@ class GraphUiRequestHandler(BaseHTTPRequestHandler):
                 content_type = "application/javascript; charset=utf-8"
             elif asset_path.suffix == ".css":
                 content_type = "text/css; charset=utf-8"
-            self._serve_static(asset_rel, content_type)
+            self._serve_static(f"assets/{asset_rel}", content_type)
             return
         if parsed.path == "/api/graph":
             params = parse_qs(parsed.query)

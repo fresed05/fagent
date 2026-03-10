@@ -44,6 +44,8 @@ def test_graph_ui_server_serves_static_and_api(tmp_path: Path) -> None:
     try:
         with urlopen(url, timeout=5) as response:  # noqa: S310
             body = response.read().decode("utf-8")
+        with urlopen(f"{url}assets/styles.css", timeout=5) as response:  # noqa: S310
+            css = response.read().decode("utf-8")
         payload = _http_json("GET", f"{url}api/graph")
         node_payload = _http_json("GET", f"{url}api/graph/node/node%3Aa")
         layout_payload = _http_json(
@@ -53,6 +55,7 @@ def test_graph_ui_server_serves_static_and_api(tmp_path: Path) -> None:
         )
 
         assert "fagent graph" in body
+        assert ".masthead" in css
         assert any(item["id"] == "node:a" for item in payload["nodes"])
         assert node_payload["id"] == "node:a"
         assert layout_payload["saved"] == 1
