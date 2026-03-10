@@ -104,6 +104,37 @@ class MemoryOrchestrator:
         )
         self._tasks: set[asyncio.Task] = set()
 
+    def _normalize_seed_artifact(
+        self,
+        artifact: MemoryArtifact | WorkflowStateArtifact,
+    ) -> MemoryArtifact | None:
+        if isinstance(artifact, MemoryArtifact):
+            return artifact
+        lookup_id = f"workflow:{artifact.snapshot_id}"
+        existing = self.registry.get_artifact(lookup_id)
+        if existing is not None:
+            return existing
+        normalized = MemoryArtifact(
+            id=lookup_id,
+            type="workflow_state",
+            content=artifact.current_state,
+            summary=f"{artifact.goal} -> {artifact.current_state}"[:240],
+            metadata={
+                "session_key": artifact.session_key,
+                "turn_id": artifact.turn_id,
+                "step_index": artifact.step_index,
+                "open_blockers": list(artifact.open_blockers),
+                "next_step": artifact.next_step,
+                "citations": list(artifact.citations),
+                "tools_used": list(artifact.tools_used),
+                "artifact_type": "workflow_state",
+                "snapshot_id": artifact.snapshot_id,
+            },
+            source_ref="workflow",
+        )
+        self.registry.upsert_artifact(normalized)
+        return normalized
+
     async def _emit_stage(
         self,
         on_progress: Callable[..., Awaitable[None]] | None,
@@ -136,6 +167,20 @@ class MemoryOrchestrator:
             duration_ms=duration_ms,
             extra=extra or {},
         )
+
+    def _normalize_stage_error(self, stage: str, exc: Exception) -> tuple[str, dict[str, object]]:
+        raw = str(exc).strip()
+        lowered = raw.lower()
+        if "workflowstateartifact" in lowered and "attribute 'id'" in lowered:
+            return (
+                "workflow snapshot normalization required",
+                {
+                    "reason": "workflow_snapshot_normalization_required",
+                    "raw_error": raw[:240],
+                    "stage": stage,
+                },
+            )
+        return raw[:180], {"reason": "runtime_error", "raw_error": raw[:240], "stage": stage}
 
     @staticmethod
     def _normalize_repeat_text(value: str) -> str:
@@ -248,9 +293,13 @@ class MemoryOrchestrator:
         episode: EpisodeRecord,
         *,
         session: "Session",
-        seed_artifacts: list[MemoryArtifact] | None = None,
+        seed_artifacts: list[MemoryArtifact | WorkflowStateArtifact] | None = None,
     ) -> TurnIngestPlan:
-        artifacts = list(seed_artifacts or [])
+        artifacts = [
+            normalized
+            for item in (seed_artifacts or [])
+            if (normalized := self._normalize_seed_artifact(item)) is not None
+        ]
         return TurnIngestPlan(
             episode=episode,
             artifacts=artifacts,
@@ -344,7 +393,7 @@ class MemoryOrchestrator:
         session: "Session",
         episode: EpisodeRecord | None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
-        seed_artifacts: list[MemoryArtifact] | None = None,
+        seed_artifacts: list[MemoryArtifact | WorkflowStateArtifact] | None = None,
     ) -> dict[str, object]:
         if not self.config.enabled or episode is None:
             return {
@@ -453,7 +502,8 @@ class MemoryOrchestrator:
                 try:
                     self.vector_backend.ingest_artifacts(ingest_plan.artifacts)
                 except Exception as exc:
-                    results["vector"] = {"status": "retry", "artifacts": 0, "error": str(exc)}
+                    error_detail, error_meta = self._normalize_stage_error("Writing vectors", exc)
+                    results["vector"] = {"status": "retry", "artifacts": 0, "error": error_detail, "reason": error_meta.get("reason")}
                     stage_state["vector"] = "retry"
                     await self._emit_stage(
                         on_progress,
@@ -461,9 +511,9 @@ class MemoryOrchestrator:
                         status="retry",
                         session_key=episode.session_key,
                         turn_id=episode.turn_id,
-                        detail=f"retry: {str(exc)[:180]}",
+                        detail=f"retry: {error_detail}",
                         duration_ms=int((time.perf_counter() - started_at) * 1000),
-                        extra={"error": str(exc)[:180]},
+                        extra=error_meta,
                     )
                     raise
                 results["vector"] = {"status": "ok", "artifacts": vector_artifacts}
@@ -510,7 +560,8 @@ class MemoryOrchestrator:
                         extra={"artifacts": 1},
                     )
             except Exception as exc:
-                results["summary"] = {"status": "failed", "artifact_id": None, "error": str(exc)}
+                error_detail, error_meta = self._normalize_stage_error("Summarizing session", exc)
+                results["summary"] = {"status": "failed", "artifact_id": None, "error": error_detail, "reason": error_meta.get("reason")}
                 stage_state["summary"] = "failed"
                 await self._emit_stage(
                     on_progress,
@@ -518,7 +569,8 @@ class MemoryOrchestrator:
                     status="failed",
                     session_key=episode.session_key,
                     turn_id=episode.turn_id,
-                    detail=str(exc)[:180],
+                    detail=error_detail,
+                    extra=error_meta,
                 )
                 raise
             self.registry.upsert_post_turn_job(
@@ -704,7 +756,7 @@ class MemoryOrchestrator:
         *,
         session: "Session",
         episode: EpisodeRecord | None,
-        seed_artifacts: list[MemoryArtifact] | None = None,
+        seed_artifacts: list[MemoryArtifact | WorkflowStateArtifact] | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> None:
         if not self.config.enabled or episode is None:
@@ -731,7 +783,7 @@ class MemoryOrchestrator:
         episode: EpisodeRecord,
         *,
         session: "Session | None" = None,
-        seed_artifacts: list[MemoryArtifact] | None = None,
+        seed_artifacts: list[MemoryArtifact | WorkflowStateArtifact] | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> None:
         class _SyntheticSession:

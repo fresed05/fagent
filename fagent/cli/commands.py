@@ -1,6 +1,7 @@
 """CLI commands for fagent."""
 
 import asyncio
+from dataclasses import dataclass
 import os
 import select
 import signal
@@ -20,17 +21,22 @@ if sys.platform == "win32":
             pass
 
 import typer
+from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
+from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.document import Document
 from rich import box
 from rich.console import Console
+from rich.console import Group
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
+from typer.main import get_command as typer_get_command
 
 from fagent import __logo__, __version__
 from fagent.config.paths import get_workspace_path
@@ -49,6 +55,105 @@ BRAND_GRADIENT = "bold bright_white on blue"
 ACCENT = "bright_cyan"
 
 
+@dataclass(frozen=True, slots=True)
+class _CommandEntry:
+    name: str
+    description: str
+    category: str
+    example: str
+    aliases: tuple[str, ...] = ()
+
+
+CHAT_COMMANDS: tuple[_CommandEntry, ...] = (
+    _CommandEntry("/help", "Show interactive help and examples.", "chat", "/help"),
+    _CommandEntry("/commands", "List chat commands and CLI shortcuts.", "chat", "/commands"),
+    _CommandEntry("/clear", "Clear the terminal viewport.", "chat", "/clear"),
+    _CommandEntry("/status", "Show the active interactive session state.", "chat", "/status"),
+    _CommandEntry("/exit", "Exit interactive mode.", "chat", "/exit", aliases=("exit", "/quit", "quit", ":q")),
+)
+
+_PROMPT_CATALOG: tuple[_CommandEntry, ...] = ()
+
+
+def _is_emoji_friendly() -> bool:
+    encoding = (getattr(sys.stdout, "encoding", None) or "").lower()
+    return "utf" in encoding
+
+
+def _icon(emoji: str, fallback: str) -> str:
+    return emoji if _is_emoji_friendly() else fallback
+
+
+def _status_chip(label: str, style: str) -> Text:
+    text = Text()
+    text.append("[", style="dim")
+    text.append(label.upper(), style=style)
+    text.append("]", style="dim")
+    return text
+
+
+class _HybridCommandCompleter(Completer):
+    def __init__(self, entries: tuple[_CommandEntry, ...]):
+        self.entries = entries
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor.lstrip()
+        is_chat = text.startswith("/")
+        entries = [entry for entry in self.entries if entry.name.startswith("/")] if is_chat else [
+            entry for entry in self.entries if not entry.name.startswith("/")
+        ]
+        if not text:
+            for entry in entries[:12]:
+                yield Completion(
+                    entry.name,
+                    start_position=0,
+                    display=entry.name,
+                    display_meta=entry.description,
+                )
+            return
+
+        lowered = text.lower()
+        matches: list[tuple[_CommandEntry, str]] = []
+        for entry in entries:
+            candidates = (entry.name, *entry.aliases)
+            for candidate in candidates:
+                if candidate.lower().startswith(lowered):
+                    matches.append((entry, candidate))
+                    break
+        seen: set[str] = set()
+        for entry, candidate in matches:
+            if entry.name in seen:
+                continue
+            seen.add(entry.name)
+            yield Completion(
+                entry.name,
+                start_position=-len(document.text_before_cursor),
+                display=entry.name,
+                display_meta=entry.description,
+            )
+
+
+class _HybridAutoSuggest(AutoSuggest):
+    def __init__(self, entries: tuple[_CommandEntry, ...]):
+        self.entries = entries
+
+    def get_suggestion(self, buffer, document):
+        text = document.text_before_cursor.lstrip()
+        if not text:
+            return None
+        pool = (
+            [entry for entry in self.entries if entry.name.startswith("/")]
+            if text.startswith("/")
+            else [entry for entry in self.entries if not entry.name.startswith("/")]
+        )
+        lowered = text.lower()
+        for entry in pool:
+            for candidate in (entry.name, *entry.aliases):
+                if candidate.lower().startswith(lowered) and entry.name != text:
+                    return Suggestion(entry.name[len(text):])
+        return None
+
+
 class _TurnTimeline:
     _SUMMARY_STAGE_KEYS = {
         "Saving file memory": "file_memory",
@@ -64,6 +169,7 @@ class _TurnTimeline:
         self._pending_tool_status = "running"
         self._turn_started_at = time.perf_counter()
         self._summary: dict[str, object] = {}
+        self._summary_visible = False
 
     def start_turn(self) -> None:
         self._last_tool_key = None
@@ -71,6 +177,7 @@ class _TurnTimeline:
         self._pending_tool_status = "running"
         self._turn_started_at = time.perf_counter()
         self._summary = {}
+        self._summary_visible = False
 
     def _stage_style(self, status: str) -> str:
         return {
@@ -85,12 +192,93 @@ class _TurnTimeline:
             "not_triggered": "dim",
         }.get(status, "dim")
 
+    def _sanitize_error_text(self, text: str, *, stage: str = "") -> str:
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        lowered = raw.lower()
+        if "workflowstateartifact" in lowered and "attribute 'id'" in lowered:
+            if stage == "Writing vectors":
+                return "workflow snapshot normalization required"
+            return "workflow snapshot metadata mismatch"
+        if "object has no attribute" in lowered:
+            return "artifact metadata mismatch"
+        return raw
+
+    def _tool_icon(self, tool_name: str) -> str:
+        normalized = tool_name.lower()
+        if any(token in normalized for token in ("exec", "shell", "bash")):
+            return _icon("🛠️", "T")
+        if any(token in normalized for token in ("read", "file", "write")):
+            return _icon("📄", "F")
+        if "memory" in normalized:
+            return _icon("🧠", "M")
+        if any(token in normalized for token in ("web", "search", "http")):
+            return _icon("🌐", "W")
+        return _icon("🔧", "*")
+
+    def _stage_icon(self, stage: str, *, status: str = "") -> str:
+        if stage == "Thinking":
+            return _icon("🧠", ">")
+        if stage == "Pre-search":
+            return _icon("🔎", "?")
+        if stage == "Saving file memory":
+            return _icon("🗂️", "F")
+        if stage == "Building graph":
+            return _icon("🕸️", "G")
+        if stage == "Writing vectors":
+            return _icon("📦", "V")
+        if stage == "Summarizing session":
+            return _icon("📝", "S")
+        if stage == "Turn complete":
+            return _icon("✅", "+")
+        return _icon("✨", "*")
+
+    def _tool_style(self, tool_name: str, status: str) -> str:
+        if status in {"error", "failed"}:
+            return "bold red"
+        if status == "retry":
+            return "bold yellow"
+        normalized = tool_name.lower()
+        if any(token in normalized for token in ("exec", "shell", "bash")):
+            return "bright_magenta"
+        if any(token in normalized for token in ("read", "file", "write")):
+            return "bright_blue"
+        if "memory" in normalized:
+            return "bright_cyan"
+        if any(token in normalized for token in ("web", "search", "http")):
+            return "bright_green"
+        return "bright_white"
+
+    def _render_line(self, icon: str, label: str, message: str, *, style: str, badge: Text | None = None) -> None:
+        text = Text()
+        text.append("  ")
+        text.append(f"{icon} ", style=style)
+        text.append(label, style=f"bold {style}")
+        if message:
+            text.append(" ")
+            text.append(message, style="white")
+        if badge is not None:
+            text.append(" ")
+            text.append_text(badge)
+        self.console.print(text)
+
     def _flush_tool(self) -> None:
         if self._last_tool_key is None:
             return
         tool_name, preview = self._last_tool_key
-        suffix = f" x{self._last_tool_count}" if self._last_tool_count > 1 else ""
-        self.console.print(f"  [tool] {tool_name} / {preview}{suffix}")
+        style = self._tool_style(tool_name, self._pending_tool_status)
+        badge = _status_chip(
+            f"x{self._last_tool_count}" if self._last_tool_count > 1 else self._pending_tool_status,
+            self._stage_style(self._pending_tool_status),
+        )
+        self._render_line(
+            self._tool_icon(tool_name),
+            tool_name,
+            preview,
+            style=style,
+            badge=badge,
+        )
         self._last_tool_key = None
         self._last_tool_count = 0
         self._pending_tool_status = "running"
@@ -141,24 +329,54 @@ class _TurnTimeline:
         count = int(extra.get("count", 0) or 0)
         confidence = float(extra.get("confidence", 0.0) or 0.0)
         stores_text = ", ".join(str(item) for item in stores) if stores else "none"
-        self.console.print(f"  [search] Memory lookup: {stores_text}")
-        self.console.print(f"  [search] Results: {count}; confidence {confidence:.2f}")
+        self._render_line(self._stage_icon("Pre-search"), "Memory", f"lookup: {stores_text}", style="bright_cyan")
+        self._render_line(self._stage_icon("Pre-search"), "Memory", f"results: {count}; confidence {confidence:.2f}", style="bright_cyan")
 
     def _render_thinking(self, content: str) -> None:
         text = content.strip()
         if not text or text == "Running main loop":
-            self.console.print("  [think] Planning response")
+            self._render_line(self._stage_icon("Thinking"), "Thought", "Planning response", style="bright_blue")
             return
-        self.console.print(f"  [think] {text}")
+        self._render_line(self._stage_icon("Thinking"), "Thought", text, style="bright_blue")
 
     def _render_post_turn_summary(self) -> None:
-        graph_value = self._summary.get("graph", "pending (background)")
-        vector_value = self._summary.get("vector", "pending (background)")
-        summary_value = self._summary.get("summary", "pending (background)")
-        self.console.print("  [index] Indexing complete")
-        self.console.print(f"  [graph] Graph: {self._clean_summary_value(graph_value)}")
-        self.console.print(f"  [vector] Vector: {self._clean_summary_value(vector_value)}")
-        self.console.print(f"  [summary] Summary: {self._clean_summary_value(summary_value)}")
+        graph_value = self._clean_summary_value(self._summary.get("graph", "pending (background)"))
+        vector_value = self._clean_summary_value(self._summary.get("vector", "pending (background)"))
+        summary_value = self._clean_summary_value(self._summary.get("summary", "pending (background)"))
+        file_value = self._clean_summary_value(self._summary.get("file_memory", "done"))
+        body = Group(
+            Text.assemble(f"{self._stage_icon('Saving file memory')} File: ", (file_value, "white")),
+            Text.assemble(f"{self._stage_icon('Building graph')} Graph: ", (graph_value, "white")),
+            Text.assemble(f"{self._stage_icon('Writing vectors')} Vector: ", (vector_value, "white")),
+            Text.assemble(f"{self._stage_icon('Summarizing session')} Summary: ", (summary_value, "white")),
+        )
+        self.console.print(
+            Panel(
+                body,
+                title=f"{_icon('🗃️', '#')} Post-turn indexing",
+                border_style="bright_black",
+                box=box.ROUNDED,
+                padding=(0, 1),
+            )
+        )
+        self._summary_visible = True
+
+    def _render_background_stage_update(self, stage: str, status: str, message: str) -> None:
+        stage_label = {
+            "Saving file memory": "File memory",
+            "Building graph": "Graph",
+            "Writing vectors": "Vector",
+            "Summarizing session": "Summary",
+        }.get(stage, stage)
+        if stage == "Turn complete":
+            return
+        self._render_line(
+            self._stage_icon(stage, status=status),
+            stage_label,
+            message,
+            style=self._stage_style(status),
+            badge=_status_chip(status, self._stage_style(status)),
+        )
 
     def handle_event(self, event: dict[str, object]) -> None:
         stage = str(event.get("stage", "") or "")
@@ -166,7 +384,8 @@ class _TurnTimeline:
         content = str(event.get("content", "") or "")
         event_type = str(event.get("event", "stage") or "stage")
         extra = event.get("extra") or {}
-        error = str(event.get("error", "") or "")
+        error = self._sanitize_error_text(str(event.get("error", "") or ""), stage=stage)
+        content = self._sanitize_error_text(content, stage=stage)
         if isinstance(extra, dict):
             self._record_summary_stage(
                 stage=stage,
@@ -196,17 +415,20 @@ class _TurnTimeline:
             return
         if stage in self._SUMMARY_STAGE_KEYS and status in {"started", "running", "ok", "done"}:
             return
+        if stage in self._SUMMARY_STAGE_KEYS and status in {"retry", "failed", "error", "skipped", "not_triggered"}:
+            self._render_background_stage_update(stage, status, content or error or status)
+            return
         if stage == "Thinking":
             self._render_thinking(content)
             return
         if stage == "Turn complete":
             elapsed = time.perf_counter() - self._turn_started_at
             self._render_post_turn_summary()
-            self.console.print("  [done] Done")
-            self.console.print(f"  [time] {elapsed:.1f}s")
+            self._render_line(self._stage_icon(stage), "Done", "Turn complete", style="green")
+            self._render_line(_icon("⏱️", "t"), "Elapsed", f"{elapsed:.1f}s", style="bright_black")
             return
         style = self._stage_style(status)
-        self.console.print(f"  [{style}]{stage}[/{style}] {content}")
+        self._render_line(self._stage_icon(stage, status=status), stage, content, style=style)
 
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
@@ -254,9 +476,129 @@ def _restore_terminal() -> None:
         pass
 
 
+def _walk_click_commands(group, prefix: tuple[str, ...] = ()) -> list[_CommandEntry]:
+    entries: list[_CommandEntry] = []
+    commands = getattr(group, "commands", {}) or {}
+    for name, command in commands.items():
+        current = (*prefix, name)
+        full_name = " ".join(current)
+        description = (
+            getattr(command, "short_help", None)
+            or getattr(command, "help", None)
+            or "No description available."
+        )
+        category = current[0]
+        entries.append(
+            _CommandEntry(
+                name=full_name,
+                description=str(description).strip(),
+                category=category,
+                example=f"fagent {full_name}",
+            )
+        )
+        if getattr(command, "commands", None):
+            entries.extend(_walk_click_commands(command, current))
+    return entries
+
+
+def _build_prompt_catalog() -> tuple[_CommandEntry, ...]:
+    cli_root = typer_get_command(app)
+    cli_entries = _walk_click_commands(cli_root)
+    unique: dict[str, _CommandEntry] = {entry.name: entry for entry in CHAT_COMMANDS}
+    for entry in cli_entries:
+        unique.setdefault(entry.name, entry)
+    return tuple(unique.values())
+
+
+def _command_categories(entries: tuple[_CommandEntry, ...]) -> dict[str, list[_CommandEntry]]:
+    grouped: dict[str, list[_CommandEntry]] = {}
+    for entry in entries:
+        grouped.setdefault(entry.category, []).append(entry)
+    return grouped
+
+
+def _best_command_match(text: str, entries: tuple[_CommandEntry, ...]) -> _CommandEntry | None:
+    lowered = text.strip().lower()
+    if not lowered:
+        return None
+    pool = [entry for entry in entries if entry.name.startswith("/")] if lowered.startswith("/") else [
+        entry for entry in entries if not entry.name.startswith("/")
+    ]
+    for entry in pool:
+        for candidate in (entry.name, *entry.aliases):
+            if candidate.lower().startswith(lowered):
+                return entry
+    return None
+
+
+def _bottom_toolbar() -> HTML:
+    if _PROMPT_SESSION is None:
+        return HTML("<style fg='ansibrightblack'>Tab to complete</style>")
+    buffer = getattr(_PROMPT_SESSION, "default_buffer", None)
+    document = buffer.document if buffer is not None else Document("")
+    match = _best_command_match(document.text_before_cursor, _PROMPT_CATALOG)
+    if match is None:
+        return HTML(
+            "<style fg='ansibrightblack'>Tab to complete | /help for interactive commands | shell completion: --install-completion</style>"
+        )
+    return HTML(
+        f"<style fg='ansibrightblack'>Tab to complete</style> "
+        f"<b fg='ansicyan'>{match.name}</b> "
+        f"<style fg='ansibrightblack'>- {match.description}</style>"
+    )
+
+
+def _print_interactive_help(entries: tuple[_CommandEntry, ...]) -> None:
+    grouped = _command_categories(entries)
+    table = Table(box=box.SIMPLE_HEAVY, show_header=True, expand=True)
+    table.add_column("Command", style="cyan", no_wrap=True)
+    table.add_column("Description", style="white")
+    table.add_column("Example", style="bright_black")
+    for category in ("chat", "memory", "workflow", "channels", "provider", "agent", "gateway", "status", "onboard"):
+        for entry in grouped.get(category, []):
+            table.add_row(entry.name, entry.description, entry.example)
+    console.print(
+        Panel(
+            table,
+            title=f"{_icon('🧭', '?')} Interactive command guide",
+            border_style=ACCENT,
+            box=box.ROUNDED,
+            padding=(0, 1),
+        )
+    )
+    console.print(
+        Panel.fit(
+            "Use Tab for in-chat completion.\n"
+            "Shell completion is still available via `fagent --install-completion` and `fagent --show-completion`.",
+            title="Tips",
+            border_style="bright_black",
+            box=box.ROUNDED,
+        )
+    )
+
+
+def _print_interactive_status(*, session_id: str, workspace: Path, model: str) -> None:
+    table = Table(box=box.SIMPLE_HEAVY, show_header=False)
+    table.add_column("Field", style="cyan", no_wrap=True)
+    table.add_column("Value", style="white")
+    table.add_row("Session", session_id)
+    table.add_row("Workspace", str(workspace))
+    table.add_row("Model", model)
+    table.add_row("Completions", "Hybrid chat + CLI")
+    console.print(
+        Panel(
+            table,
+            title=f"{_icon('📍', '*')} Interactive status",
+            border_style="bright_blue",
+            box=box.ROUNDED,
+            padding=(0, 1),
+        )
+    )
+
+
 def _init_prompt_session() -> None:
     """Create the prompt_toolkit session with persistent file history."""
-    global _PROMPT_SESSION, _SAVED_TERM_ATTRS
+    global _PROMPT_SESSION, _PROMPT_CATALOG, _SAVED_TERM_ATTRS
 
     # Save terminal state so we can restore it on exit
     try:
@@ -269,11 +611,15 @@ def _init_prompt_session() -> None:
 
     history_file = get_cli_history_path()
     history_file.parent.mkdir(parents=True, exist_ok=True)
+    _PROMPT_CATALOG = _build_prompt_catalog()
 
     _PROMPT_SESSION = PromptSession(
         history=FileHistory(str(history_file)),
         enable_open_in_editor=False,
         multiline=False,   # Enter submits (single line mode)
+        completer=_HybridCommandCompleter(_PROMPT_CATALOG),
+        auto_suggest=_HybridAutoSuggest(_PROMPT_CATALOG),
+        bottom_toolbar=_bottom_toolbar,
     )
 
 
@@ -309,20 +655,35 @@ def _print_brand_banner(tagline: str = "Lightning-fast personal AI assistant") -
 
 
 def _print_info(message: str) -> None:
-    console.print(f"[cyan]•[/cyan] {message}")
+    console.print(f"[cyan]{_icon('•', '-')}[/cyan] {message}")
 
 
 def _print_success(message: str) -> None:
-    console.print(f"[green]✓[/green] {message}")
+    console.print(f"[green]{_icon('✅', '+')}[/green] {message}")
 
 
 def _print_warning(message: str) -> None:
-    console.print(f"[yellow]![/yellow] {message}")
+    console.print(f"[yellow]{_icon('⚠️', '!')}[/yellow] {message}")
 
 
 def _is_exit_command(command: str) -> bool:
     """Return True when input should end interactive chat."""
     return command.lower() in EXIT_COMMANDS
+
+
+def _handle_interactive_command(command: str, *, session_id: str, workspace: Path, model: str) -> bool:
+    normalized = command.strip().lower()
+    if normalized in {"/help", "/commands"}:
+        _print_interactive_help(_PROMPT_CATALOG)
+        return True
+    if normalized == "/clear":
+        console.clear()
+        _print_brand_banner("Interactive mode")
+        return True
+    if normalized == "/status":
+        _print_interactive_status(session_id=session_id, workspace=workspace, model=model)
+        return True
+    return False
 
 
 async def _read_interactive_input_async() -> str:
@@ -781,6 +1142,7 @@ def agent(
         from fagent.bus.events import InboundMessage
         _init_prompt_session()
         _print_brand_banner("Interactive mode")
+        _print_info("Type /help for commands. Use Tab for hybrid chat + CLI completion.")
         _print_info("Type exit or press Ctrl+C to quit.")
 
         if ":" in session_id:
@@ -854,6 +1216,13 @@ def agent(
                             _restore_terminal()
                             console.print("\nGoodbye!")
                             break
+                        if _handle_interactive_command(
+                            command,
+                            session_id=session_id,
+                            workspace=config.workspace_path,
+                            model=config.agents.defaults.model,
+                        ):
+                            continue
 
                         turn_done.clear()
                         turn_response.clear()

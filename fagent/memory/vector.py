@@ -15,7 +15,13 @@ import httpx
 from loguru import logger
 
 from fagent.memory.registry import MemoryRegistry
-from fagent.memory.types import EmbeddingCacheEntry, EpisodeRecord, MemoryArtifact, RetrievedMemory
+from fagent.memory.types import (
+    EmbeddingCacheEntry,
+    EpisodeRecord,
+    MemoryArtifact,
+    RetrievedMemory,
+    WorkflowStateArtifact,
+)
 from fagent.utils.helpers import ensure_dir
 
 
@@ -575,7 +581,30 @@ class VectorMemoryBackend:
             )]
         )
 
-    def ingest_artifact(self, artifact: MemoryArtifact) -> None:
+    def _coerce_artifact(self, artifact: MemoryArtifact | WorkflowStateArtifact) -> MemoryArtifact:
+        if isinstance(artifact, MemoryArtifact):
+            return artifact
+        return MemoryArtifact(
+            id=f"workflow:{artifact.snapshot_id}",
+            type="workflow_state",
+            content=artifact.current_state,
+            summary=f"{artifact.goal} -> {artifact.current_state}"[:240],
+            metadata={
+                "session_key": artifact.session_key,
+                "turn_id": artifact.turn_id,
+                "step_index": artifact.step_index,
+                "open_blockers": list(artifact.open_blockers),
+                "next_step": artifact.next_step,
+                "citations": list(artifact.citations),
+                "tools_used": list(artifact.tools_used),
+                "artifact_type": "workflow_state",
+                "snapshot_id": artifact.snapshot_id,
+            },
+            source_ref="workflow",
+        )
+
+    def ingest_artifact(self, artifact: MemoryArtifact | WorkflowStateArtifact) -> None:
+        artifact = self._coerce_artifact(artifact)
         self._embed_records(
             [(
                 artifact.id,
@@ -597,27 +626,28 @@ class VectorMemoryBackend:
             )]
         )
 
-    def ingest_artifacts(self, artifacts: list[MemoryArtifact]) -> int:
+    def ingest_artifacts(self, artifacts: list[MemoryArtifact | WorkflowStateArtifact]) -> int:
         records = [
             (
-                artifact.id,
-                self._artifact_text(artifact),
+                coerced.id,
+                self._artifact_text(coerced),
                 {
                     "workspace_id": "default",
-                    "session_key": artifact.metadata.get("session_key", ""),
-                    "chat_id": artifact.metadata.get("chat_id", ""),
-                    "channel": artifact.metadata.get("channel", ""),
-                    "artifact_type": artifact.type,
-                    "speaker_role": artifact.metadata.get("speaker_role", ""),
-                    "timestamp": artifact.created_at,
-                    "topic_tags": artifact.metadata.get("topic_tags", []),
-                    "source_path": artifact.source_ref,
-                    "turn_id": artifact.metadata.get("turn_id", ""),
+                    "session_key": coerced.metadata.get("session_key", ""),
+                    "chat_id": coerced.metadata.get("chat_id", ""),
+                    "channel": coerced.metadata.get("channel", ""),
+                    "artifact_type": coerced.type,
+                    "speaker_role": coerced.metadata.get("speaker_role", ""),
+                    "timestamp": coerced.created_at,
+                    "topic_tags": coerced.metadata.get("topic_tags", []),
+                    "source_path": coerced.source_ref,
+                    "turn_id": coerced.metadata.get("turn_id", ""),
                     "embedding_version": self.embedding_client.embedding_version if self.embedding_client else "disabled",
                 },
-                artifact.type,
+                coerced.type,
             )
-            for artifact in artifacts
+            for item in artifacts
+            for coerced in [self._coerce_artifact(item)]
         ]
         self._embed_records(records)
         return len(records)

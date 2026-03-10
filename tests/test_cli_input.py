@@ -2,6 +2,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import HTML
 
 from fagent.cli import commands
@@ -43,6 +44,7 @@ def test_init_prompt_session_creates_session():
     """Test that _init_prompt_session initializes the global session."""
     # Ensure global is None before test
     commands._PROMPT_SESSION = None
+    commands._PROMPT_CATALOG = ()
     
     with patch("fagent.cli.commands.PromptSession") as MockSession, \
          patch("fagent.cli.commands.FileHistory") as MockHistory, \
@@ -57,3 +59,60 @@ def test_init_prompt_session_creates_session():
         _, kwargs = MockSession.call_args
         assert kwargs["multiline"] is False
         assert kwargs["enable_open_in_editor"] is False
+        assert kwargs["completer"] is not None
+        assert kwargs["auto_suggest"] is not None
+        assert kwargs["bottom_toolbar"] is not None
+
+
+def test_hybrid_completer_suggests_slash_commands():
+    completer = commands._HybridCommandCompleter(commands.CHAT_COMMANDS)
+
+    items = list(completer.get_completions(Document("/he"), None))
+
+    assert any(item.text == "/help" for item in items)
+
+
+def test_hybrid_completer_suggests_nested_cli_commands():
+    entries = (
+        commands._CommandEntry(
+            name="memory rebuild-vectors",
+            description="Rebuild the vector index.",
+            category="memory",
+            example="fagent memory rebuild-vectors",
+        ),
+    )
+    completer = commands._HybridCommandCompleter(entries)
+
+    items = list(completer.get_completions(Document("memory reb"), None))
+
+    assert any(item.text == "memory rebuild-vectors" for item in items)
+
+
+def test_handle_interactive_command_help_prints_catalog(tmp_path):
+    with patch("fagent.cli.commands._print_interactive_help") as mock_help:
+        handled = commands._handle_interactive_command(
+            "/help",
+            session_id="cli:direct",
+            workspace=tmp_path,
+            model="test-model",
+        )
+
+    assert handled is True
+    mock_help.assert_called_once()
+
+
+def test_bottom_toolbar_shows_best_match():
+    commands._PROMPT_CATALOG = (
+        commands._CommandEntry(
+            name="/status",
+            description="Show the active interactive session state.",
+            category="chat",
+            example="/status",
+        ),
+    )
+    session = MagicMock()
+    session.default_buffer.document = Document("/st")
+    with patch("fagent.cli.commands._PROMPT_SESSION", session):
+        toolbar = commands._bottom_toolbar()
+
+    assert "status" in toolbar.value

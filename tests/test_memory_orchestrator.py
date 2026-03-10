@@ -8,6 +8,7 @@ from fagent.memory.orchestrator import MemoryOrchestrator
 from fagent.memory.router import MemoryRouter
 from fagent.memory.shadow import ShadowContextBuilder
 from fagent.memory.types import EpisodeRecord, RetrievedMemory
+from fagent.memory.types import WorkflowStateArtifact
 from fagent.providers.base import LLMResponse, ToolCallRequest
 from fagent.session.manager import Session
 
@@ -189,6 +190,82 @@ async def test_vector_failure_does_not_break_file_memory(
     assert (tmp_path / "memory" / "HISTORY.md").exists()
     assert orchestrator.registry.get_job_status("ep-4") == "retry"
     assert any("[file]" in item for item in orchestrator.query("fallback behavior"))
+
+
+@pytest.mark.asyncio
+async def test_run_post_turn_pipeline_normalizes_workflow_state_seed_artifacts(tmp_path: Path) -> None:
+    config = MemoryConfig()
+    config.vector.embedding_model = "text-embedding-3-small"
+    config.vector.embedding_api_base = "https://embeddings.example/v1"
+    config.vector.embedding_api_key = "test-key"
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"data": [{"embedding": [0.1, 0.2, 0.3]} for _ in range(4)]}
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, headers=None, json=None):
+            return _Response()
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr("fagent.memory.vector.httpx.Client", _Client)
+    session = Session(key="cli:direct")
+    session.metadata["last_prompt_tokens"] = 200
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, config=config, model="test-model")
+    episode = EpisodeRecord(
+        episode_id="ep-5",
+        session_key="cli:direct",
+        turn_id="turn-000005",
+        channel="cli",
+        chat_id="direct",
+        user_text="remember workflow context",
+        assistant_text="workflow state was captured",
+        timestamp="2026-03-09T16:00:00",
+    )
+    workflow_state = WorkflowStateArtifact(
+        snapshot_id="snap-1",
+        session_key="cli:direct",
+        turn_id="turn-000005",
+        step_index=1,
+        goal="remember workflow context",
+        current_state="Tool chain is waiting for follow-up",
+        open_blockers=["need confirmation"],
+        next_step="Continue from latest tool state",
+        citations=["turn-000005"],
+        tools_used=["memory_search"],
+    )
+    events: list[dict[str, object]] = []
+
+    async def _progress(content: str, **kwargs):
+        events.append({"content": content, **kwargs})
+
+    try:
+        result = await orchestrator.run_post_turn_pipeline(
+            session=session,
+            episode=episode,
+            on_progress=_progress,
+            seed_artifacts=[workflow_state],
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert result["vector"]["status"] == "ok"
+    assert not any("WorkflowStateArtifact" in str(event.get("content", "")) for event in events)
+    stored = orchestrator.registry.get_artifact("workflow:snap-1")
+    assert stored is not None
+    assert stored.type == "workflow_state"
 
 
 def test_export_graph_subgraph_requires_scope_or_query_for_snapshot(tmp_path: Path) -> None:
