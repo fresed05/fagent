@@ -235,7 +235,13 @@ function renderOverview(payload) {
     : `${(payload.nodes || []).length} nodes / ${(payload.edges || []).length} edges`;
   overviewStatus.textContent = payload.message || "Atlas loaded.";
   renderSearchResults(payload.search_results || []);
-  setTimeout(() => overviewNetwork.stopSimulation(), payload.mode === "global-raw" ? 1200 : 500);
+  requestAnimationFrame(() => overviewNetwork.redraw());
+  setTimeout(() => {
+    overviewNetwork.stopSimulation();
+    if ((payload.nodes || []).length) {
+      overviewNetwork.fit({ animation: { duration: 300, easingFunction: "easeInOutQuad" } });
+    }
+  }, payload.mode === "global-raw" ? 1200 : 500);
 }
 
 function renderFocus(payload) {
@@ -252,7 +258,13 @@ function renderFocus(payload) {
     : `${(payload.nodes || []).length} nodes / ${(payload.edges || []).length} edges`;
   focusStatus.textContent = payload.message || "Focused neighborhood loaded.";
   refreshFocusBtn.disabled = !payload.selected_id;
-  setTimeout(() => focusNetwork.stopSimulation(), 650);
+  requestAnimationFrame(() => focusNetwork.redraw());
+  setTimeout(() => {
+    focusNetwork.stopSimulation();
+    if ((payload.nodes || []).length) {
+      focusNetwork.fit({ animation: { duration: 280, easingFunction: "easeInOutQuad" } });
+    }
+  }, 650);
 }
 
 function renderDetails(payload) {
@@ -334,6 +346,11 @@ function fitOverview() {
 function fitFocus() {
   focusNetwork.fit({ animation: { duration: 420, easingFunction: "easeInOutQuad" } });
 }
+
+window.addEventListener("resize", () => {
+  overviewNetwork.redraw();
+  focusNetwork.redraw();
+});
 
 function resetNodeForm() {
   nodeForm.reset();

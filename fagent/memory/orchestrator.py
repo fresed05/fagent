@@ -1461,17 +1461,6 @@ class MemoryOrchestrator:
         node_limit: int = 200,
         edge_limit: int = 400,
     ) -> dict[str, object]:
-        if not query and not session_key:
-            return {
-                "nodes": [],
-                "edges": [],
-                "clusters": [],
-                "mode": mode,
-                "requested_mode": mode,
-                "hidden_node_count": 0,
-                "hidden_edge_count": 0,
-                "message": "Provide a session or query to load a graph snapshot.",
-            }
         node_ids = self.registry.recent_graph_node_ids_for_session(session_key, limit=node_limit) if session_key else None
         raw_nodes = self.registry.list_graph_nodes(query=query, node_ids=node_ids, limit=node_limit)
         nodes = []

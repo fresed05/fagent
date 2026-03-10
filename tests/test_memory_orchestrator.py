@@ -268,7 +268,7 @@ async def test_run_post_turn_pipeline_normalizes_workflow_state_seed_artifacts(t
     assert stored.type == "workflow_state"
 
 
-def test_export_graph_subgraph_requires_scope_or_query_for_snapshot(tmp_path: Path) -> None:
+def test_export_graph_subgraph_defaults_to_latest_snapshot(tmp_path: Path) -> None:
     orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
     orchestrator.registry.upsert_graph_node("entity:ssh", "SSH", {"kind": "entity"})
     orchestrator.registry.replace_graph_aliases(
@@ -283,9 +283,9 @@ def test_export_graph_subgraph_requires_scope_or_query_for_snapshot(tmp_path: Pa
 
     payload = orchestrator.export_graph_subgraph()
 
-    assert payload["nodes"] == []
-    assert payload["edges"] == []
-    assert payload["message"] == "Provide a session or query to load a graph snapshot."
+    assert any(item["id"] == "entity:ssh" for item in payload["nodes"])
+    assert any(item["relation"] == "described_by" for item in payload["edges"])
+    assert payload["message"] == "Loaded latest graph snapshot."
 
 
 def test_get_entity_and_query_resolve_russian_alias_to_english_canonical_node(tmp_path: Path) -> None:

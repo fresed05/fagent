@@ -6,6 +6,7 @@ import pytest
 
 from fagent.agent.loop import AgentLoop
 from fagent.bus.queue import MessageBus
+from fagent.memory.graph_ui import _STATIC_DIR
 from fagent.memory.graph_ui import get_graph_ui_manager
 from fagent.memory.orchestrator import MemoryOrchestrator
 from fagent.providers.base import LLMProvider, LLMResponse
@@ -72,7 +73,7 @@ def test_graph_ui_server_serves_static_and_api(tmp_path: Path) -> None:
         manager.stop()
 
 
-def test_graph_ui_api_requires_scope_for_default_snapshot(tmp_path: Path) -> None:
+def test_graph_ui_api_returns_default_overview_snapshot(tmp_path: Path) -> None:
     orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="stub")
     orchestrator.upsert_graph_node(node_id="entity:test", label="Test", metadata={"kind": "entity"})
     manager = get_graph_ui_manager(tmp_path)
@@ -80,10 +81,9 @@ def test_graph_ui_api_requires_scope_for_default_snapshot(tmp_path: Path) -> Non
 
     try:
         payload = _http_json("GET", f"{url}api/graph")
-        assert payload["nodes"] == []
-        assert payload["edges"] == []
+        assert any(item["id"] == "entity:test" for item in payload["nodes"])
         assert payload["view"] == "overview"
-        assert "session or query" in payload["message"].lower()
+        assert "loaded latest graph snapshot" in payload["message"].lower()
     finally:
         manager.stop()
 
@@ -169,6 +169,12 @@ def test_graph_ui_focus_and_details_support_cluster_nodes(tmp_path: Path) -> Non
     assert details["view"] == "details"
     assert details["kind"] == "cluster"
     assert "cluster_bridge_targets" in details["metadata"]
+
+
+def test_graph_ui_assets_do_not_contain_common_mojibake_sequences() -> None:
+    app_js = (_STATIC_DIR / "assets" / "app.js").read_text(encoding="utf-8")
+
+    assert "вЂў" not in app_js
 
 
 def test_graph_ui_raw_mode_falls_back_to_clustered_when_graph_is_too_large(tmp_path: Path) -> None:
