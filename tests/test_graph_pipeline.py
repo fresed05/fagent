@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from fagent.config.schema import Config
 from fagent.memory.orchestrator import MemoryOrchestrator
 from fagent.memory.types import EpisodeRecord
 from fagent.providers.base import LLMResponse, ToolCallRequest
@@ -92,6 +93,15 @@ class _ToolGraphProvider:
         return "stub"
 
 
+class _ProviderFactoryStub:
+    def __init__(self, mapping, fallback=None) -> None:
+        self.mapping = mapping
+        self.fallback = fallback
+
+    def build_from_profile(self, profile):
+        return self.mapping.get(profile.model, self.fallback)
+
+
 @pytest.mark.asyncio
 async def test_graph_pipeline_creates_job_and_edges_with_tool_agent(tmp_path: Path) -> None:
     orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=_ToolGraphProvider(), model="test-model")
@@ -118,3 +128,50 @@ async def test_graph_pipeline_creates_job_and_edges_with_tool_agent(tmp_path: Pa
     assert any("LanceDB" in item.snippet for item in results)
     assert orchestrator.registry.get_graph_node("entity:lancedb") is not None
     assert orchestrator.registry.get_graph_edge("entity:lancedb", "entity:shadow-context", "supports") is not None
+
+
+@pytest.mark.asyncio
+async def test_graph_pipeline_uses_graph_extract_role_provider(tmp_path: Path) -> None:
+    main_provider = _ToolGraphProvider()
+    graph_provider = _ToolGraphProvider()
+    app_config = Config.model_validate(
+        {
+            "providers": {
+                "main_provider": {"providerKind": "custom", "apiKey": "main-key", "apiBase": "http://main.example/v1"},
+                "graph_provider": {"providerKind": "custom", "apiKey": "graph-key", "apiBase": "http://graph.example/v1"},
+            },
+            "models": {
+                "profiles": {
+                    "graph_extract": {
+                        "provider": "graph_provider",
+                        "providerKind": "custom",
+                        "model": "graph-model",
+                    }
+                },
+                "roles": {"graph_extract": "graph_extract"},
+            },
+        }
+    )
+    orchestrator = MemoryOrchestrator(
+        workspace=tmp_path,
+        provider=main_provider,
+        model="main-model",
+        app_config=app_config,
+        provider_factory=_ProviderFactoryStub({"graph-model": graph_provider}, fallback=main_provider),
+    )
+    episode = EpisodeRecord(
+        episode_id="ep-graph-3",
+        session_key="cli:direct",
+        turn_id="turn-000012",
+        channel="cli",
+        chat_id="direct",
+        user_text="we decided to use graph specific provider",
+        assistant_text="graph memory should use the graph provider",
+        timestamp="2026-03-10T05:12:00",
+    )
+
+    await orchestrator.ingest_episode(episode)
+
+    assert orchestrator.graph_backend.provider is graph_provider
+    assert graph_provider.calls > 0
+    assert main_provider.calls == 0

@@ -376,16 +376,20 @@ class MemoryOrchestrator:
             return results
 
     def _build_graph_backend(self, workspace: Path):
+        graph_provider = self.provider
         graph_extract_model = None
         graph_normalize_model = None
         if self.app_config:
-            graph_extract_model = self.app_config.resolve_model_role("graph_extract", self.model).model
+            graph_extract_role = self.app_config.resolve_model_role("graph_extract", self.model)
+            graph_extract_model = graph_extract_role.model
             graph_normalize_model = self.app_config.resolve_model_role("graph_normalize", self.model).model
+            if self.provider_factory and graph_extract_role.provider_kind not in ("", "inherit"):
+                graph_provider = self.provider_factory.build_from_profile(graph_extract_role)
         if not self.config.graph.enabled:
             return LocalGraphBackend(
                 workspace,
                 self.registry,
-                provider=self.provider,
+                provider=graph_provider,
                 extract_model=graph_extract_model,
                 normalize_model=graph_normalize_model,
                 prompt_loader=self.prompts,
@@ -397,7 +401,7 @@ class MemoryOrchestrator:
                 uri=self.config.graph.uri,
                 username=self.config.graph.username,
                 password=self.config.graph.password,
-                provider=self.provider,
+                provider=graph_provider,
                 extract_model=graph_extract_model,
                 normalize_model=graph_normalize_model,
                 prompt_loader=self.prompts,
@@ -405,7 +409,7 @@ class MemoryOrchestrator:
         return LocalGraphBackend(
             workspace,
             self.registry,
-            provider=self.provider,
+            provider=graph_provider,
             extract_model=graph_extract_model,
             normalize_model=graph_normalize_model,
             prompt_loader=self.prompts,
