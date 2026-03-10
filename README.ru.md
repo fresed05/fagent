@@ -1,51 +1,132 @@
 # fagent
 
-[English README](./README.md)
+[English version](./README.md)
 
 <div align="center">
-  <h1>fagent: быстрый персональный AI-ассистент</h1>
+  <h1>fagent: memory-first рантайм агента с графовой памятью</h1>
 </div>
 
-`fagent` — это лёгкий фреймворк персонального AI-ассистента для CLI, чатов, автоматизации, памяти и tool-driven workflow.
+`fagent` — это graph-aware, memory-first AI runtime для долгой работы агента: многослойная память, shadow-context compression, mini-agents, workflow execution, provider/model-role routing и локальный Graph UI внутри одного прозрачного Python-стека.
 
-## Дополнительная документация
+## Оглавление
 
-- [Почему `fagent` выигрывает в практической работе](./WHY_FAGENT.md)
-- [Русская версия сравнения и преимуществ](./WHY_FAGENT.ru.md)
-- [Полная настройка конфига](./CONFIGURATION.md)
-- [Русская версия настройки конфига](./CONFIGURATION.ru.md)
+- [Зачем это нужно](#зачем-это-нужно)
+- [Чем `fagent` отличается](#чем-fagent-отличается)
+- [Архитектура в одном взгляде](#архитектура-в-одном-взгляде)
+- [Быстрый старт](#быстрый-старт)
+- [Ключевые CLI-команды](#ключевые-cli-команды)
+- [Провайдеры и роли моделей](#провайдеры-и-роли-моделей)
+- [Центр документации](#центр-документации)
+- [Основан на nanobot](#основан-на-nanobot)
+- [Разработка](#разработка)
 
-## Основа проекта
+## Зачем это нужно
 
-Проект основан на [nanobot](https://github.com/HKUDS/nanobot). Именно nanobot дал базовую лёгкую архитектуру агента, многоканальную модель рантайма и упаковку, на которой построен `fagent`.
+Многие агентные стеки неплохо отвечают в одном окне чата, но теряют связность, когда работа растягивается на несколько сессий, инструментов и прерываний.
 
-Что изменено в `fagent`:
+`fagent` строится вокруг другой цели:
 
-- завершён ребрендинг в package/runtime/docs
-- CLI переведён на визуал с молнией вместо котика
-- путь конфигурации и рабочей директории стандартизирован как `~/.fagent`
-- документация переписана под `fagent`, но с явной ссылкой на исходный nanobot
+- память должна быть многослойной, проверяемой и query-aware
+- основная модель должна получать короткий рабочий бриф, а не сырой шум памяти
+- связи между задачами, сущностями, блокерами и решениями должны переживать отдельные ходы
+- tool-heavy workflows не должны постоянно сжигать токены главной модели на мелком ремонте и первичной ориентации
 
-Если нужен апстрим-проект, смотрите [HKUDS/nanobot](https://github.com/HKUDS/nanobot).
+Поэтому `fagent` сочетает file memory, vector retrieval, graph memory, workflow state, task graph state, experience memory, shadow briefs и routing logic внутри самого рантайма.
 
-## Что умеет fagent
+## Чем `fagent` отличается
 
-- лёгкое и понятное ядро, удобное для аудита и доработки
-- каналы Telegram, Discord, WhatsApp, Feishu, DingTalk, Slack, QQ, Email, Mochat и Matrix
-- несколько провайдеров моделей через LiteLLM и отдельные интеграции Azure OpenAI / OpenAI Codex
-- MCP-серверы для подключения внешних инструментов
-- система памяти с file, vector, graph, shadow и orchestration слоями
-- cron и heartbeat для регулярных задач и фоновых напоминаний
-- автоматическая синхронизация шаблонов рабочего пространства
-- CLI-команды для чата, статуса, OAuth-логина, memory-инспекции и bridge-настройки
+### Многослойная память вместо простой истории чата
 
-## Архитектура
+`fagent` не считает память просто transcript-лентой. Он сочетает:
 
-Лёгкий рантайм агента с CLI, каналами, инструментами, памятью и фоновыми сервисами автоматизации вокруг пакета `fagent`.
+- file memory для прозрачных on-disk артефактов
+- vector memory для semantic recall
+- graph memory для сущностей и связей
+- workflow state для снимков активного выполнения
+- task graph state для целей, блокеров и решений
+- experience memory для повторяющихся recoveries
+- shadow context для сжатия перед вызовом основной модели
+- query-aware routing, чтобы retrieval менялся по типу запроса
 
-## Установка
+### Graph-aware recall вместо только vector recall
 
-### Клонирование с GitHub
+Vector search помогает с semantic similarity. Он слабее на вопросах вида:
+
+- что от чего зависит
+- какое решение породило этот blocker
+- какой workflow node связан с этим фактом
+- какое task state нужно держать вместе
+
+`fagent` относится к таким вопросам как к графовой задаче, а не только как к text-search задаче. Рантайм уже хранит структуру задач и отношений, поэтому агент сохраняет не только линейный checklist. Такая graph-shaped continuity и есть база для более богатого graph planning и будущих автоматических relevance links без заявлений о несуществующей полной автоматизации.
+
+### Shadow context направляет основную модель
+
+До того как основная модель начинает reasoning, `fagent` может собрать память из нескольких хранилищ и сжать её в shadow brief.
+
+За счёт этого главная модель тратит меньше токенов на:
+
+- поиск по памяти
+- восстановление task state из шумной истории
+- повторное открытие уже известных фактов
+- стартовые низкоценные шаги вида «сейчас разберусь, что происходит»
+
+Вместо этого она начинает с направляющего контекста: summary, relevant facts, open questions, contradictions, citations и confidence.
+
+### Мини-агенты и workflow-light repair уменьшают waste
+
+`fagent` поддерживает:
+
+- subagents для ограниченных фоновых задач
+- `run_workflow` для ordered tool chains
+- `workflowLight` как отдельную более лёгкую model role для repair и recovery
+
+Это позволяет главной модели держать фокус на дорогом reasoning, пока меньшие операционные починки происходят в ограниченном execution lane.
+
+### Локальный Graph UI делает память видимой
+
+`fagent` поставляется с локальным Graph UI server/editor. Можно открыть graph memory в браузере, посмотреть nodes и edges и понять, почему произошёл relationship-oriented recall.
+
+Это превращает graph memory из чёрного ящика в то, что можно инспектировать и тюнить.
+
+## Архитектура в одном взгляде
+
+```text
+Пользователь / CLI / чат-канал
+            |
+            v
+      Main Agent Loop
+            |
+            +--> Tool Registry
+            |      +--> shell / web / files / MCP / workflow / moa / spawn
+            |
+            +--> Memory Orchestrator
+            |      +--> file memory
+            |      +--> vector memory
+            |      +--> graph memory
+            |      +--> workflow state
+            |      +--> task graph
+            |      +--> experience patterns
+            |      +--> shadow brief builder
+            |      +--> query-aware router
+            |
+            +--> Subagent Manager
+            |
+            +--> Provider / Model Role Resolver
+                   +--> main / shadow / workflowLight / graphExtract / graphNormalize / embeddings / autoSummarize
+```
+
+Ключевые implementation modules:
+
+- `fagent/memory/orchestrator.py`
+- `fagent/memory/router.py`
+- `fagent/memory/shadow.py`
+- `fagent/memory/graph_ui.py`
+- `fagent/agent/subagent.py`
+- `fagent/agent/tools/workflow.py`
+
+## Быстрый старт
+
+### 1. Установка
 
 ```bash
 git clone https://github.com/fresed05/fagent.git
@@ -53,31 +134,22 @@ cd fagent
 pip install -e .
 ```
 
-### Установка из PyPI
+Или:
 
 ```bash
 pip install fagent-ai
-```
-
-### Установка через uv
-
-```bash
 uv tool install fagent-ai
 ```
 
-## Быстрый старт
-
-### 1. Сгенерировать конфиг и workspace
+### 2. Сгенерировать config и workspace
 
 ```bash
 fagent onboard
 ```
 
-Команда `fagent onboard` создаёт полный конфиг в `~/.fagent/config.json`. Это не урезанный шаблон: в файле сразу будут секции channels, providers, models, tools, gateway и memory со значениями по умолчанию.
+`fagent onboard` создаёт полный default config tree в `~/.fagent/config.json` и default workspace в `~/.fagent/workspace`.
 
-### 2. Добавить ключи
-
-Минимальный пример:
+### 3. Добавить провайдера и главную роль модели
 
 ```json
 {
@@ -85,81 +157,6 @@ fagent onboard
     "openrouter_main": {
       "providerKind": "openrouter",
       "apiKey": "sk-or-v1-xxx"
-    }
-  },
-  "agents": {
-    "defaults": {
-      "model": "anthropic/claude-opus-4-5",
-      "provider": "openrouter_main"
-    }
-  }
-}
-```
-
-### 3. Запустить диалог
-
-```bash
-fagent agent
-```
-
-Одноразовый запрос:
-
-```bash
-fagent agent -m "Summarize this repository"
-```
-
-Проверка состояния:
-
-```bash
-fagent status
-```
-
-## Каналы
-
-| Канал | Что обычно нужно |
-| --- | --- |
-| Telegram | токен бота от `@BotFather` |
-| Discord | bot token и message content intent |
-| WhatsApp | QR-логин через локальный bridge |
-| Feishu | App ID и App Secret |
-| DingTalk | App Key и App Secret |
-| Slack | bot token и app token |
-| QQ | App ID и App Secret |
-| Email | IMAP/SMTP учётные данные |
-| Mochat | Claw token |
-| Matrix | homeserver, user и token |
-
-Ссылки на сообщество и QR-коды: [COMMUNICATION.md](./COMMUNICATION.md).
-
-## Полезные CLI-команды
-
-- `fagent onboard`
-- `fagent agent`
-- `fagent gateway`
-- `fagent status`
-- `fagent channels login`
-- `fagent auth login --provider ...`
-- `fagent memory ...`
-
-## MOA tool
-
-В `fagent` появился встроенный `moa` tool для mixture-of-agents сценариев. Основная модель вызывает его явно, когда нужен более сильный ответ, чем от одной модели.
-
-`moa` отправляет один и тот же запрос нескольким named model profiles, затем передаёт их ответы отдельной judge model. Worker и judge модели могут жить на разных provider instances, включая несколько аккаунтов или gateway одного и того же provider family.
-
-Пример:
-
-```json
-{
-  "providers": {
-    "openrouter_main": {
-      "providerKind": "openrouter",
-      "apiKey": "sk-or-v1-xxx"
-    },
-    "custom_local": {
-      "providerKind": "custom",
-      "apiKey": "local-key",
-      "apiBase": "http://localhost:8000/v1"
     }
   },
   "models": {
@@ -167,43 +164,105 @@ fagent status
       "opus_main": {
         "provider": "openrouter_main",
         "model": "anthropic/claude-opus-4-5"
-      },
-      "gemini_fast": {
-        "provider": "openrouter_main",
-        "model": "google/gemini-2.5-pro"
-      },
-      "local_reasoner": {
-        "provider": "custom_local",
-        "model": "gpt-5.4"
       }
     },
     "roles": {
       "main": "opus_main"
     }
-  },
-  "tools": {
-    "moa": {
-      "defaultPreset": "default",
-      "presets": {
-        "default": {
-          "workerModels": ["opus_main", "gemini_fast", "local_reasoner"],
-          "judgeModel": "opus_main",
-          "parallelism": 3,
-          "returnCandidates": true
-        }
-      }
-    }
   }
 }
 ```
 
-## Почему `fagent` часто удобнее крупных агентных стеков
+### 4. Запустить агента
 
-Подробная версия вынесена в [WHY_FAGENT.md](./WHY_FAGENT.md).
+```bash
+fagent agent
+fagent agent -m "Summarize this repository"
+fagent status
+```
 
-- `fagent` проще разворачивать и поддерживать, чем более тяжёлые платформы вроде [OpenClaw](https://github.com/openclaw/openclaw), потому что здесь один понятный Python runtime, один конфиг и одна рабочая модель workspace.
-- Память здесь — это не только история сообщений. Используются file memory, vector retrieval, graph memory, workflow snapshots, task graph, experience patterns и shadow-context сжатие перед основным вызовом модели.
-- Встроенный workflow tool умеет выполнять последовательность шагов и подключать более лёгкую модель для локального ремонта шага, не тратя основной контекст на каждую мелкую ошибку.
+### 5. Посмотреть память и графовое состояние
+
+```bash
+fagent memory doctor
+fagent memory query-v2 "what blockers are connected to the current task"
+fagent memory inspect-task-graph cli:direct
+fagent memory inspect-experience
+fagent memory rebuild-graph
+```
+
+### 6. Открыть локальный Graph UI
+
+```bash
+fagent memory graph-ui --open
+fagent memory graph-ui --query "workflowLight"
+```
+
+## Ключевые CLI-команды
+
+- `fagent onboard`
+- `fagent agent`
+- `fagent gateway`
+- `fagent status`
+- `fagent auth login --provider ...`
+- `fagent channels login`
+- `fagent memory doctor`
+- `fagent memory query-v2`
+- `fagent memory inspect-task-graph`
+- `fagent memory inspect-experience`
+- `fagent memory rebuild-graph`
+- `fagent memory graph-ui`
+
+## Провайдеры и роли моделей
+
+Provider instances отвечают за то, куда идёт трафик. Model roles отвечают за то, какая модель выполняет конкретную работу.
+
+Ключевые встроенные роли:
+
+- `main`
+- `shadow`
+- `workflowLight`
+- `graphExtract`
+- `graphNormalize`
+- `embeddings`
+- `autoSummarize`
+
+Это позволяет делать такие схемы:
+
+- сильная reasoning model для `main`
+- более дешёвая repair model для `workflowLight`
+- отдельный embedding endpoint для `embeddings`
+- отдельный graph extraction profile для `graphExtract`
+- отдельная summarization model для `autoSummarize`
+
+Смотрите [docs/providers-and-model-roles.ru.md](./docs/providers-and-model-roles.ru.md) и [CONFIGURATION.ru.md](./CONFIGURATION.ru.md).
+
+## Центр документации
+
+Начните с этих deep-dive материалов:
+
+- [Docs index](./docs/README.ru.md)
+- [Архитектура памяти](./docs/memory-architecture.ru.md)
+- [Subagents и workflows](./docs/subagents-and-workflows.ru.md)
+- [Graph memory и Graph UI](./docs/graph-memory-and-gui.ru.md)
+- [Провайдеры и роли моделей](./docs/providers-and-model-roles.ru.md)
+- [CLI и observability](./docs/cli-and-observability.ru.md)
+- [Почему fagent](./WHY_FAGENT.ru.md)
+- [Конфигурация](./CONFIGURATION.ru.md)
+
+## Основан на nanobot
+
+Проект основан на [nanobot](https://github.com/HKUDS/nanobot), который дал лёгкую agent packaging model и multi-channel runtime foundation.
+
+`fagent` расширяет эту базу:
+
+- memory-first позиционированием
+- graph-aware memory и локальной graph inspection
+- subagents и workflow orchestration
+- разделением provider/model roles
+- bootstrap-потоком и runtime ergonomics вокруг `~/.fagent`
+
+Если нужен upstream base project, смотрите [HKUDS/nanobot](https://github.com/HKUDS/nanobot). Если нужен форкнутый runtime, описанный в этом наборе документации, оставайтесь здесь.
 
 ## Разработка
 
@@ -212,14 +271,16 @@ pip install -e ".[dev]"
 pytest
 python -m fagent --version
 fagent --version
+fagent onboard
+fagent memory doctor
 ```
 
-## Пути по умолчанию
+## Примечания
 
-- конфиг: `~/.fagent/config.json`
-- workspace: `~/.fagent/workspace`
-- bridge: `~/.fagent/bridge`
-- gateway port: `18790`
+- workspace по умолчанию: `~/.fagent/workspace`
+- config по умолчанию: `~/.fagent/config.json`
+- gateway port по умолчанию: `18790`
+- WhatsApp использует локальный Node.js bridge в `~/.fagent/bridge`
 
 ## Лицензия
 

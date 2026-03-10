@@ -1,7 +1,7 @@
 [project]
 name = "fagent-ai"
 version = "0.1.4.post4"
-description = "A lightweight personal AI assistant framework"
+description = "A graph-aware, memory-first AI agent runtime for long-running work"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
