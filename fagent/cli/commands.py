@@ -50,6 +50,13 @@ ACCENT = "bright_cyan"
 
 
 class _TurnTimeline:
+    _SUMMARY_STAGE_KEYS = {
+        "Saving file memory": "file_memory",
+        "Building graph": "graph",
+        "Writing vectors": "vector",
+        "Summarizing session": "summary",
+    }
+
     def __init__(self, console_: Console):
         self.console = console_
         self._last_tool_key: tuple[str, str] | None = None
@@ -93,6 +100,42 @@ class _TurnTimeline:
         text = str(value or "n/a").strip()
         return text or "n/a"
 
+    @staticmethod
+    def _format_summary_value(
+        stage: str,
+        status: str,
+        content: str,
+        error: str,
+        extra: dict[str, object],
+    ) -> str:
+        text = content.strip() or str(error or "").strip()
+        if text and text.lower() not in {status.lower(), stage.lower()}:
+            return text
+        if status == "started":
+            return "pending (background)"
+        if status == "running":
+            return text or "running"
+        if status in {"ok", "done"}:
+            return text or status
+        if status in {"skipped", "retry", "failed", "error", "not_triggered"}:
+            detail = text or str(extra.get("reason") or "").strip()
+            return f"{status}: {detail}" if detail else status
+        return text or status or "n/a"
+
+    def _record_summary_stage(
+        self,
+        *,
+        stage: str,
+        status: str,
+        content: str,
+        extra: dict[str, object],
+        error: str,
+    ) -> None:
+        key = self._SUMMARY_STAGE_KEYS.get(stage)
+        if not key:
+            return
+        self._summary[key] = self._format_summary_value(stage, status, content, error, extra)
+
     def _render_presearch(self, extra: dict[str, object]) -> None:
         stores = extra.get("used_stores") if isinstance(extra.get("used_stores"), list) else []
         count = int(extra.get("count", 0) or 0)
@@ -109,10 +152,13 @@ class _TurnTimeline:
         self.console.print(f"  [think] {text}")
 
     def _render_post_turn_summary(self) -> None:
+        graph_value = self._summary.get("graph", "pending (background)")
+        vector_value = self._summary.get("vector", "pending (background)")
+        summary_value = self._summary.get("summary", "pending (background)")
         self.console.print("  [index] Indexing complete")
-        self.console.print(f"  [graph] Graph: {self._clean_summary_value(self._summary.get('graph', 'n/a'))}")
-        self.console.print(f"  [vector] Vector: {self._clean_summary_value(self._summary.get('vector', 'n/a'))}")
-        self.console.print(f"  [summary] Summary: {self._clean_summary_value(self._summary.get('summary', 'n/a'))}")
+        self.console.print(f"  [graph] Graph: {self._clean_summary_value(graph_value)}")
+        self.console.print(f"  [vector] Vector: {self._clean_summary_value(vector_value)}")
+        self.console.print(f"  [summary] Summary: {self._clean_summary_value(summary_value)}")
 
     def handle_event(self, event: dict[str, object]) -> None:
         stage = str(event.get("stage", "") or "")
@@ -120,19 +166,15 @@ class _TurnTimeline:
         content = str(event.get("content", "") or "")
         event_type = str(event.get("event", "stage") or "stage")
         extra = event.get("extra") or {}
+        error = str(event.get("error", "") or "")
         if isinstance(extra, dict):
-            if stage == "Saving file memory":
-                self._summary["file_memory"] = content
-                return
-            elif stage == "Building graph":
-                self._summary["graph"] = content
-                return
-            elif stage == "Writing vectors":
-                self._summary["vector"] = content
-                return
-            elif stage == "Summarizing session":
-                self._summary["summary"] = content
-                return
+            self._record_summary_stage(
+                stage=stage,
+                status=status,
+                content=content,
+                extra=extra,
+                error=error,
+            )
         if event_type == "tool":
             tool_name = str(event.get("tool_name", "") or "")
             preview = str(event.get("arguments_preview", "") or tool_name or content)
@@ -151,6 +193,8 @@ class _TurnTimeline:
             return
         if stage == "Pre-search":
             self._render_presearch(extra if isinstance(extra, dict) else {})
+            return
+        if stage in self._SUMMARY_STAGE_KEYS and status in {"started", "running", "ok", "done"}:
             return
         if stage == "Thinking":
             self._render_thinking(content)
