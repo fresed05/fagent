@@ -88,6 +88,13 @@ class MemorySearchRequestV2:
     session_scope: str | None = None
     time_range: dict[str, str] | None = None
     allow_raw_escalation: bool = False
+    semantic_score: float = 0.0
+    rule_score: float = 0.0
+    route_confidence: float = 0.0
+    route_reason: str = ""
+    query_variants: list[str] = field(default_factory=list)
+    candidate_budget: dict[str, int] = field(default_factory=dict)
+    novelty_target: float = 0.2
 
 
 @dataclass(slots=True)
@@ -103,6 +110,10 @@ class ShadowBrief:
     retrieval_strategy: str = "direct"
     store_breakdown: dict[str, int] = field(default_factory=dict)
     raw_results: list[RetrievedMemory] = field(default_factory=list)
+    current_state: list[str] = field(default_factory=list)
+    relevant_facts: list[str] = field(default_factory=list)
+    open_items: list[str] = field(default_factory=list)
+    what_changed: list[str] = field(default_factory=list)
 
     def to_prompt_block(self) -> str:
         """Render as a fenced context block for the system prompt."""
@@ -111,15 +122,22 @@ class ShadowBrief:
             f"Confidence: {self.confidence:.2f}",
             f"Summary: {self.summary or '(empty)'}",
         ]
-        if self.facts:
-            lines.append("Facts:")
-            lines.extend(f"- {item}" for item in self.facts)
-        if self.open_questions:
-            lines.append("Open Questions:")
-            lines.extend(f"- {item}" for item in self.open_questions)
-        if self.contradictions:
-            lines.append("Contradictions:")
-            lines.extend(f"- {item}" for item in self.contradictions)
+        state_items = self.current_state or self.facts
+        if state_items:
+            lines.append("Current State:")
+            lines.extend(f"- {item}" for item in state_items)
+        fact_items = self.relevant_facts or self.facts
+        if fact_items:
+            lines.append("Relevant Facts:")
+            lines.extend(f"- {item}" for item in fact_items)
+        open_items = self.open_items or self.open_questions
+        if open_items:
+            lines.append("Open Items:")
+            lines.extend(f"- {item}" for item in open_items)
+        changed_items = self.what_changed or self.contradictions
+        if changed_items:
+            lines.append("What Changed:")
+            lines.extend(f"- {item}" for item in changed_items)
         if self.citations:
             lines.append("Citations:")
             lines.extend(f"- {item}" for item in self.citations)
@@ -127,6 +145,18 @@ class ShadowBrief:
             lines.append(f"Store Breakdown: {self.store_breakdown}")
         lines.append(f"Retrieval Strategy: {self.retrieval_strategy}")
         return "\n".join(lines)
+
+
+@dataclass(slots=True)
+class SessionShadowState:
+    """Turn-aware shadow state cached per session."""
+
+    last_query: str = ""
+    last_query_embedding: list[float] = field(default_factory=list)
+    last_citations: list[str] = field(default_factory=list)
+    last_anchor_ids: list[str] = field(default_factory=list)
+    last_brief_fingerprint: str = ""
+    recent_citation_windows: list[list[str]] = field(default_factory=list)
 
 
 @dataclass(slots=True)

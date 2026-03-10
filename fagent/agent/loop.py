@@ -504,6 +504,7 @@ class AgentLoop:
                 msg.content,
                 key,
                 {"channel": channel, "chat_id": chat_id},
+                presearch_bundle=presearch,
             )
             messages = self.context.build_messages(
                 history=history,
@@ -650,6 +651,7 @@ class AgentLoop:
             msg.content,
             key,
             {"channel": msg.channel, "chat_id": msg.chat_id},
+            presearch_bundle=presearch,
         )
         initial_messages = self.context.build_messages(
             history=history,

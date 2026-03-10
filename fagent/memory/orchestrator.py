@@ -96,17 +96,10 @@ class MemoryOrchestrator:
             model=(shadow_role.model if shadow_role else None),
             default_strategy=self.config.router.default_strategy,
             raw_evidence_escalation=self.config.router.raw_evidence_escalation,
+            embedder=self.vector_backend,
         )
         self.shadow = ShadowContextBuilder(
-            backends=[
-                ("file", self.file_store),
-                ("vector", self.vector_backend),
-                ("graph", self.graph_backend),
-            ],
-            provider=shadow_provider,
-            fast_model=(shadow_role.model if shadow_role and shadow_role.model else self.config.shadow_context.fast_model or model),
             max_tokens=self.config.shadow_context.max_tokens,
-            prompt_loader=self.prompts,
         )
         self._tasks: set[asyncio.Task] = set()
 
@@ -481,18 +474,26 @@ class MemoryOrchestrator:
         user_query: str,
         session_key: str,
         channel_context: dict[str, str],
+        *,
+        presearch_bundle: dict[str, object] | None = None,
     ) -> ShadowBrief | None:
         if not self.config.enabled or not self.config.shadow_context.enabled:
             return None
-        route = await self.router.route(
+        bundle = presearch_bundle or await self.search_v2(
+            user_query,
+            session_scope=session_key,
+        )
+        brief = await self.shadow.build(
             user_query,
             session_key,
-            active_task_state=self.get_task_state_summary(session_key),
-            recent_workflow_state=self.get_recent_workflow_state(session_key),
+            channel_context,
+            evidence_bundle=bundle,
+            working_set=self._session_working_set(session_key),
         )
-        brief = await self.shadow.build(user_query, session_key, channel_context)
         if brief is not None:
-            brief.retrieval_strategy = f"router:{route.intent}:{route.strategy}"
+            brief.retrieval_strategy = (
+                f"router:{bundle.get('intent', 'fresh_request')}:{bundle.get('retrieval_strategy', 'balanced')}"
+            )
         return brief
 
     def build_episode(
@@ -623,12 +624,16 @@ class MemoryOrchestrator:
         except Exception as exc:
             logger.warning("Graph retrieval failed for query '{}': {}", query, exc)
         if session_scope:
-            results = [item for item in results if item.metadata.get("session_key") in ("", session_scope)]
+            results = [
+                item for item in results
+                if item.metadata.get("session_key") in ("", None, session_scope)
+            ]
         if artifact_types:
             results = [
                 item for item in results
                 if item.metadata.get("artifact_type") in artifact_types
                 or item.metadata.get("kind") in artifact_types
+                or item.store == "file"
                 or (item.store == "file" and "daily_note" in artifact_types and item.metadata.get("path", "").endswith(".md"))
             ]
         if time_range and (start := time_range.get("start")):
@@ -641,6 +646,168 @@ class MemoryOrchestrator:
             results = filtered
         results.sort(key=lambda item: item.score, reverse=True)
         return results[:top_k]
+
+    def _session_working_set(self, session_key: str) -> dict[str, object]:
+        active_task_state = self.get_task_state_summary(session_key)
+        recent_workflow_state = self.get_recent_workflow_state(session_key)
+        current_decisions: list[str] = []
+        open_blockers: list[str] = []
+        active_entities: list[str] = []
+        for row in self.registry.list_task_nodes(session_key, limit=12):
+            node_type = str(row["node_type"])
+            title = str(row["title"])
+            status = str(row["status"])
+            summary = str(row["summary"])
+            if node_type == "decision":
+                current_decisions.append(f"{title} | {summary}"[:220])
+            if node_type == "blocker" or status in {"blocked", "open"}:
+                open_blockers.append(f"{title} | {summary}"[:220])
+            if node_type in {"goal", "entity"}:
+                active_entities.append(title[:120])
+        return {
+            "active_task_state": active_task_state,
+            "recent_workflow_state": recent_workflow_state,
+            "current_decisions": current_decisions[:3],
+            "open_blockers": open_blockers[:3],
+            "active_entities": active_entities[:6],
+        }
+
+    @staticmethod
+    def _parse_timestamp(value: str | None) -> float:
+        if not value:
+            return 0.0
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return 0.0
+
+    def _candidate_score(
+        self,
+        item: RetrievedMemory,
+        *,
+        route: MemorySearchRequestV2,
+        store_rank: dict[str, int],
+        seen_recent: set[str],
+    ) -> float:
+        store_pref = max(0.0, 1.0 - 0.08 * store_rank.get(item.store, 5))
+        semantic = item.score
+        ts = str(item.metadata.get("timestamp") or item.metadata.get("created_at") or "")
+        recency = 0.0
+        if ts:
+            age_seconds = max(0.0, time.time() - self._parse_timestamp(ts))
+            recency = max(0.0, 1.0 - min(1.0, age_seconds / (14 * 24 * 3600)))
+        temporal_bonus = 0.12 if route.intent == "temporal_recall" and ts else 0.0
+        novelty_bonus = route.novelty_target if item.artifact_id not in seen_recent else -0.08
+        contradiction_bonus = 0.14 if (
+            item.metadata.get("superseded")
+            or "contradict" in item.reason.lower()
+            or item.metadata.get("node_type") == "blocker"
+        ) else 0.0
+        return 0.58 * semantic + 0.16 * store_pref + 0.12 * recency + temporal_bonus + novelty_bonus + contradiction_bonus
+
+    def _rrf_merge(self, ranked_lists: list[list[RetrievedMemory]], k: int = 60) -> list[RetrievedMemory]:
+        merged: dict[str, RetrievedMemory] = {}
+        scores: dict[str, float] = {}
+        for ranked in ranked_lists:
+            for index, item in enumerate(ranked, start=1):
+                scores[item.artifact_id] = scores.get(item.artifact_id, 0.0) + 1.0 / (k + index)
+                existing = merged.get(item.artifact_id)
+                if existing is None or item.score > existing.score:
+                    merged[item.artifact_id] = item
+        fused = []
+        for artifact_id, item in merged.items():
+            fused.append(
+                RetrievedMemory(
+                    artifact_id=item.artifact_id,
+                    store=item.store,
+                    score=min(1.0, item.score + scores.get(artifact_id, 0.0)),
+                    snippet=item.snippet,
+                    reason=item.reason,
+                    metadata=item.metadata,
+                )
+            )
+        fused.sort(key=lambda item: item.score, reverse=True)
+        return fused
+
+    def _lexical_variant(self, query: str) -> str:
+        compact = re.sub(r"[^\w\s:/.-]+", " ", query.lower())
+        compact = re.sub(r"\s+", " ", compact).strip()
+        squashed = compact.replace(" ", "")
+        return squashed if 6 <= len(squashed) <= 32 else compact
+
+    def _semantic_variant(self, query: str, route: MemorySearchRequestV2) -> str:
+        if route.intent == "relationship_recall":
+            return f"relationship graph {query}".strip()
+        if route.intent == "workflow_recall":
+            return f"workflow blocker steps {query}".strip()
+        if route.intent == "continuity":
+            return f"current state continue {query}".strip()
+        return f"{route.intent.replace('_', ' ')} {query}".strip()
+
+    def _expand_query_variants(
+        self,
+        query: str,
+        route: MemorySearchRequestV2,
+        *,
+        first_pass_count: int = 0,
+    ) -> list[str]:
+        variants = [variant for variant in route.query_variants if variant and variant != query]
+        hard_query = (
+            len(query.split()) < 4
+            or route.route_confidence < 0.62
+            or first_pass_count < 3
+        )
+        if not hard_query:
+            return variants[:2]
+        lexical = self._lexical_variant(query)
+        semantic = self._semantic_variant(query, route)
+        for candidate in (lexical, semantic):
+            if candidate and candidate != query and candidate not in variants:
+                variants.append(candidate)
+            if len(variants) >= 2:
+                break
+        return variants[:2]
+
+    def _structured_results_for_query(
+        self,
+        query: str,
+        request: MemorySearchRequestV2,
+        *,
+        session_scope: str | None,
+    ) -> list[RetrievedMemory]:
+        limit = max(3, request.candidate_budget.get("final", self.config.search_v2.default_top_k))
+        results: list[RetrievedMemory] = []
+        if request.intent in {"continuity", "broad_synthesis"} and session_scope:
+            results.extend(self._latest_session_summary_result(session_scope))
+        if request.intent in {"continuity", "workflow_recall", "relationship_recall"} and session_scope:
+            results.extend(self._task_graph_results(session_scope, query, request.candidate_budget.get("task_graph", limit)))
+        if request.intent == "workflow_recall" and session_scope:
+            results.extend(self._workflow_snapshot_results(session_scope, request.candidate_budget.get("workflow", limit)))
+            results.extend(self._experience_results(session_scope, query, request.candidate_budget.get("experience", 4)))
+        elif request.intent in {"factual_recall", "preference_recall"}:
+            results.extend(self._experience_results(session_scope, query, request.candidate_budget.get("experience", 4)))
+        return results
+
+    def _search_store(
+        self,
+        query: str,
+        store: str,
+        *,
+        limit: int,
+        session_scope: str | None,
+        artifact_types: list[str],
+        time_range: dict[str, str] | None,
+    ) -> list[RetrievedMemory]:
+        if store in {"summary", "task_graph", "workflow", "experience"}:
+            return []
+        return self.search(
+            query,
+            stores=[store],
+            artifact_types=artifact_types,
+            top_k=limit,
+            session_scope=session_scope,
+            time_range=time_range,
+        )
 
     def _dedupe_results(self, items: list[RetrievedMemory], limit: int) -> list[RetrievedMemory]:
         merged: dict[str, RetrievedMemory] = {}
@@ -770,34 +937,80 @@ class MemoryOrchestrator:
         )
         selected_stores = stores or request.stores
         selected_types = artifact_types or request.artifact_types
-        limit = top_k or request.stores.__len__() or self.config.search_v2.default_top_k
-        results: list[RetrievedMemory] = []
+        limit = top_k or request.candidate_budget.get("final") or self.config.search_v2.default_top_k
+        store_rank = {store: index for index, store in enumerate(selected_stores)}
+        variant_queries = [query]
+        initial_structured = self._structured_results_for_query(query, request, session_scope=session_scope)
+        initial_store_lists: list[list[RetrievedMemory]] = []
+        if initial_structured:
+            initial_store_lists.append(initial_structured)
+        for store in selected_stores:
+            pool_limit = request.candidate_budget.get(store, max(limit, 4))
+            hits = self._search_store(
+                query,
+                store,
+                limit=pool_limit,
+                session_scope=session_scope,
+                artifact_types=selected_types,
+                time_range=time_range,
+            )
+            if hits:
+                initial_store_lists.append(hits)
+        first_pass = self._rrf_merge(initial_store_lists) if initial_store_lists else []
+        for variant in self._expand_query_variants(query, request, first_pass_count=len(first_pass)):
+            if variant not in variant_queries:
+                variant_queries.append(variant)
 
-        if request.intent in {"continuity", "broad_synthesis"} and session_scope:
-            results.extend(self._latest_session_summary_result(session_scope))
-        if request.intent in {"continuity", "workflow_recall", "relationship_recall"} and session_scope:
-            results.extend(self._task_graph_results(session_scope, query, limit))
-        if request.intent == "workflow_recall" and session_scope:
-            results.extend(self._workflow_snapshot_results(session_scope, limit))
-            results.extend(self._experience_results(session_scope, query, limit))
-        elif request.intent in {"factual_recall", "preference_recall"}:
-            results.extend(self._experience_results(session_scope, query, max(2, limit // 2)))
+        ranked_lists: list[list[RetrievedMemory]] = []
+        store_contributions: dict[str, int] = {}
+        for variant in variant_queries:
+            structured = self._structured_results_for_query(variant, request, session_scope=session_scope)
+            if structured:
+                ranked_lists.append(structured)
+                for item in structured:
+                    store_contributions[item.store] = store_contributions.get(item.store, 0) + 1
+            for store in selected_stores:
+                pool_limit = request.candidate_budget.get(store, max(limit, 4))
+                hits = self._search_store(
+                    variant,
+                    store,
+                    limit=pool_limit,
+                    session_scope=session_scope,
+                    artifact_types=selected_types,
+                    time_range=time_range,
+                )
+                if not hits:
+                    continue
+                ranked_lists.append(hits)
+                store_contributions[store] = store_contributions.get(store, 0) + len(hits)
 
-        results.extend(self.search(
-            query,
-            stores=selected_stores,
-            artifact_types=selected_types,
-            top_k=limit,
-            session_scope=session_scope,
-            time_range=time_range,
-        ))
+        results = self._rrf_merge(ranked_lists) if ranked_lists else []
         if selected_types:
             results = [
                 item for item in results
                 if item.metadata.get("artifact_type") in selected_types
                 or item.metadata.get("kind") in selected_types
+                or item.store == "file"
             ]
-        results = self._dedupe_results(results, limit)
+        shadow_state = self.shadow.session_history.get(session_scope or "") if session_scope else None
+        recent_citations = set(shadow_state.last_citations if shadow_state else [])
+        rescored = [
+            RetrievedMemory(
+                artifact_id=item.artifact_id,
+                store=item.store,
+                score=self._candidate_score(
+                    item,
+                    route=request,
+                    store_rank=store_rank,
+                    seen_recent=recent_citations,
+                ),
+                snippet=item.snippet,
+                reason=item.reason,
+                metadata=item.metadata,
+            )
+            for item in results
+        ]
+        results = self._dedupe_results(rescored, max(limit, request.candidate_budget.get("final", limit)))
         raw_escalated = False
         if (
             (allow_raw_escalation if allow_raw_escalation is not None else request.allow_raw_escalation)
@@ -811,7 +1024,23 @@ class MemoryOrchestrator:
                 limit=self.config.search_v2.max_raw_artifacts,
             )
             results.extend(raw_results)
-            results = self._dedupe_results(results, limit)
+            rescored = [
+                RetrievedMemory(
+                    artifact_id=item.artifact_id,
+                    store=item.store,
+                    score=self._candidate_score(
+                        item,
+                        route=request,
+                        store_rank=store_rank,
+                        seen_recent=recent_citations,
+                    ),
+                    snippet=item.snippet,
+                    reason=item.reason,
+                    metadata=item.metadata,
+                )
+                for item in results
+            ]
+            results = self._dedupe_results(rescored, limit)
         confidence = min(1.0, sum(item.score for item in results[:3]) / max(1, min(3, len(results)))) if results else 0.0
         return {
             "query": query,
@@ -823,6 +1052,14 @@ class MemoryOrchestrator:
             "count": len(results),
             "citations": [item.artifact_id for item in results[:limit]],
             "results": results[:limit],
+            "semantic_score": request.semantic_score,
+            "rule_score": request.rule_score,
+            "route_confidence": request.route_confidence,
+            "route_reason": request.route_reason,
+            "query_variants": variant_queries[1:],
+            "candidate_budget": request.candidate_budget,
+            "novelty_target": request.novelty_target,
+            "store_contributions": store_contributions,
         }
 
     def _fetch_raw_session_artifacts(self, session_key: str, query: str, limit: int = 4) -> list[RetrievedMemory]:
@@ -1439,7 +1676,14 @@ class MemoryOrchestrator:
 class NullMemoryOrchestrator:
     """Fallback used when memory initialization is unavailable in tests or degraded setups."""
 
-    async def prepare_shadow_context(self, user_query: str, session_key: str, channel_context: dict[str, str]) -> ShadowBrief | None:
+    async def prepare_shadow_context(
+        self,
+        user_query: str,
+        session_key: str,
+        channel_context: dict[str, str],
+        *,
+        presearch_bundle: dict[str, object] | None = None,
+    ) -> ShadowBrief | None:
         return None
 
     def build_episode(self, session_key: str, turn_id: str, channel: str, chat_id: str, saved_entries: list[dict]) -> EpisodeRecord | None:
@@ -1508,6 +1752,14 @@ class NullMemoryOrchestrator:
             "count": 0,
             "citations": [],
             "results": [],
+            "semantic_score": 0.0,
+            "rule_score": 0.0,
+            "route_confidence": 0.0,
+            "route_reason": "memory unavailable",
+            "query_variants": [],
+            "candidate_budget": {},
+            "novelty_target": 0.0,
+            "store_contributions": {},
         }
 
     def get_artifact(self, artifact_id: str) -> MemoryArtifact | None:
