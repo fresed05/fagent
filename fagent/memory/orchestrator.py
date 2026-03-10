@@ -451,6 +451,7 @@ class MemoryOrchestrator:
                 extract_model=graph_extract_model,
                 normalize_model=graph_normalize_model,
                 prompt_loader=self.prompts,
+                semantic_embedder=self.vector_backend,
             )
         if self.config.graph.backend == "graphiti-neo4j" and self.config.graph.uri:
             return Neo4jGraphBackend(
@@ -463,6 +464,7 @@ class MemoryOrchestrator:
                 extract_model=graph_extract_model,
                 normalize_model=graph_normalize_model,
                 prompt_loader=self.prompts,
+                semantic_embedder=self.vector_backend,
             )
         return LocalGraphBackend(
             workspace,
@@ -471,6 +473,7 @@ class MemoryOrchestrator:
             extract_model=graph_extract_model,
             normalize_model=graph_normalize_model,
             prompt_loader=self.prompts,
+            semantic_embedder=self.vector_backend,
         )
 
     async def prepare_shadow_context(

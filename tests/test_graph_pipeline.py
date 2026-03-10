@@ -178,6 +178,27 @@ async def test_graph_pipeline_uses_graph_extract_role_provider(tmp_path: Path) -
     assert main_provider.calls == 0
 
 
+class _StubEmbeddingClient:
+    embedding_version = "stub-embed"
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for text in texts:
+            normalized = text.lower().replace(" ", "")
+            if "cliproxyapi" in normalized or "cliapiproxi" in normalized:
+                vectors.append([1.0, 0.0, 0.0])
+            elif "shadowcontext" in normalized:
+                vectors.append([0.0, 1.0, 0.0])
+            else:
+                vectors.append([0.0, 0.0, 1.0])
+        return vectors
+
+
+class _SemanticEmbedder:
+    def __init__(self) -> None:
+        self.embedding_client = _StubEmbeddingClient()
+
+
 def test_graph_tool_normalizes_russian_entity_and_relation_to_english(tmp_path: Path) -> None:
     orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
     backend = LocalGraphBackend(tmp_path, orchestrator.registry)
@@ -230,3 +251,55 @@ def test_graph_tool_skips_low_confidence_non_english_entity(tmp_path: Path) -> N
     assert result["ok"] is False
     assert result["error"] == "english_canonicalization_required"
     assert stage["entities"] == {}
+
+
+def test_find_existing_entity_reuses_case_and_typo_variants(tmp_path: Path) -> None:
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
+    backend = LocalGraphBackend(tmp_path, orchestrator.registry, semantic_embedder=_SemanticEmbedder())
+    orchestrator.registry.upsert_graph_node(
+        "entity:cliproxyapi",
+        "cliproxyapi",
+        {
+            "kind": "service",
+            "canonical_name": "cliproxyapi",
+            "aliases": ["cliproxyapi"],
+        },
+    )
+    orchestrator.registry.replace_graph_aliases(
+        "entity:cliproxyapi",
+        [
+            {"alias_text": "cliproxyapi", "alias_language": "en", "is_canonical": True},
+        ],
+    )
+
+    assert backend._find_existing_entity_id("CLIProxyAPI") == "entity:cliproxyapi"
+    assert backend._find_existing_entity_id("cliapi proxi") == "entity:cliproxyapi"
+
+
+def test_search_graph_returns_hybrid_matches_with_scores(tmp_path: Path) -> None:
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
+    backend = LocalGraphBackend(tmp_path, orchestrator.registry, semantic_embedder=_SemanticEmbedder())
+    orchestrator.registry.upsert_graph_node(
+        "entity:cliproxyapi",
+        "cliproxyapi",
+        {
+            "kind": "service",
+            "canonical_name": "cliproxyapi",
+            "aliases": ["CLIProxyAPI", "cliapi proxi"],
+        },
+    )
+    orchestrator.registry.replace_graph_aliases(
+        "entity:cliproxyapi",
+        [
+            {"alias_text": "cliproxyapi", "alias_language": "en", "is_canonical": True},
+            {"alias_text": "CLIProxyAPI", "alias_language": "en", "is_canonical": False},
+            {"alias_text": "cliapi proxi", "alias_language": "en", "is_canonical": False},
+        ],
+    )
+
+    stage = {"summary": "", "reason": "", "entities": {}, "facts": {}, "relations": []}
+    result, _ = backend._run_graph_tool("search_graph", {"query": "cliapi proxi", "limit": 20}, stage)
+
+    assert result["matches"]
+    assert result["matches"][0]["id"] == "entity:cliproxyapi"
+    assert result["matches"][0]["search_score"] > 0.8
