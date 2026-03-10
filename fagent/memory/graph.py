@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
@@ -151,7 +151,11 @@ class LocalGraphBackend:
     def delete_edge(self, source_id: str, target_id: str, relation: str) -> str | None:
         return None
 
-    async def ingest_episode_async(self, episode: EpisodeRecord) -> None:
+    async def ingest_episode_async(
+        self,
+        episode: EpisodeRecord,
+        status_callback: Callable[..., Awaitable[None]] | None = None,
+    ) -> None:
         summary = self.policy.build_summary(episode)
         extractor_prompt = self.prompt_loader.load("system/memory-extractor.md")
         previous_job = self.registry.get_graph_job(episode.episode_id)
@@ -174,17 +178,28 @@ class LocalGraphBackend:
             return
 
         try:
-            extraction = await self._extract_with_llm(episode, summary, extractor_prompt.text)
+            extraction = await self._extract_with_llm(
+                episode,
+                summary,
+                extractor_prompt.text,
+                status_callback=status_callback,
+            )
             if extraction is not None:
+                if status_callback is not None:
+                    await status_callback("persisting", "persisting graph")
                 self._persist_graph(episode, summary, extraction)
             job.status = "done"
             job.error = ""
             self.registry.upsert_graph_job(job)
+            if status_callback is not None:
+                await status_callback("done", "done")
         except Exception as exc:
             logger.warning("Graph extraction failed for {}: {}", episode.episode_id, exc)
             job.status = "retry"
             job.error = str(exc)[:500]
             self.registry.upsert_graph_job(job)
+            if status_callback is not None:
+                await status_callback("retry", f"retry: {job.error}", error=job.error)
 
     def ingest_episode(self, episode: EpisodeRecord) -> None:
         """Sync compatibility wrapper."""
@@ -206,6 +221,7 @@ class LocalGraphBackend:
         episode: EpisodeRecord,
         summary: str,
         extractor_prompt: str,
+        status_callback: Callable[..., Awaitable[None]] | None = None,
     ) -> dict[str, Any] | None:
         assert self.provider is not None
         assert self.extract_model
@@ -267,6 +283,10 @@ class LocalGraphBackend:
 
             finished = False
             for call in response.tool_calls:
+                if status_callback is not None and call.name == "search_graph":
+                    await status_callback("searching", "searching existing graph")
+                if status_callback is not None and call.name in {"create_entity", "create_fact", "create_relation"}:
+                    await status_callback("staging", "staging entities/facts/relations")
                 result, finished = self._run_graph_tool(call.name, call.arguments, stage)
                 messages.append(
                     {

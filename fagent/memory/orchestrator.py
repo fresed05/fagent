@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import asyncio
 import hashlib
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
-import json
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from loguru import logger
 
@@ -106,6 +107,273 @@ class MemoryOrchestrator:
             prompt_loader=self.prompts,
         )
         self._tasks: set[asyncio.Task] = set()
+
+    async def _emit_stage(
+        self,
+        on_progress: Callable[..., Awaitable[None]] | None,
+        *,
+        stage: str,
+        status: str,
+        session_key: str,
+        turn_id: str,
+        detail: str = "",
+        duration_ms: int | None = None,
+        extra: dict[str, object] | None = None,
+    ) -> None:
+        logger.bind(
+            session_key=session_key,
+            turn_id=turn_id,
+            stage=stage,
+            status=status,
+            duration_ms=duration_ms,
+            detail=detail[:240],
+        ).info("turn_stage")
+        if on_progress is None:
+            return
+        await on_progress(
+            detail or stage,
+            stage=stage,
+            status=status,
+            event="stage",
+            session_key=session_key,
+            turn_id=turn_id,
+            duration_ms=duration_ms,
+            extra=extra or {},
+        )
+
+    def _ensure_session_artifact(self, episode: EpisodeRecord) -> MemoryArtifact:
+        summary = self.policy.build_summary(episode)
+        artifact = MemoryArtifact(
+            id=episode.episode_id,
+            type="session_turn",
+            content=episode.content,
+            summary=summary,
+            metadata={
+                "session_key": episode.session_key,
+                "turn_id": episode.turn_id,
+                "chat_id": episode.chat_id,
+                "channel": episode.channel,
+                "topic_tags": episode.metadata.get("topic_tags", []),
+            },
+            source_ref=episode.metadata.get("source_path", ""),
+            created_at=episode.timestamp,
+        )
+        self.registry.upsert_artifact(artifact)
+        return artifact
+
+    def _ingest_file_memory(self, episode: EpisodeRecord, summary: str) -> list[MemoryArtifact]:
+        file_artifacts: list[MemoryArtifact] = []
+        if not self.registry.get_artifact(f"{episode.episode_id}:history"):
+            file_artifacts = self.file_store.ingest_episode(episode, summary=summary)
+            for artifact in file_artifacts:
+                self.registry.upsert_artifact(artifact)
+            return file_artifacts
+        for suffix in ("history", "daily", "memory"):
+            artifact = self.registry.get_artifact(f"{episode.episode_id}:{suffix}")
+            if artifact is not None:
+                file_artifacts.append(artifact)
+        return file_artifacts
+
+    async def _run_graph_stage(
+        self,
+        episode: EpisodeRecord,
+        *,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
+    ) -> str:
+        stage = "Building graph"
+        started_at = time.perf_counter()
+        await self._emit_stage(
+            on_progress,
+            stage=stage,
+            status="started",
+            session_key=episode.session_key,
+            turn_id=episode.turn_id,
+            detail="Launching graph mini-agent",
+        )
+
+        async def _graph_status(kind: str, detail: str, **extra: object) -> None:
+            await self._emit_stage(
+                on_progress,
+                stage=stage,
+                status="running",
+                session_key=episode.session_key,
+                turn_id=episode.turn_id,
+                detail=detail,
+                extra={"graph_phase": kind, **extra},
+            )
+
+        await self.graph_backend.ingest_episode_async(episode, status_callback=_graph_status)
+        job = self.registry.get_graph_job(episode.episode_id)
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+        if job is None:
+            await self._emit_stage(
+                on_progress,
+                stage=stage,
+                status="failed",
+                session_key=episode.session_key,
+                turn_id=episode.turn_id,
+                detail="Graph job missing after ingest",
+                duration_ms=duration_ms,
+            )
+            return "failed"
+        detail = job.status if not job.error else f"{job.status}: {job.error}"
+        await self._emit_stage(
+            on_progress,
+            stage=stage,
+            status=job.status,
+            session_key=episode.session_key,
+            turn_id=episode.turn_id,
+            detail=detail,
+            duration_ms=duration_ms,
+            extra={"attempts": job.attempts, "error": job.error},
+        )
+        return job.status
+
+    async def run_post_turn_pipeline(
+        self,
+        *,
+        session: "Session",
+        episode: EpisodeRecord | None,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
+    ) -> dict[str, object]:
+        if not self.config.enabled or episode is None:
+            return {
+                "file_memory": {"status": "skipped", "artifacts": 0},
+                "graph": {"status": "skipped"},
+                "vector": {"status": "skipped", "artifacts": 0},
+                "summary": {"status": "skipped", "artifact_id": None},
+            }
+
+        if self.registry.get_job_status(episode.episode_id) == "done":
+            return {
+                "file_memory": {"status": "ok", "artifacts": 0},
+                "graph": {"status": "done"},
+                "vector": {"status": "ok", "artifacts": 0},
+                "summary": {"status": "not_triggered", "artifact_id": None},
+            }
+
+        results: dict[str, object] = {
+            "file_memory": {"status": "skipped", "artifacts": 0},
+            "graph": {"status": "skipped"},
+            "vector": {"status": "skipped", "artifacts": 0},
+            "summary": {"status": "not_triggered", "artifact_id": None},
+        }
+        self.registry.set_job_status(episode.episode_id, "running")
+        summary = self.policy.build_summary(episode)
+        try:
+            self._ensure_session_artifact(episode)
+
+            started_at = time.perf_counter()
+            await self._emit_stage(
+                on_progress,
+                stage="Saving file memory",
+                status="started",
+                session_key=episode.session_key,
+                turn_id=episode.turn_id,
+                detail="Writing file artifacts",
+            )
+            file_artifacts = self._ingest_file_memory(episode, summary=summary)
+            results["file_memory"] = {"status": "ok", "artifacts": len(file_artifacts)}
+            await self._emit_stage(
+                on_progress,
+                stage="Saving file memory",
+                status="ok",
+                session_key=episode.session_key,
+                turn_id=episode.turn_id,
+                detail=f"Wrote {len(file_artifacts)} artifacts",
+                duration_ms=int((time.perf_counter() - started_at) * 1000),
+                extra={"artifacts": len(file_artifacts)},
+            )
+
+            results["graph"] = {"status": await self._run_graph_stage(episode, on_progress=on_progress)}
+
+            started_at = time.perf_counter()
+            await self._emit_stage(
+                on_progress,
+                stage="Writing vectors",
+                status="started",
+                session_key=episode.session_key,
+                turn_id=episode.turn_id,
+                detail="Embedding session and file artifacts",
+            )
+            vector_artifacts = len(file_artifacts) + 1
+            if self.vector_backend.embedding_client is None:
+                results["vector"] = {"status": "skipped", "artifacts": 0, "reason": "vector_unavailable"}
+                await self._emit_stage(
+                    on_progress,
+                    stage="Writing vectors",
+                    status="skipped",
+                    session_key=episode.session_key,
+                    turn_id=episode.turn_id,
+                    detail="skipped: vector_unavailable",
+                    duration_ms=int((time.perf_counter() - started_at) * 1000),
+                )
+            else:
+                try:
+                    self.vector_backend.ingest_artifacts(file_artifacts)
+                    self.vector_backend.ingest_episode(episode)
+                except Exception as exc:
+                    results["vector"] = {"status": "retry", "artifacts": 0, "error": str(exc)}
+                    await self._emit_stage(
+                        on_progress,
+                        stage="Writing vectors",
+                        status="retry",
+                        session_key=episode.session_key,
+                        turn_id=episode.turn_id,
+                        detail=f"retry: {str(exc)[:180]}",
+                        duration_ms=int((time.perf_counter() - started_at) * 1000),
+                        extra={"error": str(exc)[:180]},
+                    )
+                    raise
+                results["vector"] = {"status": "ok", "artifacts": vector_artifacts}
+                await self._emit_stage(
+                    on_progress,
+                    stage="Writing vectors",
+                    status="ok",
+                    session_key=episode.session_key,
+                    turn_id=episode.turn_id,
+                    detail=f"Wrote {vector_artifacts} vector payloads",
+                    duration_ms=int((time.perf_counter() - started_at) * 1000),
+                    extra={"artifacts": vector_artifacts},
+                )
+
+            try:
+                results["summary"] = await self.run_auto_summary_stage(session, on_progress=on_progress, turn_id=episode.turn_id)
+            except Exception as exc:
+                results["summary"] = {"status": "failed", "artifact_id": None, "error": str(exc)}
+                await self._emit_stage(
+                    on_progress,
+                    stage="Summarizing session",
+                    status="failed",
+                    session_key=episode.session_key,
+                    turn_id=episode.turn_id,
+                    detail=str(exc)[:180],
+                )
+                raise
+            self.registry.set_job_status(episode.episode_id, "done")
+            return results
+        except Exception as exc:
+            self.record_experience_event(
+                category="environment_constraint",
+                session_key=episode.session_key,
+                trigger_text=f"ingest failed: {exc}",
+                recovery_text="retry ingest later",
+                metadata={"episode_id": episode.episode_id},
+            )
+            self.registry.set_job_status(episode.episode_id, "retry", error=str(exc))
+            logger.exception("Memory ingest failed for {}", episode.episode_id)
+            if isinstance(results.get("vector"), dict) and results["vector"].get("status") == "skipped":
+                pass
+            else:
+                await self._emit_stage(
+                    on_progress,
+                    stage="Turn memory",
+                    status="failed",
+                    session_key=episode.session_key,
+                    turn_id=episode.turn_id,
+                    detail=str(exc)[:240],
+                )
+            return results
 
     def _build_graph_backend(self, workspace: Path):
         graph_extract_model = None
@@ -228,52 +496,13 @@ class MemoryOrchestrator:
         self._tasks.add(task)
 
     async def ingest_episode(self, episode: EpisodeRecord) -> None:
-        if self.registry.get_job_status(episode.episode_id) == "done":
-            return
-        self.registry.set_job_status(episode.episode_id, "running")
-        try:
-            summary = self.policy.build_summary(episode)
-            episode_artifact = MemoryArtifact(
-                id=episode.episode_id,
-                type="session_turn",
-                content=episode.content,
-                summary=summary,
-                metadata={
-                    "session_key": episode.session_key,
-                    "turn_id": episode.turn_id,
-                    "chat_id": episode.chat_id,
-                    "channel": episode.channel,
-                    "topic_tags": episode.metadata.get("topic_tags", []),
-                },
-                source_ref=episode.metadata.get("source_path", ""),
-                created_at=episode.timestamp,
-            )
-            self.registry.upsert_artifact(episode_artifact)
-            file_artifacts: list[MemoryArtifact] = []
-            if not self.registry.get_artifact(f"{episode.episode_id}:history"):
-                file_artifacts = self.file_store.ingest_episode(episode, summary=summary)
-                for artifact in file_artifacts:
-                    self.registry.upsert_artifact(artifact)
-            else:
-                for suffix in ("history", "daily", "memory"):
-                    artifact = self.registry.get_artifact(f"{episode.episode_id}:{suffix}")
-                    if artifact is not None:
-                        file_artifacts.append(artifact)
+        class _SyntheticSession:
+            def __init__(self, key: str) -> None:
+                self.key = key
+                self.messages: list[dict[str, object]] = []
+                self.metadata: dict[str, object] = {}
 
-            self.vector_backend.ingest_artifacts(file_artifacts)
-            self.vector_backend.ingest_episode(episode)
-            await self.graph_backend.ingest_episode_async(episode)
-            self.registry.set_job_status(episode.episode_id, "done")
-        except Exception as exc:
-            self.record_experience_event(
-                category="environment_constraint",
-                session_key=episode.session_key,
-                trigger_text=f"ingest failed: {exc}",
-                recovery_text="retry ingest later",
-                metadata={"episode_id": episode.episode_id},
-            )
-            self.registry.set_job_status(episode.episode_id, "retry", error=str(exc))
-            logger.exception("Memory ingest failed for {}", episode.episode_id)
+        await self.run_post_turn_pipeline(session=_SyntheticSession(episode.session_key), episode=episode)
 
     async def consolidate_session(self, session: "Session") -> bool:
         """Best-effort compatibility hook for old consolidation paths."""
@@ -950,19 +1179,67 @@ class MemoryOrchestrator:
         self.vector_backend.ingest_artifact(artifact)
         return artifact
 
-    async def maybe_auto_summarize_session(self, session: "Session") -> MemoryArtifact | None:
+    async def run_auto_summary_stage(
+        self,
+        session: "Session",
+        *,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
+        turn_id: str = "",
+    ) -> dict[str, object]:
+        stage = "Summarizing session"
         if not self.config.auto_summarize.enabled:
-            return None
+            await self._emit_stage(
+                on_progress,
+                stage=stage,
+                status="skipped",
+                session_key=session.key,
+                turn_id=turn_id,
+                detail="skipped: disabled",
+            )
+            return {"status": "skipped", "artifact_id": None}
         current_tokens = int(session.metadata.get("estimated_context_tokens", 0))
         threshold = int(self.config.auto_summarize.max_context_tokens * self.config.auto_summarize.trigger_ratio)
         last_cutoff = int(session.metadata.get("summary_cutoff_idx", 0))
         if current_tokens < threshold:
-            return None
+            await self._emit_stage(
+                on_progress,
+                stage=stage,
+                status="not_triggered",
+                session_key=session.key,
+                turn_id=turn_id,
+                detail=f"not_triggered: {current_tokens}/{threshold} tokens",
+            )
+            return {"status": "not_triggered", "artifact_id": None}
         if len(session.messages) - last_cutoff < self.config.auto_summarize.min_new_messages:
-            return None
+            await self._emit_stage(
+                on_progress,
+                stage=stage,
+                status="not_triggered",
+                session_key=session.key,
+                turn_id=turn_id,
+                detail="not_triggered: not enough new messages",
+            )
+            return {"status": "not_triggered", "artifact_id": None}
         slice_messages = session.messages[last_cutoff:-max(1, min(6, len(session.messages)))] or session.messages[last_cutoff:]
         if not slice_messages:
-            return None
+            await self._emit_stage(
+                on_progress,
+                stage=stage,
+                status="not_triggered",
+                session_key=session.key,
+                turn_id=turn_id,
+                detail="not_triggered: empty slice",
+            )
+            return {"status": "not_triggered", "artifact_id": None}
+        started_at = time.perf_counter()
+        await self._emit_stage(
+            on_progress,
+            stage=stage,
+            status="started",
+            session_key=session.key,
+            turn_id=turn_id,
+            detail="Building session rollup",
+        )
         summary_text = await self._build_session_summary_text(session.key, slice_messages)
         covered_turns = [msg.get("turn_id", "") for msg in slice_messages if msg.get("turn_id")]
         source_refs = [msg.get("turn_id", "") for msg in slice_messages if msg.get("turn_id")]
@@ -990,7 +1267,8 @@ class MemoryOrchestrator:
             created_at=datetime.now().isoformat(),
         )
         self.registry.upsert_artifact(artifact)
-        self.vector_backend.ingest_artifact(artifact)
+        if self.vector_backend.embedding_client is not None:
+            self.vector_backend.ingest_artifact(artifact)
         if self.config.auto_summarize.archive_mode == "archive_continue":
             session.metadata["summary_cutoff_idx"] = max(last_cutoff, last_cutoff + len(slice_messages))
             trimmed_tokens = sum(len(str(msg.get("content", ""))) for msg in slice_messages) // 4
@@ -998,7 +1276,22 @@ class MemoryOrchestrator:
                 0,
                 int(session.metadata.get("estimated_context_tokens", 0)) - trimmed_tokens,
             )
-        return artifact
+        await self._emit_stage(
+            on_progress,
+            stage=stage,
+            status="done",
+            session_key=session.key,
+            turn_id=turn_id,
+            detail=f"Summary artifact {artifact.id}",
+            duration_ms=int((time.perf_counter() - started_at) * 1000),
+            extra={"artifact_id": artifact.id},
+        )
+        return {"status": "done", "artifact_id": artifact.id, "artifact": artifact}
+
+    async def maybe_auto_summarize_session(self, session: "Session") -> MemoryArtifact | None:
+        result = await self.run_auto_summary_stage(session)
+        artifact = result.get("artifact")
+        return artifact if isinstance(artifact, MemoryArtifact) else None
 
     async def _build_session_summary_text(self, session_key: str, messages: list[dict]) -> str:
         auto_role = self.app_config.resolve_model_role("auto_summarize", self.model) if self.app_config else None
@@ -1082,6 +1375,20 @@ class NullMemoryOrchestrator:
 
     async def enqueue_post_turn_ingest(self, episode: EpisodeRecord | None) -> None:
         return None
+
+    async def run_post_turn_pipeline(
+        self,
+        *,
+        session: "Session",
+        episode: EpisodeRecord | None,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "file_memory": {"status": "skipped", "artifacts": 0},
+            "graph": {"status": "skipped"},
+            "vector": {"status": "skipped", "artifacts": 0},
+            "summary": {"status": "skipped", "artifact_id": None},
+        }
 
     async def consolidate_session(self, session: "Session") -> bool:
         return True
@@ -1174,6 +1481,15 @@ class NullMemoryOrchestrator:
 
     async def maybe_auto_summarize_session(self, session: "Session"):
         return None
+
+    async def run_auto_summary_stage(
+        self,
+        session: "Session",
+        *,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
+        turn_id: str = "",
+    ) -> dict[str, object]:
+        return {"status": "skipped", "artifact_id": None}
 
     def build_runtime_context(self, session_key: str) -> str | None:
         return None

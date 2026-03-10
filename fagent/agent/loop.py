@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 import weakref
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -234,6 +235,38 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _tool_preview(tool_name: str, arguments: dict[str, Any] | list[Any] | None) -> str:
+        args = (arguments[0] if isinstance(arguments, list) and arguments else arguments) or {}
+        if not isinstance(args, dict):
+            return tool_name
+        val = next(iter(args.values()), None) if args else None
+        if not isinstance(val, str):
+            return tool_name
+        return f'{tool_name}("{val[:40]}...")' if len(val) > 40 else f'{tool_name}("{val}")'
+
+    async def _emit_progress(
+        self,
+        callback: Callable[..., Awaitable[None]] | None,
+        content: str,
+        *,
+        stage: str,
+        status: str = "running",
+        event: str = "stage",
+        **extra: Any,
+    ) -> None:
+        logger.bind(
+            session_key=extra.get("session_key", ""),
+            turn_id=extra.get("turn_id", ""),
+            stage=stage,
+            status=status,
+            duration_ms=extra.get("duration_ms"),
+            detail=str(content)[:240],
+        ).info("turn_stage")
+        if callback is None:
+            return
+        await callback(content, stage=stage, status=status, event=event, **extra)
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -266,8 +299,7 @@ class AgentLoop:
                 if on_progress:
                     thought = self._strip_think(response.content)
                     if thought:
-                        await on_progress(thought)
-                    await on_progress(self._tool_hint(response.tool_calls), tool_hint=True)
+                        await self._emit_progress(on_progress, thought, stage="Thinking", status="running", event="thinking")
 
                 tool_call_dicts = [
                     {
@@ -290,7 +322,48 @@ class AgentLoop:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    preview = self._tool_preview(tool_call.name, tool_call.arguments)
+                    if on_progress:
+                        await self._emit_progress(
+                            on_progress,
+                            preview,
+                            stage="Tool execution",
+                            status="running",
+                            event="tool",
+                            tool_name=tool_call.name,
+                            arguments_preview=preview,
+                            arguments_signature=args_str[:200],
+                        )
+                    started_at = time.perf_counter()
+                    try:
+                        result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    except Exception as exc:
+                        if on_progress:
+                            await self._emit_progress(
+                                on_progress,
+                                preview,
+                                stage="Tool execution",
+                                status="error",
+                                event="tool",
+                                tool_name=tool_call.name,
+                                arguments_preview=preview,
+                                arguments_signature=args_str[:200],
+                                duration_ms=int((time.perf_counter() - started_at) * 1000),
+                                error=str(exc)[:240],
+                            )
+                        raise
+                    if on_progress:
+                        await self._emit_progress(
+                            on_progress,
+                            preview,
+                            stage="Tool execution",
+                            status="ok",
+                            event="tool",
+                            tool_name=tool_call.name,
+                            arguments_preview=preview,
+                            arguments_signature=args_str[:200],
+                            duration_ms=int((time.perf_counter() - started_at) * 1000),
+                        )
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -395,7 +468,7 @@ class AgentLoop:
         self,
         msg: InboundMessage,
         session_key: str | None = None,
-        on_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
@@ -407,6 +480,15 @@ class AgentLoop:
             session = self.sessions.get_or_create(key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=self.memory_window)
+            presearch = await self.memory.search_v2(msg.content, session_scope=key)
+            await self._emit_progress(
+                on_progress,
+                f"scope={key} stores={','.join(presearch.get('used_stores', [])) or '-'} results={presearch.get('count', 0)} confidence={float(presearch.get('confidence', 0.0)):.2f}",
+                stage="Pre-search",
+                status="ok",
+                event="stage",
+                extra=presearch,
+            )
             shadow = await self.memory.prepare_shadow_context(
                 msg.content,
                 key,
@@ -420,13 +502,27 @@ class AgentLoop:
                 channel=channel,
                 chat_id=chat_id,
             )
-            final_content, tools_used, all_msgs, usage_totals, tool_call_count = await self._run_agent_loop(messages)
+            await self._emit_progress(on_progress, "Running main loop", stage="Thinking", status="started")
+            final_content, tools_used, all_msgs, usage_totals, tool_call_count = await self._run_agent_loop(
+                messages,
+                on_progress=on_progress,
+            )
             turn_id, saved_entries = self._save_turn(session, all_msgs, 1 + len(history))
             self._update_session_usage(session, usage_totals)
             self.sessions.save(session)
             episode = self.memory.build_episode(key, turn_id, channel, chat_id, saved_entries)
-            await self.memory.enqueue_post_turn_ingest(episode)
-            await self._post_turn_memory_tasks(session, turn_id, msg.content, tools_used, tool_call_count, saved_entries)
+            await self._emit_progress(on_progress, (final_content or "")[:120], stage="Draft ready", status="done")
+            await self._post_turn_memory_tasks(
+                session,
+                turn_id,
+                msg.content,
+                tools_used,
+                tool_call_count,
+                saved_entries,
+                episode=episode,
+                on_progress=on_progress,
+            )
+            await self._emit_progress(on_progress, "Turn complete", stage="Turn complete", status="done")
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
 
@@ -510,7 +606,35 @@ class AgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
+        async def _bus_progress(content: str, **kwargs: Any) -> None:
+            meta = dict(msg.metadata or {})
+            meta["_progress"] = True
+            meta["_progress_event"] = {
+                "content": content,
+                "stage": kwargs.get("stage", ""),
+                "status": kwargs.get("status", "running"),
+                "event": kwargs.get("event", "stage"),
+                "tool_name": kwargs.get("tool_name"),
+                "arguments_preview": kwargs.get("arguments_preview"),
+                "arguments_signature": kwargs.get("arguments_signature"),
+                "duration_ms": kwargs.get("duration_ms"),
+                "extra": kwargs.get("extra") or {},
+                "error": kwargs.get("error", ""),
+            }
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
+            ))
+
         history = session.get_history(max_messages=self.memory_window)
+        presearch = await self.memory.search_v2(msg.content, session_scope=key)
+        await self._emit_progress(
+            on_progress or _bus_progress,
+            f"scope={key} stores={','.join(presearch.get('used_stores', [])) or '-'} results={presearch.get('count', 0)} confidence={float(presearch.get('confidence', 0.0)):.2f}",
+            stage="Pre-search",
+            status="ok",
+            event="stage",
+            extra=presearch,
+        )
         shadow = await self.memory.prepare_shadow_context(
             msg.content,
             key,
@@ -525,14 +649,7 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id,
         )
 
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
-            meta = dict(msg.metadata or {})
-            meta["_progress"] = True
-            meta["_tool_hint"] = tool_hint
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
-            ))
-
+        await self._emit_progress(on_progress or _bus_progress, "Running main loop", stage="Thinking", status="started")
         final_content, tools_used, all_msgs, usage_totals, tool_call_count = await self._run_agent_loop(
             initial_messages, on_progress=on_progress or _bus_progress,
         )
@@ -544,8 +661,18 @@ class AgentLoop:
         self._update_session_usage(session, usage_totals)
         self.sessions.save(session)
         episode = self.memory.build_episode(key, turn_id, msg.channel, msg.chat_id, saved_entries)
-        await self.memory.enqueue_post_turn_ingest(episode)
-        await self._post_turn_memory_tasks(session, turn_id, msg.content, tools_used, tool_call_count, saved_entries)
+        await self._emit_progress(on_progress or _bus_progress, final_content[:120], stage="Draft ready", status="done")
+        await self._post_turn_memory_tasks(
+            session,
+            turn_id,
+            msg.content,
+            tools_used,
+            tool_call_count,
+            saved_entries,
+            episode=episode,
+            on_progress=on_progress or _bus_progress,
+        )
+        await self._emit_progress(on_progress or _bus_progress, "Turn complete", stage="Turn complete", status="done")
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
@@ -574,6 +701,9 @@ class AgentLoop:
         tools_used: list[str],
         tool_call_count: int,
         saved_entries: list[dict],
+        *,
+        episode: Any = None,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> None:
         if (
             tools_used
@@ -597,7 +727,16 @@ class AgentLoop:
                 citations=[entry.get("turn_id", turn_id) for entry in saved_entries[-4:]],
                 tools_used=tools_used,
             )
-        await self.memory.maybe_auto_summarize_session(session)
+        started_at = time.perf_counter()
+        pipeline = await self.memory.run_post_turn_pipeline(session=session, episode=episode, on_progress=on_progress)
+        logger.bind(
+            session_key=session.key,
+            turn_id=turn_id,
+            stage="post_turn_pipeline",
+            status="done",
+            duration_ms=int((time.perf_counter() - started_at) * 1000),
+            detail=json.dumps(pipeline, ensure_ascii=False)[:500],
+        ).info("turn_stage")
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> tuple[str, list[dict]]:
         """Save new-turn messages into session, truncating large tool results."""
@@ -665,7 +804,7 @@ class AgentLoop:
         session_key: str = "cli:direct",
         channel: str = "cli",
         chat_id: str = "direct",
-        on_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
         await self._connect_mcp()

@@ -18,6 +18,7 @@ def test_memory_help_lists_commands() -> None:
     assert "inspect-session" in result.stdout
     assert "inspect-task-graph" in result.stdout
     assert "inspect-experience" in result.stdout
+    assert "inspect-graph-jobs" in result.stdout
     assert "graph-ui" in result.stdout
 
 
@@ -129,3 +130,27 @@ def test_memory_graph_ui_command_prints_url(monkeypatch, tmp_path) -> None:
     assert result.exit_code == 0
     assert "Graph UI" in result.stdout
     assert "127.0.0.1:9999" in result.stdout
+
+
+def test_memory_inspect_graph_jobs_renders_rows(monkeypatch) -> None:
+    class _Registry:
+        def list_graph_jobs(self, limit=12):
+            return [{
+                "episode_id": "ep-1",
+                "status": "retry",
+                "attempts": 2,
+                "updated_at": "2026-03-10T10:00:00",
+                "error": "graph_extract_unavailable",
+            }]
+
+    class _StubMemory:
+        def __init__(self):
+            self.registry = _Registry()
+
+    monkeypatch.setattr("fagent.cli.commands._build_memory_orchestrator", lambda config, workspace: (None, _StubMemory()))
+    result = runner.invoke(app, ["memory", "inspect-graph-jobs"])
+
+    assert result.exit_code == 0
+    assert "Graph Jobs" in result.stdout
+    assert "ep-1" in result.stdout
+    assert "graph_extract_unavaila" in result.stdout

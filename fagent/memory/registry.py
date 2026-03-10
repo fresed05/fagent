@@ -584,6 +584,18 @@ class MemoryRegistry:
             error=row["error"] if "error" in row.keys() else "",
         )
 
+    def list_graph_jobs(self, limit: int = 20) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT job_id, episode_id, status, attempts, error, updated_at
+                FROM graph_jobs
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
     def upsert_task_node(self, node: TaskNode, metadata: dict[str, Any] | None = None) -> None:
         meta = metadata or {}
         node_id = str(meta.get("node_id") or f"{node.node_type}:{node.title}")

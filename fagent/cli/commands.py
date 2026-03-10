@@ -5,6 +5,7 @@ import os
 import select
 import signal
 import sys
+import time
 from pathlib import Path
 
 # Force UTF-8 encoding for Windows console
@@ -46,6 +47,94 @@ console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
 BRAND_GRADIENT = "bold bright_white on blue"
 ACCENT = "bright_cyan"
+
+
+class _TurnTimeline:
+    def __init__(self, console_: Console):
+        self.console = console_
+        self._last_tool_key: tuple[str, str] | None = None
+        self._last_tool_count = 0
+        self._pending_tool_status = "running"
+        self._turn_started_at = time.perf_counter()
+        self._summary: dict[str, object] = {}
+
+    def start_turn(self) -> None:
+        self._last_tool_key = None
+        self._last_tool_count = 0
+        self._pending_tool_status = "running"
+        self._turn_started_at = time.perf_counter()
+        self._summary = {}
+
+    def _stage_style(self, status: str) -> str:
+        return {
+            "started": "cyan",
+            "running": "cyan",
+            "ok": "green",
+            "done": "green",
+            "failed": "red",
+            "error": "red",
+            "retry": "yellow",
+            "skipped": "yellow",
+            "not_triggered": "dim",
+        }.get(status, "dim")
+
+    def _flush_tool(self) -> None:
+        if self._last_tool_key is None:
+            return
+        tool_name, preview = self._last_tool_key
+        suffix = f" x{self._last_tool_count}" if self._last_tool_count > 1 else ""
+        style = self._stage_style(self._pending_tool_status)
+        self.console.print(f"  [{style}]Tool execution[/{style}] {preview}{suffix} [{style}]{self._pending_tool_status}[/{style}]")
+        self._last_tool_key = None
+        self._last_tool_count = 0
+        self._pending_tool_status = "running"
+
+    def handle_event(self, event: dict[str, object]) -> None:
+        stage = str(event.get("stage", "") or "")
+        status = str(event.get("status", "running") or "running")
+        content = str(event.get("content", "") or "")
+        event_type = str(event.get("event", "stage") or "stage")
+        extra = event.get("extra") or {}
+        if isinstance(extra, dict):
+            if stage == "Saving file memory":
+                self._summary["file_memory"] = content
+            elif stage == "Building graph":
+                self._summary["graph"] = content
+            elif stage == "Writing vectors":
+                self._summary["vector"] = content
+            elif stage == "Summarizing session":
+                self._summary["summary"] = content
+        if event_type == "tool":
+            tool_name = str(event.get("tool_name", "") or "")
+            preview = str(event.get("arguments_preview", "") or tool_name or content)
+            key = (tool_name, preview)
+            if self._last_tool_key == key:
+                self._last_tool_count += 1
+                self._pending_tool_status = status
+                return
+            self._flush_tool()
+            self._last_tool_key = key
+            self._last_tool_count = 1
+            self._pending_tool_status = status
+            return
+        self._flush_tool()
+        style = self._stage_style(status)
+        if stage == "Turn complete":
+            elapsed = time.perf_counter() - self._turn_started_at
+            self.console.print(f"  [{style}]{stage}[/{style}] {content}")
+            footer = " | ".join(
+                part for part in [
+                    f"graph: {self._summary.get('graph', 'n/a')}",
+                    f"vectors: {self._summary.get('vector', 'n/a')}",
+                    f"summary: {self._summary.get('summary', 'n/a')}",
+                ]
+                if part
+            )
+            if footer:
+                self.console.print(f"  [dim]{footer}[/dim]")
+            self.console.print(f"  [dim]Post-turn: {elapsed:.1f}s[/dim]")
+            return
+        self.console.print(f"  [{style}]{stage}[/{style}] {content}")
 
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
@@ -344,11 +433,13 @@ def gateway(
     from fagent.cron.service import CronService
     from fagent.cron.types import CronJob
     from fagent.heartbeat.service import HeartbeatService
+    from fagent.runtime_logging import setup_runtime_logging
     from fagent.session.manager import SessionManager
 
     if verbose:
         import logging
         logging.basicConfig(level=logging.DEBUG)
+    setup_runtime_logging(verbose=verbose, console_output=True)
 
     config = _load_runtime_config(config, workspace)
 
@@ -534,9 +625,11 @@ def agent(
     from fagent.bus.queue import MessageBus
     from fagent.config.paths import get_cron_dir
     from fagent.cron.service import CronService
+    from fagent.runtime_logging import setup_runtime_logging
 
     config = _load_runtime_config(config, workspace)
     sync_workspace_templates(config.workspace_path)
+    setup_runtime_logging(verbose=logs, console_output=logs)
 
     bus = MessageBus()
     provider = _make_provider(config)
@@ -545,10 +638,7 @@ def agent(
     cron_store_path = get_cron_dir() / "jobs.json"
     cron = CronService(cron_store_path)
 
-    if logs:
-        logger.enable("fagent")
-    else:
-        logger.disable("fagent")
+    logger.enable("fagent")
 
     agent_loop = AgentLoop(
         bus=bus,
@@ -579,19 +669,36 @@ def agent(
         # Animated spinner is safe to use with prompt_toolkit input handling
         return console.status("[dim]fagent is thinking...[/dim]", spinner="dots")
 
-    async def _cli_progress(content: str, *, tool_hint: bool = False) -> None:
+    timeline = _TurnTimeline(console)
+
+    async def _cli_progress(content: str, **kwargs) -> None:
         ch = agent_loop.channels_config
-        if ch and tool_hint and not ch.send_tool_hints:
+        event = {
+            "content": content,
+            "stage": kwargs.get("stage", ""),
+            "status": kwargs.get("status", "running"),
+            "event": kwargs.get("event", "stage"),
+            "tool_name": kwargs.get("tool_name"),
+            "arguments_preview": kwargs.get("arguments_preview"),
+            "arguments_signature": kwargs.get("arguments_signature"),
+            "duration_ms": kwargs.get("duration_ms"),
+            "extra": kwargs.get("extra") or {},
+            "error": kwargs.get("error", ""),
+        }
+        is_tool_hint = event["event"] == "tool"
+        if ch and is_tool_hint and not ch.send_tool_hints:
             return
-        if ch and not tool_hint and not ch.send_progress:
+        if ch and not is_tool_hint and not ch.send_progress:
             return
-        console.print(f"  [dim]↳ {content}[/dim]")
+        timeline.handle_event(event)
 
     if message:
         # Single message mode — direct call, no bus needed
         async def run_once():
+            timeline.start_turn()
             with _thinking_ctx():
                 response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
+            timeline._flush_tool()
             _print_agent_response(response, render_markdown=markdown)
             await agent_loop.close_mcp()
 
@@ -635,17 +742,20 @@ def agent(
                     try:
                         msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
                         if msg.metadata.get("_progress"):
-                            is_tool_hint = msg.metadata.get("_tool_hint", False)
+                            event = dict(msg.metadata.get("_progress_event") or {})
+                            is_tool_hint = event.get("event") == "tool"
                             ch = agent_loop.channels_config
                             if ch and is_tool_hint and not ch.send_tool_hints:
                                 pass
                             elif ch and not is_tool_hint and not ch.send_progress:
                                 pass
                             else:
-                                console.print(f"  [dim]↳ {msg.content}[/dim]")
+                                event.setdefault("content", msg.content)
+                                timeline.handle_event(event)
                         elif not turn_done.is_set():
                             if msg.content:
                                 turn_response.append(msg.content)
+                            timeline._flush_tool()
                             turn_done.set()
                         elif msg.content:
                             console.print()
@@ -673,6 +783,7 @@ def agent(
 
                         turn_done.clear()
                         turn_response.clear()
+                        timeline.start_turn()
 
                         await bus.publish_inbound(InboundMessage(
                             channel=cli_channel,
@@ -684,6 +795,7 @@ def agent(
                         with _thinking_ctx():
                             await turn_done.wait()
 
+                        timeline._flush_tool()
                         if turn_response:
                             _print_agent_response(turn_response[0], render_markdown=markdown)
                     except KeyboardInterrupt:
@@ -764,6 +876,17 @@ def memory_doctor(
     registry_table.add_row("Task Nodes", str(len(orchestrator.registry.search_task_nodes("", limit=1000))))
     registry_table.add_row("Experience Patterns", str(len(orchestrator.registry.list_experience_patterns(limit=1000))))
     console.print(registry_table)
+
+    graph_jobs = orchestrator.registry.list_graph_jobs(limit=5)
+    if graph_jobs:
+        graph_table = Table(title="Recent Graph Jobs")
+        graph_table.add_column("Episode", style="cyan")
+        graph_table.add_column("Status", style="green")
+        graph_table.add_column("Attempts", style="yellow")
+        graph_table.add_column("Error", style="red")
+        for row in graph_jobs:
+            graph_table.add_row(str(row["episode_id"]), str(row["status"]), str(row["attempts"]), str(row["error"])[:80])
+        console.print(graph_table)
 
 
 @memory_app.command("query")
@@ -1009,6 +1132,35 @@ def memory_graph_ui(
         manager.wait_forever()
     except KeyboardInterrupt:
         manager.stop()
+
+
+@memory_app.command("inspect-graph-jobs")
+def memory_inspect_graph_jobs(
+    limit: int = typer.Option(12, "--limit", "-n", help="Number of recent graph jobs"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+):
+    """Inspect recent graph extraction jobs."""
+    _, orchestrator = _build_memory_orchestrator(config, workspace)
+    rows = orchestrator.registry.list_graph_jobs(limit=limit)
+    if not rows:
+        console.print("[yellow]No graph jobs found.[/yellow]")
+        raise typer.Exit(0)
+    table = Table(title="Graph Jobs")
+    table.add_column("Episode", style="cyan")
+    table.add_column("Status", style="green")
+    table.add_column("Attempts", style="yellow")
+    table.add_column("Updated", style="magenta")
+    table.add_column("Error", style="red")
+    for row in rows:
+        table.add_row(
+            str(row["episode_id"]),
+            str(row["status"]),
+            str(row["attempts"]),
+            str(row["updated_at"]),
+            str(row["error"])[:120],
+        )
+    console.print(table)
 
 
 # ============================================================================
