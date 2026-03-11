@@ -529,6 +529,10 @@ class LocalGraphBackend:
         ranked.sort(key=lambda item: (item["search_score"], item["semantic_score"], item["label"]), reverse=True)
         return ranked[:limit]
 
+    def search_candidates(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Expose ranked graph candidates for retrieval and diagnostics."""
+        return self._search_graph_candidates(query, limit=limit)
+
     def healthcheck(self) -> bool:
         return True
 

@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from fagent.agent.tools.memory_search import (
 from fagent.agent.tools.registry import ToolRegistry
 from fagent.agent.tools.workflow import WorkflowTool
 from fagent.memory.orchestrator import MemoryOrchestrator
+from fagent.memory.vector import EmbeddedVectorStore
 from fagent.memory.types import EpisodeRecord
 from fagent.providers.base import LLMProvider, LLMResponse
 
@@ -74,6 +76,18 @@ class StrictEchoTool(EchoTool):
         return kwargs["text"]
 
 
+class StubEmbeddingClient:
+    def __init__(self, vector: list[float] | None = None) -> None:
+        self.vector = vector or [1.0, 0.0]
+        self.embedding_version = "stub-embedding"
+
+    def healthcheck(self) -> bool:
+        return True
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        return [list(self.vector) for _ in texts]
+
+
 @pytest.mark.asyncio
 async def test_memory_search_tool_returns_ranked_results(tmp_path: Path) -> None:
     orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
@@ -94,6 +108,7 @@ async def test_memory_search_tool_returns_ranked_results(tmp_path: Path) -> None
 
     assert payload["count"] >= 1
     assert any(item["store"] in {"file", "graph"} for item in payload["results"])
+    assert "empty_reason_codes" in payload
 
 
 @pytest.mark.asyncio
@@ -137,6 +152,7 @@ async def test_memory_search_v2_surfaces_task_and_experience_memory(tmp_path: Pa
     assert payload["intent"] == "workflow_recall"
     assert payload["count"] >= 1
     assert any(item["store"] in {"workflow", "task_graph", "experience"} for item in payload["results"])
+    assert payload["store_attempts"]
 
 
 @pytest.mark.asyncio
@@ -169,23 +185,179 @@ async def test_memory_get_artifact_and_daily_note_tools(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_memory_get_entity_tool_returns_graph_node(tmp_path: Path) -> None:
     orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
+    orchestrator.registry.upsert_graph_node(
+        "entity:lancedb",
+        label="lancedb",
+        metadata={
+            "kind": "entity",
+            "canonical_name": "lancedb",
+            "aliases": ["lancedb"],
+            "session_key": "cli:direct",
+        },
+    )
+
+    tool = MemoryGetEntityTool(orchestrator)
+    payload = json.loads(await tool.execute("entity:lancedb"))
+
+    assert payload["status"] == "ok"
+    assert payload["resolution"] == "graph_entity"
+    assert payload["entity"]["label"]
+    assert payload["entity"]["match_source"] == "direct_id"
+
+
+@pytest.mark.asyncio
+async def test_memory_get_entity_tool_returns_ranked_graph_match(tmp_path: Path) -> None:
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
+    orchestrator.registry.upsert_graph_node(
+        "entity:lancedb",
+        label="lancedb",
+        metadata={"kind": "entity", "aliases": ["lance db"], "canonical_name": "lancedb"},
+    )
+    orchestrator.registry.replace_graph_aliases(
+        "entity:lancedb",
+        [
+            {"alias_text": "lancedb", "alias_language": "en", "is_canonical": 1},
+            {"alias_text": "lance db", "alias_language": "en", "is_canonical": 0},
+        ],
+    )
+
+    tool = MemoryGetEntityTool(orchestrator)
+    payload = json.loads(await tool.execute("lance db"))
+
+    assert payload["status"] == "ok"
+    assert payload["resolution"] == "graph_entity"
+    assert payload["entity"]["match_source"] == "ranked_graph_search"
+    assert payload["entity"]["match_confidence"] > 0
+
+
+@pytest.mark.asyncio
+async def test_memory_get_entity_tool_returns_honest_artifact_fallback(tmp_path: Path) -> None:
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
     episode = EpisodeRecord(
-        episode_id="ep-entity",
+        episode_id="ep-artifact-fallback",
         session_key="cli:direct",
-        turn_id="turn-000003",
+        turn_id="turn-000004",
         channel="cli",
         chat_id="direct",
-        user_text="we use lancedb for vector memory",
-        assistant_text="lancedb is linked to memory graph",
-        timestamp="2026-03-09T16:20:00",
+        user_text="remember nvidia embedding model selection",
+        assistant_text="embedding model remembered for later",
+        timestamp="2026-03-09T16:30:00",
     )
     await orchestrator.ingest_episode(episode)
 
     tool = MemoryGetEntityTool(orchestrator)
-    payload = json.loads(await tool.execute("lancedb"))
+    payload = json.loads(await tool.execute("nvidia"))
 
-    assert payload["status"] in {"ok", "degraded"}
-    assert payload["entity"]["label"]
+    assert payload["status"] == "degraded"
+    assert payload["resolution"] == "artifact_fallback"
+    assert payload["entity"]["metadata"]["resolution"] == "artifact_fallback"
+
+
+@pytest.mark.asyncio
+async def test_memory_get_entity_tool_returns_not_found(tmp_path: Path) -> None:
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
+    tool = MemoryGetEntityTool(orchestrator)
+
+    payload = json.loads(await tool.execute("totally-unknown-entity"))
+
+    assert payload["status"] == "not_found"
+
+
+def test_embedded_vector_store_backfills_legacy_scope_columns(tmp_path: Path) -> None:
+    store = EmbeddedVectorStore(tmp_path, collection="memory")
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("DELETE FROM vectors")
+        conn.execute(
+            """
+            INSERT INTO vectors(
+                id, content, vector_json, metadata_json, session_key, artifact_type, channel, chat_id, turn_id, search_text,
+                content_hash, embedding_version
+            )
+            VALUES (?, ?, ?, ?, '', '', '', '', '', '', ?, ?)
+            """,
+            (
+                "legacy-row",
+                "local SQLite graph memory",
+                json.dumps([1.0, 0.0]),
+                json.dumps(
+                    {
+                        "artifact_id": "legacy-row",
+                        "session_key": "cli:legacy",
+                        "artifact_type": "session_turn",
+                        "channel": "cli",
+                        "chat_id": "direct",
+                        "turn_id": "turn-legacy",
+                    }
+                ),
+                "hash-legacy",
+                "stub-embedding",
+            ),
+        )
+    store = EmbeddedVectorStore(tmp_path, collection="memory")
+    rows = store.query([1.0, 0.0], top_k=3, filters={"session_key": "cli:legacy", "artifact_type": "session_turn"}, query_text="local SQLite")
+
+    assert rows
+    assert rows[0]["session_key"] == "cli:legacy"
+    assert rows[0]["artifact_type"] == "session_turn"
+
+
+@pytest.mark.asyncio
+async def test_memory_search_v2_reports_empty_diagnostics_without_session_scope(tmp_path: Path) -> None:
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
+    episode = EpisodeRecord(
+        episode_id="ep-empty-diagnostics",
+        session_key="cli:direct",
+        turn_id="turn-000005",
+        channel="cli",
+        chat_id="direct",
+        user_text="remember local sqlite graph memory and background extractor",
+        assistant_text="stored local sqlite graph memory and background extractor",
+        timestamp="2026-03-09T16:40:00",
+    )
+    await orchestrator.ingest_episode(episode)
+
+    tool = MemorySearchV2Tool(orchestrator)
+    payload = json.loads(
+        await tool.execute(
+            query="telegram placeholder github",
+            stores=["file", "graph"],
+            allow_raw_escalation=True,
+        )
+    )
+
+    assert payload["count"] == 0
+    assert "no_matching_data" in payload["empty_reason_codes"]
+    assert "query_data_mismatch" in payload["empty_reason_codes"]
+    assert payload["raw_escalation_reason"] == "raw_escalation_skipped_no_session_scope"
+    assert payload["session_scope_applied"] is False
+
+
+@pytest.mark.asyncio
+async def test_memory_search_v2_returns_realistic_fixture_results(tmp_path: Path) -> None:
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
+    episode = EpisodeRecord(
+        episode_id="ep-realistic-memory",
+        session_key="cli:live-memory",
+        turn_id="turn-000006",
+        channel="cli",
+        chat_id="direct",
+        user_text="Please remember this exact fact for future turns: We selected the external embeddings model nvidia/llama-nemotron-embed-vl-1b-v2 and we use local SQLite graph memory with a background extractor.",
+        assistant_text="Got it, I will remember the embeddings model and the local SQLite graph memory setup.",
+        timestamp="2026-03-09T16:50:00",
+    )
+    await orchestrator.ingest_episode(episode)
+
+    tool = MemorySearchV2Tool(orchestrator)
+    payload = json.loads(
+        await tool.execute(
+            query="local SQLite graph memory",
+            stores=["file", "graph"],
+            session_scope="cli:live-memory",
+        )
+    )
+
+    assert payload["count"] >= 1
+    assert any("local SQLite graph memory" in item["snippet"] for item in payload["results"])
 
 
 @pytest.mark.asyncio

@@ -79,6 +79,12 @@ class MemorySearchTool(Tool):
                 "raw_escalated": payload["raw_escalated"],
                 "count": payload["count"],
                 "citations": payload["citations"],
+                "store_health": payload.get("store_health", {}),
+                "store_attempts": payload.get("store_attempts", {}),
+                "empty_reason_codes": payload.get("empty_reason_codes", []),
+                "raw_escalation_reason": payload.get("raw_escalation_reason", ""),
+                "session_scope_applied": payload.get("session_scope_applied", False),
+                "filters_applied": payload.get("filters_applied", {}),
                 "results": [
                     {
                         "artifact_id": item.artifact_id,
@@ -165,6 +171,12 @@ class MemorySearchV2Tool(Tool):
                 "raw_escalated": payload["raw_escalated"],
                 "count": payload["count"],
                 "citations": payload["citations"],
+                "store_health": payload.get("store_health", {}),
+                "store_attempts": payload.get("store_attempts", {}),
+                "empty_reason_codes": payload.get("empty_reason_codes", []),
+                "raw_escalation_reason": payload.get("raw_escalation_reason", ""),
+                "session_scope_applied": payload.get("session_scope_applied", False),
+                "filters_applied": payload.get("filters_applied", {}),
                 "results": [
                 {
                     "artifact_id": item.artifact_id,
@@ -256,8 +268,9 @@ class MemoryGetEntityTool(Tool):
         entity = self.memory.get_entity(entity_ref)
         if entity is None:
             return json.dumps({"status": "not_found", "entity_ref": entity_ref}, ensure_ascii=False, indent=2)
-        status = "degraded" if bool((entity.get("metadata") or {}).get("degraded")) else "ok"
-        return json.dumps({"status": status, "entity": entity}, ensure_ascii=False, indent=2)
+        resolution = str(entity.get("resolution") or (entity.get("metadata") or {}).get("resolution") or "")
+        status = "degraded" if resolution == "artifact_fallback" or bool((entity.get("metadata") or {}).get("degraded")) else "ok"
+        return json.dumps({"status": status, "resolution": resolution or ("artifact_fallback" if status == "degraded" else "graph_entity"), "entity": entity}, ensure_ascii=False, indent=2)
 
 
 class MemoryGetDailyNoteTool(Tool):

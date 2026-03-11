@@ -168,6 +168,39 @@ class EmbeddedVectorStore:
                     conn.execute(f"ALTER TABLE vectors ADD COLUMN {column_name} {definition}")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_vectors_session_type ON vectors(session_key, artifact_type)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_vectors_artifact_type ON vectors(artifact_type)")
+            rows = conn.execute(
+                """
+                SELECT id, content, metadata_json
+                FROM vectors
+                WHERE session_key = ''
+                   OR artifact_type = ''
+                   OR channel = ''
+                   OR chat_id = ''
+                   OR turn_id = ''
+                   OR search_text = ''
+                """
+            ).fetchall()
+            if rows:
+                conn.executemany(
+                    """
+                    UPDATE vectors
+                    SET session_key = ?,
+                        artifact_type = ?,
+                        channel = ?,
+                        chat_id = ?,
+                        turn_id = ?,
+                        search_text = ?
+                    WHERE id = ?
+                    """,
+                    [
+                        self._legacy_vector_row_values(
+                            str(row["content"] or ""),
+                            str(row["metadata_json"] or "{}"),
+                            str(row["id"]),
+                        )
+                        for row in rows
+                    ],
+                )
 
     def healthcheck(self) -> bool:
         try:
@@ -276,6 +309,26 @@ class EmbeddedVectorStore:
                     embedding_version,
                 ),
             )
+
+    @staticmethod
+    def _legacy_vector_row_values(
+        content: str,
+        metadata_json: str,
+        record_id: str,
+    ) -> tuple[str, str, str, str, str, str, str]:
+        try:
+            metadata = json.loads(metadata_json) if metadata_json else {}
+        except Exception:
+            metadata = {}
+        return (
+            str(metadata.get("session_key") or ""),
+            str(metadata.get("artifact_type") or ""),
+            str(metadata.get("channel") or ""),
+            str(metadata.get("chat_id") or ""),
+            str(metadata.get("turn_id") or ""),
+            EmbeddedVectorStore._build_search_text(content, metadata),
+            record_id,
+        )
 
     @staticmethod
     def _build_search_text(content: str, metadata: dict[str, Any]) -> str:

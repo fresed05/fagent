@@ -1181,7 +1181,7 @@ class MemoryOrchestrator:
             recent_workflow_state=self.get_recent_workflow_state(session_scope or ""),
         )
         selected_stores = stores or request.stores
-        selected_types = artifact_types or request.artifact_types
+        selected_types = artifact_types or request.artifact_types or []
         limit = top_k or request.candidate_budget.get("final") or self.config.search_v2.default_top_k
         store_rank = {store: index for index, store in enumerate(selected_stores)}
         if hasattr(self.vector_backend, "reset_query_embedding_stats"):
@@ -1190,11 +1190,13 @@ class MemoryOrchestrator:
         initial_structured = self._structured_results_for_query(query, request, session_scope=session_scope)
         initial_store_lists: list[list[RetrievedMemory]] = []
         store_contributions: dict[str, int] = {}
+        per_store_hits: dict[str, int] = defaultdict(int)
         store_queries = 0
         if initial_structured:
             initial_store_lists.append(initial_structured)
             for item in initial_structured:
                 store_contributions[item.store] = store_contributions.get(item.store, 0) + 1
+                per_store_hits[item.store] += 1
         for store in selected_stores:
             store_queries += 1
             pool_limit = request.candidate_budget.get(store, max(limit, 4))
@@ -1209,6 +1211,7 @@ class MemoryOrchestrator:
             if hits:
                 initial_store_lists.append(hits)
                 store_contributions[store] = store_contributions.get(store, 0) + len(hits)
+                per_store_hits[store] += len(hits)
         first_pass = self._rrf_merge(initial_store_lists) if initial_store_lists else []
         for variant in self._expand_query_variants(query, request, first_pass_count=len(first_pass)):
             if variant not in variant_queries:
@@ -1221,6 +1224,7 @@ class MemoryOrchestrator:
                 ranked_lists.append(structured)
                 for item in structured:
                     store_contributions[item.store] = store_contributions.get(item.store, 0) + 1
+                    per_store_hits[item.store] += 1
             for store in selected_stores:
                 store_queries += 1
                 pool_limit = request.candidate_budget.get(store, max(limit, 4))
@@ -1236,6 +1240,7 @@ class MemoryOrchestrator:
                     continue
                 ranked_lists.append(hits)
                 store_contributions[store] = store_contributions.get(store, 0) + len(hits)
+                per_store_hits[store] += len(hits)
 
         results = self._rrf_merge(ranked_lists) if ranked_lists else []
         if selected_types:
@@ -1260,8 +1265,9 @@ class MemoryOrchestrator:
         ]
         results = self._dedupe_results(rescored, max(limit, request.candidate_budget.get("final", limit)))
         raw_escalated = False
+        raw_escalation_requested = allow_raw_escalation if allow_raw_escalation is not None else request.allow_raw_escalation
         if (
-            (allow_raw_escalation if allow_raw_escalation is not None else request.allow_raw_escalation)
+            raw_escalation_requested
             and len(results) < max(2, limit // 2)
             and session_scope
         ):
@@ -1289,7 +1295,19 @@ class MemoryOrchestrator:
                 for item in results
             ]
             results = self._dedupe_results(rescored, limit)
+            per_store_hits["raw"] += len(raw_results)
         confidence = min(1.0, sum(item.score for item in results[:3]) / max(1, min(3, len(results)))) if results else 0.0
+        diagnostics = self._build_search_diagnostics(
+            query=query,
+            selected_stores=selected_stores,
+            selected_types=selected_types,
+            session_scope=session_scope,
+            time_range=time_range,
+            allow_raw_requested=raw_escalation_requested,
+            raw_escalated=raw_escalated,
+            per_store_hits=per_store_hits,
+            results=results,
+        )
         return {
             "query": query,
             "intent": request.intent,
@@ -1314,6 +1332,7 @@ class MemoryOrchestrator:
             "embedding_cache_hits_per_search": self.vector_backend.query_embedding_stats().get("cache_hits", 0),
             "raw_escalations": 1 if raw_escalated else 0,
             "graph_search_candidates_scanned": getattr(self.graph_backend, "last_search_candidate_count", 0),
+            **diagnostics,
         }
 
     def _fetch_raw_session_artifacts(self, session_key: str, query: str, limit: int = 4) -> list[RetrievedMemory]:
@@ -1348,6 +1367,81 @@ class MemoryOrchestrator:
                 break
         return matches
 
+    def _store_health_snapshot(self) -> dict[str, bool]:
+        return {
+            "file": True,
+            "vector": self.vector_backend.healthcheck(),
+            "graph": self.graph_backend.healthcheck(),
+        }
+
+    def _build_search_diagnostics(
+        self,
+        *,
+        query: str,
+        selected_stores: list[str],
+        selected_types: list[str],
+        session_scope: str | None,
+        time_range: dict[str, str] | None,
+        allow_raw_requested: bool,
+        raw_escalated: bool,
+        per_store_hits: dict[str, int],
+        results: list[RetrievedMemory],
+    ) -> dict[str, object]:
+        store_health = self._store_health_snapshot()
+        store_attempts = {
+            store: {
+                "attempted": True,
+                "healthy": store_health.get(store, False) if store in {"vector", "graph"} else True,
+                "hits": per_store_hits.get(store, 0),
+            }
+            for store in selected_stores
+        }
+        empty_reason_codes: list[str] = []
+        if allow_raw_requested and not session_scope:
+            raw_escalation_reason = "raw_escalation_skipped_no_session_scope"
+        elif raw_escalated:
+            raw_escalation_reason = "raw_escalated"
+        elif allow_raw_requested and session_scope:
+            raw_escalation_reason = "raw_escalation_not_triggered"
+        else:
+            raw_escalation_reason = "not_requested"
+
+        if not results:
+            empty_reason_codes.append("no_matching_data")
+            if any(store_health.get(store, True) for store in selected_stores):
+                empty_reason_codes.append("query_data_mismatch")
+            if "graph" in selected_stores and per_store_hits.get("graph", 0) == 0:
+                empty_reason_codes.append("graph_no_entity_match")
+            if "vector" in selected_stores and session_scope and store_health.get("vector", False):
+                unscoped_hits = self.search(
+                    query,
+                    stores=["vector"],
+                    artifact_types=selected_types,
+                    top_k=max(4, self.config.search_v2.default_top_k),
+                    session_scope=None,
+                    time_range=time_range,
+                )
+                if unscoped_hits:
+                    empty_reason_codes.append("vector_filtered_out_by_scope")
+        elif allow_raw_requested and not raw_escalated and not session_scope and len(results) < max(2, len(selected_stores)):
+            empty_reason_codes.append("raw_escalation_skipped_no_session_scope")
+
+        deduped_codes: list[str] = []
+        for code in empty_reason_codes:
+            if code not in deduped_codes:
+                deduped_codes.append(code)
+        return {
+            "store_health": store_health,
+            "store_attempts": store_attempts,
+            "empty_reason_codes": deduped_codes,
+            "raw_escalation_reason": raw_escalation_reason,
+            "session_scope_applied": bool(session_scope),
+            "filters_applied": {
+                "artifact_types": selected_types,
+                "time_range": bool(time_range),
+            },
+        }
+
     def query(self, query: str, limit: int = 10) -> list[str]:
         results = self.search(query, top_k=limit)
         return [f"[{item.store}] {item.snippet}" for item in results]
@@ -1364,9 +1458,15 @@ class MemoryOrchestrator:
 
     def get_entity(self, entity_ref: str) -> dict | None:
         row = self.registry.get_graph_node(entity_ref)
+        match_source = "direct_id"
+        match_confidence = 1.0
         if row is None:
-            candidates = self.registry.find_graph_nodes(entity_ref, limit=1)
-            row = candidates[0] if candidates else None
+            candidates = self.graph_backend.search_candidates(entity_ref, limit=3)
+            if candidates:
+                top = candidates[0]
+                row = self.registry.get_graph_node(str(top["id"]))
+                match_source = "ranked_graph_search"
+                match_confidence = float(top.get("search_score", 0.0) or 0.0)
         if row is not None:
             edges = self.registry.get_graph_edges_for_node(row["id"], limit=256)
             neighbor_ids = {
@@ -1388,7 +1488,15 @@ class MemoryOrchestrator:
             return {
                 "id": row["id"],
                 "label": row["label"],
-                "metadata": json.loads(row["metadata_json"]),
+                "resolution": "graph_entity",
+                "match_source": match_source,
+                "match_confidence": match_confidence,
+                "metadata": {
+                    **json.loads(row["metadata_json"]),
+                    "resolution": "graph_entity",
+                    "match_source": match_source,
+                    "match_confidence": match_confidence,
+                },
                 "neighbors": neighbors,
                 "edges": [
                     {
@@ -1417,7 +1525,17 @@ class MemoryOrchestrator:
                 return {
                     "id": task_row["node_id"],
                     "label": task_row["title"],
-                    "metadata": {**json.loads(task_row["metadata_json"]), "task_id": task_id, "status": task_row["status"]},
+                    "resolution": "task_graph",
+                    "match_source": "task_graph_search",
+                    "match_confidence": 0.74,
+                    "metadata": {
+                        **json.loads(task_row["metadata_json"]),
+                        "task_id": task_id,
+                        "status": task_row["status"],
+                        "resolution": "task_graph",
+                        "match_source": "task_graph_search",
+                        "match_confidence": 0.74,
+                    },
                     "edges": edges,
                 }
         artifact_matches = self.registry.search_artifacts(entity_ref, limit=3)
@@ -1426,10 +1544,16 @@ class MemoryOrchestrator:
             return {
                 "id": f"artifact:{primary.id}",
                 "label": entity_ref,
+                "resolution": "artifact_fallback",
+                "match_source": "artifact_search",
+                "match_confidence": 0.45,
                 "metadata": {
                     "kind": "artifact_fallback",
                     "degraded": True,
                     "confidence": 0.45,
+                    "resolution": "artifact_fallback",
+                    "match_source": "artifact_search",
+                    "match_confidence": 0.45,
                     "artifact_id": primary.id,
                     "artifact_type": primary.type,
                     "source_ref": primary.source_ref,
