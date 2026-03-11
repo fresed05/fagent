@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
+from html import escape as html_escape
 import re
-import time
 import unicodedata
 
 from loguru import logger
 from telegram import BotCommand, ReplyParameters, Update
+from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.helpers import escape_markdown
 from telegram.request import HTTPXRequest
 
 from fagent.bus.events import OutboundMessage
@@ -19,132 +22,349 @@ from fagent.config.paths import get_media_dir
 from fagent.config.schema import TelegramConfig
 from fagent.utils.helpers import split_message
 
-TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
+TELEGRAM_MAX_MESSAGE_LEN = 4000
+TELEGRAM_RENDER_LIMIT = 3800
+POST_TURN_STAGES = {
+    "Saving file memory",
+    "Building graph",
+    "Writing vectors",
+    "Summarizing session",
+}
+POST_TURN_LABELS = {
+    "Saving file memory": "File",
+    "Building graph": "Graph",
+    "Writing vectors": "Vector",
+    "Summarizing session": "Summary",
+}
+POST_TURN_ICONS = {
+    "Saving file memory": "🗂️",
+    "Building graph": "🕸️",
+    "Writing vectors": "📦",
+    "Summarizing session": "📝",
+}
+
+
+@dataclass(slots=True)
+class _TelegramTurnState:
+    progress_message_id: int | None = None
+    progress_lines: list[str] = field(default_factory=list)
+    archived_progress_lines: list[str] = field(default_factory=list)
+    last_progress_fingerprint: str = ""
+    final_sent: bool = False
+    post_turn_summary: dict[str, str] = field(default_factory=dict)
+    post_turn_message_id: int | None = None
 
 
 def _strip_md(s: str) -> str:
     """Strip markdown inline formatting from text."""
-    s = re.sub(r'\*\*(.+?)\*\*', r'\1', s)
-    s = re.sub(r'__(.+?)__', r'\1', s)
-    s = re.sub(r'~~(.+?)~~', r'\1', s)
-    s = re.sub(r'`([^`]+)`', r'\1', s)
+    s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+    s = re.sub(r"__(.+?)__", r"\1", s)
+    s = re.sub(r"~~(.+?)~~", r"\1", s)
+    s = re.sub(r"`([^`]+)`", r"\1", s)
     return s.strip()
 
 
 def _render_table_box(table_lines: list[str]) -> str:
-    """Convert markdown pipe-table to compact aligned text for <pre> display."""
+    """Convert markdown pipe-table to compact aligned text for monospaced display."""
 
     def dw(s: str) -> int:
-        return sum(2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1 for c in s)
+        return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
 
     rows: list[list[str]] = []
     has_sep = False
     for line in table_lines:
-        cells = [_strip_md(c) for c in line.strip().strip('|').split('|')]
-        if all(re.match(r'^:?-+:?$', c) for c in cells if c):
+        cells = [_strip_md(c) for c in line.strip().strip("|").split("|")]
+        if all(re.match(r"^:?-+:?$", c) for c in cells if c):
             has_sep = True
             continue
         rows.append(cells)
     if not rows or not has_sep:
-        return '\n'.join(table_lines)
+        return "\n".join(table_lines)
 
     ncols = max(len(r) for r in rows)
-    for r in rows:
-        r.extend([''] * (ncols - len(r)))
-    widths = [max(dw(r[c]) for r in rows) for c in range(ncols)]
+    for row in rows:
+        row.extend([""] * (ncols - len(row)))
+    widths = [max(dw(row[c]) for row in rows) for c in range(ncols)]
 
     def dr(cells: list[str]) -> str:
-        return '  '.join(f'{c}{" " * (w - dw(c))}' for c, w in zip(cells, widths))
+        return "  ".join(f"{c}{' ' * (w - dw(c))}" for c, w in zip(cells, widths))
 
     out = [dr(rows[0])]
-    out.append('  '.join('─' * w for w in widths))
+    out.append("  ".join("─" * w for w in widths))
     for row in rows[1:]:
         out.append(dr(row))
-    return '\n'.join(out)
+    return "\n".join(out)
 
 
-def _markdown_to_telegram_html(text: str) -> str:
-    """
-    Convert markdown to Telegram-safe HTML.
-    """
-    if not text:
-        return ""
+def _normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
 
-    # 1. Extract and protect code blocks (preserve content from other processing)
-    code_blocks: list[str] = []
-    def save_code_block(m: re.Match) -> str:
-        code_blocks.append(m.group(1))
-        return f"\x00CB{len(code_blocks) - 1}\x00"
 
-    text = re.sub(r'```[\w]*\n?([\s\S]*?)```', save_code_block, text)
+def _escape_pre_html(text: str) -> str:
+    return html_escape(text, quote=False)
 
-    # 1.5. Convert markdown tables to box-drawing (reuse code_block placeholders)
-    lines = text.split('\n')
-    rebuilt: list[str] = []
-    li = 0
-    while li < len(lines):
-        if re.match(r'^\s*\|.+\|', lines[li]):
-            tbl: list[str] = []
-            while li < len(lines) and re.match(r'^\s*\|.+\|', lines[li]):
-                tbl.append(lines[li])
-                li += 1
-            box = _render_table_box(tbl)
-            if box != '\n'.join(tbl):
-                code_blocks.append(box)
-                rebuilt.append(f"\x00CB{len(code_blocks) - 1}\x00")
-            else:
-                rebuilt.extend(tbl)
+
+def _render_pre_block(lines: list[str]) -> str:
+    body = "\n".join(line.rstrip() for line in lines if line is not None).strip()
+    return f"<pre>{_escape_pre_html(body or '...')}</pre>"
+
+
+def _sanitize_not_triggered(text: str) -> str:
+    raw = _normalize_whitespace(text)
+    lowered = raw.lower()
+    if "threshold=" in lowered:
+        metrics = {key: value for key, value in re.findall(r"([a-z_]+)=([0-9]+)", raw)}
+        current = metrics.get("last_prompt_tokens") or metrics.get("current_tokens") or "n/a"
+        threshold = metrics.get("threshold") or "n/a"
+        return f"below summarize threshold ({current}/{threshold} tokens)"
+    if "usage_unavailable" in lowered:
+        return "usage metrics unavailable"
+    if "not enough new messages" in lowered:
+        return "not enough new messages"
+    if "empty slice" in lowered:
+        return "nothing new to summarize"
+    return raw.removeprefix("not_triggered:").strip() or "not triggered"
+
+
+def _format_post_turn_value(status: str, detail: str) -> str:
+    clean = _normalize_whitespace(detail)
+    if status == "started":
+        return "pending"
+    if status == "running":
+        return clean or "running"
+    if status == "not_triggered":
+        return _sanitize_not_triggered(clean)
+    if status in {"failed", "error", "retry", "skipped"}:
+        message = clean.removeprefix(f"{status}:").strip() or status
+        return f"{status}: {message}"
+    return clean or status or "done"
+
+
+def _progress_stage_icon(stage: str, status: str = "") -> str:
+    if stage == "Pre-search":
+        return "🔎"
+    if stage == "Thinking":
+        return "🧠"
+    if stage == "Turn complete":
+        return "✅"
+    if status in {"failed", "error"}:
+        return "❌"
+    if status in {"retry", "skipped", "not_triggered"}:
+        return "⚠️"
+    return "✨"
+
+
+def _progress_fingerprint(event: dict) -> str:
+    return "|".join(
+        [
+            str(event.get("event", "")),
+            str(event.get("stage", "")),
+            str(event.get("status", "")),
+            str(event.get("tool_name", "")),
+            _normalize_whitespace(str(event.get("arguments_preview", "") or event.get("content", ""))),
+        ]
+    )
+
+
+def _format_progress_line(event: dict) -> str | None:
+    event_type = str(event.get("event", "stage") or "stage")
+    stage = str(event.get("stage", "") or "")
+    status = str(event.get("status", "running") or "running")
+    content = str(event.get("content", "") or "").strip()
+    extra = event.get("extra") if isinstance(event.get("extra"), dict) else {}
+
+    if event_type == "tool":
+        if status not in {"running", "started"}:
+            return None
+        preview = str(event.get("arguments_preview", "") or event.get("tool_name", "")).strip()
+        return f"🔧 {preview}" if preview else None
+
+    if stage in POST_TURN_STAGES or stage == "Draft ready":
+        return None
+
+    if stage == "Pre-search":
+        stores = extra.get("used_stores") if isinstance(extra.get("used_stores"), list) else []
+        count = int(extra.get("count", 0) or 0)
+        confidence = float(extra.get("confidence", 0.0) or 0.0)
+        stores_text = ",".join(str(item) for item in stores) if stores else "-"
+        return f"🔎 memory: stores={stores_text} | results={count} | confidence={confidence:.2f}"
+
+    if stage == "Thinking":
+        text = _normalize_whitespace(content)
+        if not text:
+            return None
+        if text.lower() == "running main loop":
+            return "🤖 running main loop"
+        return f"🧠 {text}"
+
+    if stage == "Turn complete":
+        return "✅ turn complete"
+
+    label = stage or "stage"
+    detail = _normalize_whitespace(content)
+    if detail.lower() == label.lower():
+        detail = ""
+    icon = _progress_stage_icon(stage, status=status)
+    return f"{icon} {label}: {detail}".rstrip(": ")
+
+
+def _split_pre_lines(lines: list[str], max_len: int = TELEGRAM_RENDER_LIMIT) -> list[str]:
+    if not lines:
+        return [_render_pre_block(["..."])]
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    for line in lines:
+        if len(_render_pre_block([line])) > max_len:
+            for piece in split_message(line, max_len=max(400, max_len - 32)):
+                if current:
+                    chunks.append(current)
+                    current = []
+                chunks.append([piece])
+            continue
+        candidate = current + [line]
+        if current and len(_render_pre_block(candidate)) > max_len:
+            chunks.append(current)
+            current = [line]
         else:
-            rebuilt.append(lines[li])
-            li += 1
-    text = '\n'.join(rebuilt)
+            current = candidate
+    if current:
+        chunks.append(current)
+    return [_render_pre_block(chunk) for chunk in chunks if chunk]
 
-    # 2. Extract and protect inline code
-    inline_codes: list[str] = []
-    def save_inline_code(m: re.Match) -> str:
-        inline_codes.append(m.group(1))
-        return f"\x00IC{len(inline_codes) - 1}\x00"
 
-    text = re.sub(r'`([^`]+)`', save_inline_code, text)
+def _escape_markdown_v2_text(text: str) -> str:
+    return escape_markdown(text, version=2)
 
-    # 3. Headers # Title -> just the title text
-    text = re.sub(r'^#{1,6}\s+(.+)$', r'\1', text, flags=re.MULTILINE)
 
-    # 4. Blockquotes > text -> just the text (before HTML escaping)
-    text = re.sub(r'^>\s*(.*)$', r'\1', text, flags=re.MULTILINE)
+def _escape_markdown_v2_url(url: str) -> str:
+    return url.replace("\\", "\\\\").replace(")", "\\)")
 
-    # 5. Escape HTML special characters
-    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    # 6. Links [text](url) - must be before bold/italic to handle nested cases
-    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
+def _render_markdown_v2_inline(text: str) -> str:
+    placeholders: dict[str, str] = {}
 
-    # 7. Bold **text** or __text__
-    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
-    text = re.sub(r'__(.+?)__', r'<b>\1</b>', text)
+    def store(value: str) -> str:
+        token = f"\x00TG{len(placeholders)}\x00"
+        placeholders[token] = value
+        return token
 
-    # 8. Italic _text_ (avoid matching inside words like some_var_name)
-    text = re.sub(r'(?<![a-zA-Z0-9])_([^_]+)_(?![a-zA-Z0-9])', r'<i>\1</i>', text)
+    def replace_inline_code(match: re.Match) -> str:
+        code = escape_markdown(match.group(1), version=2, entity_type="code")
+        return store(f"`{code}`")
 
-    # 9. Strikethrough ~~text~~
-    text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
+    def replace_link(match: re.Match) -> str:
+        label = _escape_markdown_v2_text(match.group(1))
+        url = _escape_markdown_v2_url(match.group(2).strip())
+        return store(f"[{label}]({url})")
 
-    # 10. Bullet lists - item -> • item
-    text = re.sub(r'^[-*]\s+', '• ', text, flags=re.MULTILINE)
+    def replace_bold(match: re.Match) -> str:
+        return store(f"*{_escape_markdown_v2_text(match.group(1))}*")
 
-    # 11. Restore inline code with HTML tags
-    for i, code in enumerate(inline_codes):
-        # Escape HTML in code content
-        escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        text = text.replace(f"\x00IC{i}\x00", f"<code>{escaped}</code>")
+    def replace_italic(match: re.Match) -> str:
+        return store(f"_{_escape_markdown_v2_text(match.group(1))}_")
 
-    # 12. Restore code blocks with HTML tags
-    for i, code in enumerate(code_blocks):
-        # Escape HTML in code content
-        escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        text = text.replace(f"\x00CB{i}\x00", f"<pre><code>{escaped}</code></pre>")
+    def replace_strike(match: re.Match) -> str:
+        return store(f"~{_escape_markdown_v2_text(match.group(1))}~")
 
-    return text
+    text = re.sub(r"`([^`]+)`", replace_inline_code, text)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", replace_link, text)
+    text = re.sub(r"\*\*(.+?)\*\*", replace_bold, text)
+    text = re.sub(r"__(.+?)__", replace_bold, text)
+    text = re.sub(r"~~(.+?)~~", replace_strike, text)
+    text = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", replace_italic, text)
+    text = re.sub(
+        r"(?m)^#{1,6}\s+(.+)$",
+        lambda match: store(f"*{_escape_markdown_v2_text(match.group(1).strip())}*"),
+        text,
+    )
+    escaped = _escape_markdown_v2_text(text)
+    for token, value in placeholders.items():
+        escaped = escaped.replace(_escape_markdown_v2_text(token), value)
+    return escaped
+
+
+def _split_markdown_blocks(text: str) -> list[tuple[str, str, str]]:
+    blocks: list[tuple[str, str, str]] = []
+    pattern = re.compile(r"```([\w+-]*)\n?([\s\S]*?)```", re.MULTILINE)
+    last = 0
+    for match in pattern.finditer(text):
+        if match.start() > last:
+            prose = text[last:match.start()]
+            if prose.strip():
+                blocks.append(("text", "", prose))
+        blocks.append(("code", match.group(1) or "", match.group(2)))
+        last = match.end()
+    tail = text[last:]
+    if tail.strip():
+        blocks.append(("text", "", tail))
+    return blocks or [("text", "", text)]
+
+
+def _render_code_block_markdown_v2(language: str, text: str) -> str:
+    escaped = escape_markdown(text, version=2, entity_type="pre")
+    return f"```{language}\n{escaped}\n```"
+
+
+def _split_markdown_v2_message(text: str, max_len: int = TELEGRAM_RENDER_LIMIT) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+    for kind, language, raw in _split_markdown_blocks(text):
+        if kind == "code":
+            lines = raw.splitlines() or [""]
+            segment_lines: list[str] = []
+            for line in lines:
+                candidate_lines = segment_lines + [line]
+                rendered_candidate = _render_code_block_markdown_v2(language, "\n".join(candidate_lines))
+                if segment_lines and len(rendered_candidate) > max_len:
+                    rendered = _render_code_block_markdown_v2(language, "\n".join(segment_lines))
+                    if current and len(current) + 2 + len(rendered) <= max_len:
+                        current = f"{current}\n\n{rendered}"
+                    else:
+                        if current:
+                            chunks.append(current)
+                        current = rendered
+                    segment_lines = [line]
+                else:
+                    segment_lines = candidate_lines
+            if segment_lines:
+                rendered = _render_code_block_markdown_v2(language, "\n".join(segment_lines))
+                if current and len(current) + 2 + len(rendered) <= max_len:
+                    current = f"{current}\n\n{rendered}"
+                else:
+                    if current:
+                        chunks.append(current)
+                    current = rendered
+            continue
+
+        paragraphs = [segment for segment in re.split(r"\n{2,}", raw) if segment.strip()]
+        for paragraph in paragraphs:
+            lines = paragraph.splitlines() or [paragraph]
+            rolling = ""
+            rendered_parts: list[str] = []
+            for line in lines:
+                candidate = f"{rolling}\n{line}".strip() if rolling else line
+                rendered_candidate = _render_markdown_v2_inline(candidate)
+                if rolling and len(rendered_candidate) > max_len:
+                    rendered_parts.append(_render_markdown_v2_inline(rolling))
+                    rolling = line
+                elif not rolling and len(rendered_candidate) > max_len:
+                    for piece in split_message(line, max_len=max(300, max_len - 16)):
+                        rendered_parts.append(_render_markdown_v2_inline(piece))
+                    rolling = ""
+                else:
+                    rolling = candidate
+            if rolling:
+                rendered_parts.append(_render_markdown_v2_inline(rolling))
+            for part in rendered_parts:
+                if current and len(current) + 2 + len(part) <= max_len:
+                    current = f"{current}\n\n{part}"
+                else:
+                    if current:
+                        chunks.append(current)
+                    current = part
+    if current:
+        chunks.append(current)
+    return chunks or [_render_markdown_v2_inline(text)]
 
 
 class TelegramChannel(BaseChannel):
@@ -156,7 +376,6 @@ class TelegramChannel(BaseChannel):
 
     name = "telegram"
 
-    # Commands registered with Telegram's command menu
     BOT_COMMANDS = [
         BotCommand("start", "Start the bot"),
         BotCommand("new", "Start a new conversation"),
@@ -174,11 +393,12 @@ class TelegramChannel(BaseChannel):
         self.config: TelegramConfig = config
         self.groq_api_key = groq_api_key
         self._app: Application | None = None
-        self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
-        self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
+        self._chat_ids: dict[str, int] = {}
+        self._typing_tasks: dict[str, asyncio.Task] = {}
         self._media_group_buffers: dict[str, dict] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
         self._message_threads: dict[tuple[str, int], int] = {}
+        self._turn_states: dict[tuple[str, int | None, int | None], _TelegramTurnState] = {}
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
@@ -206,8 +426,6 @@ class TelegramChannel(BaseChannel):
             return
 
         self._running = True
-
-        # Build the application with larger connection pool to avoid pool-timeout on long runs
         req = HTTPXRequest(
             connection_pool_size=16,
             pool_timeout=5.0,
@@ -219,44 +437,36 @@ class TelegramChannel(BaseChannel):
         self._app = builder.build()
         self._app.add_error_handler(self._on_error)
 
-        # Add command handlers
         self._app.add_handler(CommandHandler("start", self._on_start))
         self._app.add_handler(CommandHandler("new", self._forward_command))
         self._app.add_handler(CommandHandler("stop", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
-
-        # Add message handler for text, photos, voice, documents
         self._app.add_handler(
             MessageHandler(
                 (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL)
                 & ~filters.COMMAND,
-                self._on_message
+                self._on_message,
             )
         )
 
         logger.info("Starting Telegram bot (polling mode)...")
-
-        # Initialize and start polling
         await self._app.initialize()
         await self._app.start()
 
-        # Get bot info and register command menu
         bot_info = await self._app.bot.get_me()
         logger.info("Telegram bot @{} connected", bot_info.username)
 
         try:
             await self._app.bot.set_my_commands(self.BOT_COMMANDS)
             logger.debug("Telegram bot commands registered")
-        except Exception as e:
-            logger.warning("Failed to register bot commands: {}", e)
+        except Exception as exc:
+            logger.warning("Failed to register bot commands: {}", exc)
 
-        # Start polling (this runs until stopped)
         await self._app.updater.start_polling(
             allowed_updates=["message"],
-            drop_pending_updates=True  # Ignore old messages on startup
+            drop_pending_updates=True,
         )
 
-        # Keep running until stopped
         while self._running:
             await asyncio.sleep(1)
 
@@ -264,7 +474,6 @@ class TelegramChannel(BaseChannel):
         """Stop the Telegram bot."""
         self._running = False
 
-        # Cancel all typing indicators
         for chat_id in list(self._typing_tasks):
             self._stop_typing(chat_id)
 
@@ -272,6 +481,7 @@ class TelegramChannel(BaseChannel):
             task.cancel()
         self._media_group_tasks.clear()
         self._media_group_buffers.clear()
+        self._turn_states.clear()
 
         if self._app:
             logger.info("Stopping Telegram bot...")
@@ -292,13 +502,157 @@ class TelegramChannel(BaseChannel):
             return "audio"
         return "document"
 
+    @staticmethod
+    def _turn_key(chat_id: str, message_thread_id: int | None, reply_to_message_id: int | None) -> tuple[str, int | None, int | None]:
+        return (chat_id, message_thread_id, reply_to_message_id)
+
+    async def _send_html_message(
+        self,
+        *,
+        chat_id: int,
+        html: str,
+        reply_params=None,
+        thread_kwargs: dict | None = None,
+    ) -> int | None:
+        message = await self._app.bot.send_message(
+            chat_id=chat_id,
+            text=html,
+            parse_mode=ParseMode.HTML,
+            reply_parameters=reply_params,
+            **(thread_kwargs or {}),
+        )
+        return getattr(message, "message_id", None)
+
+    async def _edit_html_message(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        html: str,
+    ) -> None:
+        await self._app.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=html,
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _send_markdown_v2_chunks(
+        self,
+        *,
+        chat_id: int,
+        text: str,
+        reply_params=None,
+        thread_kwargs: dict | None = None,
+    ) -> list[int | None]:
+        message_ids: list[int | None] = []
+        for chunk in _split_markdown_v2_message(text, TELEGRAM_RENDER_LIMIT):
+            message = await self._app.bot.send_message(
+                chat_id=chat_id,
+                text=chunk,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_parameters=reply_params,
+                **(thread_kwargs or {}),
+            )
+            message_ids.append(getattr(message, "message_id", None))
+        return message_ids
+
+    async def _flush_archived_progress(
+        self,
+        *,
+        state: _TelegramTurnState,
+        chat_id: int,
+        reply_params,
+        thread_kwargs: dict,
+    ) -> None:
+        if not state.archived_progress_lines:
+            return
+        for html in _split_pre_lines(state.archived_progress_lines, TELEGRAM_RENDER_LIMIT):
+            await self._send_html_message(
+                chat_id=chat_id,
+                html=html,
+                reply_params=reply_params,
+                thread_kwargs=thread_kwargs,
+            )
+        state.archived_progress_lines.clear()
+
+    async def _send_progress_update(
+        self,
+        *,
+        state: _TelegramTurnState,
+        chat_id: int,
+        line: str,
+        reply_params,
+        thread_kwargs: dict,
+    ) -> None:
+        if state.progress_lines and state.progress_lines[-1] == line:
+            return
+
+        state.progress_lines.append(line)
+        while len(_render_pre_block(state.progress_lines)) > TELEGRAM_RENDER_LIMIT and len(state.progress_lines) > 1:
+            state.archived_progress_lines.append(state.progress_lines.pop(0))
+        if state.archived_progress_lines:
+            await self._flush_archived_progress(
+                state=state,
+                chat_id=chat_id,
+                reply_params=reply_params,
+                thread_kwargs=thread_kwargs,
+            )
+
+        current_html = _render_pre_block(state.progress_lines)
+        if state.progress_message_id is None:
+            state.progress_message_id = await self._send_html_message(
+                chat_id=chat_id,
+                html=current_html,
+                reply_params=reply_params,
+                thread_kwargs=thread_kwargs,
+            )
+        else:
+            await self._edit_html_message(
+                chat_id=chat_id,
+                message_id=state.progress_message_id,
+                html=current_html,
+            )
+
+    async def _send_or_update_post_turn_summary(
+        self,
+        *,
+        state: _TelegramTurnState,
+        chat_id: int,
+        reply_params,
+        thread_kwargs: dict,
+    ) -> None:
+        lines = ["Post-turn memory"]
+        for stage in (
+            "Saving file memory",
+            "Building graph",
+            "Writing vectors",
+            "Summarizing session",
+        ):
+            value = state.post_turn_summary.get(stage, "pending")
+            lines.append(f"{POST_TURN_ICONS[stage]} {POST_TURN_LABELS[stage]}: {value}")
+
+        html = _render_pre_block(lines)
+        if state.post_turn_message_id is None:
+            state.post_turn_message_id = await self._send_html_message(
+                chat_id=chat_id,
+                html=html,
+                reply_params=reply_params,
+                thread_kwargs=thread_kwargs,
+            )
+        else:
+            await self._edit_html_message(
+                chat_id=chat_id,
+                message_id=state.post_turn_message_id,
+                html=html,
+            )
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Telegram."""
         if not self._app:
             logger.warning("Telegram bot not running")
             return
 
-        # Only stop typing indicator for final responses
         if not msg.metadata.get("_progress", False):
             self._stop_typing(msg.chat_id)
 
@@ -307,23 +661,22 @@ class TelegramChannel(BaseChannel):
         except ValueError:
             logger.error("Invalid chat_id: {}", msg.chat_id)
             return
+
         reply_to_message_id = msg.metadata.get("message_id")
         message_thread_id = msg.metadata.get("message_thread_id")
         if message_thread_id is None and reply_to_message_id is not None:
             message_thread_id = self._message_threads.get((msg.chat_id, reply_to_message_id))
-        thread_kwargs = {}
-        if message_thread_id is not None:
-            thread_kwargs["message_thread_id"] = message_thread_id
-
+        thread_kwargs = {"message_thread_id": message_thread_id} if message_thread_id is not None else {}
         reply_params = None
-        if self.config.reply_to_message:
-            if reply_to_message_id:
-                reply_params = ReplyParameters(
-                    message_id=reply_to_message_id,
-                    allow_sending_without_reply=True
-                )
+        if self.config.reply_to_message and reply_to_message_id:
+            reply_params = ReplyParameters(
+                message_id=reply_to_message_id,
+                allow_sending_without_reply=True,
+            )
 
-        # Send media files
+        turn_key = self._turn_key(msg.chat_id, message_thread_id, reply_to_message_id)
+        state = self._turn_states.setdefault(turn_key, _TelegramTurnState())
+
         for media_path in (msg.media or []):
             try:
                 media_type = self._get_media_type(media_path)
@@ -333,16 +686,16 @@ class TelegramChannel(BaseChannel):
                     "audio": self._app.bot.send_audio,
                 }.get(media_type, self._app.bot.send_document)
                 param = "photo" if media_type == "photo" else media_type if media_type in ("voice", "audio") else "document"
-                with open(media_path, 'rb') as f:
+                with open(media_path, "rb") as file_obj:
                     await sender(
                         chat_id=chat_id,
-                        **{param: f},
+                        **{param: file_obj},
                         reply_parameters=reply_params,
                         **thread_kwargs,
                     )
-            except Exception as e:
+            except Exception as exc:
                 filename = media_path.rsplit("/", 1)[-1]
-                logger.error("Failed to send media {}: {}", media_path, e)
+                logger.error("Failed to send media {}: {}", media_path, exc)
                 await self._app.bot.send_message(
                     chat_id=chat_id,
                     text=f"[Failed to send: {filename}]",
@@ -350,67 +703,54 @@ class TelegramChannel(BaseChannel):
                     **thread_kwargs,
                 )
 
-        # Send text content
-        if msg.content and msg.content != "[empty message]":
-            is_progress = msg.metadata.get("_progress", False)
+        if not msg.content or msg.content == "[empty message]":
+            return
 
-            for chunk in split_message(msg.content, TELEGRAM_MAX_MESSAGE_LEN):
-                # Final response: simulate streaming via draft, then persist
-                if not is_progress:
-                    await self._send_with_streaming(chat_id, chunk, reply_params, thread_kwargs)
-                else:
-                    await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
+        if msg.metadata.get("_progress", False):
+            event = dict(msg.metadata.get("_progress_event") or {})
+            fingerprint = _progress_fingerprint(event)
+            if fingerprint == state.last_progress_fingerprint:
+                return
+            state.last_progress_fingerprint = fingerprint
+            stage = str(event.get("stage", "") or "")
+            status = str(event.get("status", "running") or "running")
+            content = str(event.get("content", msg.content) or msg.content)
+            if stage in POST_TURN_STAGES:
+                state.post_turn_summary[stage] = _format_post_turn_value(status, content)
+                if state.final_sent:
+                    await self._send_or_update_post_turn_summary(
+                        state=state,
+                        chat_id=chat_id,
+                        reply_params=reply_params,
+                        thread_kwargs=thread_kwargs,
+                    )
+                return
 
-    async def _send_text(
-        self,
-        chat_id: int,
-        text: str,
-        reply_params=None,
-        thread_kwargs: dict | None = None,
-    ) -> None:
-        """Send a plain text message with HTML fallback."""
-        try:
-            html = _markdown_to_telegram_html(text)
-            await self._app.bot.send_message(
-                chat_id=chat_id, text=html, parse_mode="HTML",
-                reply_parameters=reply_params,
-                **(thread_kwargs or {}),
-            )
-        except Exception as e:
-            logger.warning("HTML parse failed, falling back to plain text: {}", e)
-            try:
-                await self._app.bot.send_message(
+            line = _format_progress_line({**event, "content": content})
+            if line:
+                await self._send_progress_update(
+                    state=state,
                     chat_id=chat_id,
-                    text=text,
-                    reply_parameters=reply_params,
-                    **(thread_kwargs or {}),
+                    line=line,
+                    reply_params=reply_params,
+                    thread_kwargs=thread_kwargs,
                 )
-            except Exception as e2:
-                logger.error("Error sending Telegram message: {}", e2)
+            return
 
-    async def _send_with_streaming(
-        self,
-        chat_id: int,
-        text: str,
-        reply_params=None,
-        thread_kwargs: dict | None = None,
-    ) -> None:
-        """Simulate streaming via send_message_draft, then persist with send_message."""
-        draft_id = int(time.time() * 1000) % (2**31)
-        try:
-            step = max(len(text) // 8, 40)
-            for i in range(step, len(text), step):
-                await self._app.bot.send_message_draft(
-                    chat_id=chat_id, draft_id=draft_id, text=text[:i],
-                )
-                await asyncio.sleep(0.04)
-            await self._app.bot.send_message_draft(
-                chat_id=chat_id, draft_id=draft_id, text=text,
+        state.final_sent = True
+        await self._send_markdown_v2_chunks(
+            chat_id=chat_id,
+            text=msg.content,
+            reply_params=reply_params,
+            thread_kwargs=thread_kwargs,
+        )
+        if state.post_turn_summary:
+            await self._send_or_update_post_turn_summary(
+                state=state,
+                chat_id=chat_id,
+                reply_params=reply_params,
+                thread_kwargs=thread_kwargs,
             )
-            await asyncio.sleep(0.15)
-        except Exception:
-            pass
-        await self._send_text(chat_id, text, reply_params, thread_kwargs)
 
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""
@@ -497,26 +837,21 @@ class TelegramChannel(BaseChannel):
         chat_id = message.chat_id
         sender_id = self._sender_id(user)
         self._remember_thread_context(message)
-
-        # Store chat_id for replies
         self._chat_ids[sender_id] = chat_id
 
-        # Build content from text and/or media
         content_parts = []
         media_paths = []
 
-        # Text content
         if message.text:
             content_parts.append(message.text)
         if message.caption:
             content_parts.append(message.caption)
 
-        # Handle media files
         media_file = None
         media_type = None
 
         if message.photo:
-            media_file = message.photo[-1]  # Largest photo
+            media_file = message.photo[-1]
             media_type = "image"
         elif message.voice:
             media_file = message.voice
@@ -528,25 +863,22 @@ class TelegramChannel(BaseChannel):
             media_file = message.document
             media_type = "file"
 
-        # Download media if present
         if media_file and self._app:
             try:
                 file = await self._app.bot.get_file(media_file.file_id)
                 ext = self._get_extension(
                     media_type,
-                    getattr(media_file, 'mime_type', None),
-                    getattr(media_file, 'file_name', None),
+                    getattr(media_file, "mime_type", None),
+                    getattr(media_file, "file_name", None),
                 )
                 media_dir = get_media_dir("telegram")
-
                 file_path = media_dir / f"{media_file.file_id[:16]}{ext}"
                 await file.download_to_drive(str(file_path))
 
                 media_paths.append(str(file_path))
-
-                # Handle voice transcription
-                if media_type == "voice" or media_type == "audio":
+                if media_type in {"voice", "audio"}:
                     from fagent.providers.transcription import GroqTranscriptionProvider
+
                     transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
                     transcription = await transcriber.transcribe(file_path)
                     if transcription:
@@ -556,27 +888,26 @@ class TelegramChannel(BaseChannel):
                         content_parts.append(f"[{media_type}: {file_path}]")
                 else:
                     content_parts.append(f"[{media_type}: {file_path}]")
-
                 logger.debug("Downloaded {} to {}", media_type, file_path)
-            except Exception as e:
-                logger.error("Failed to download media: {}", e)
+            except Exception as exc:
+                logger.error("Failed to download media: {}", exc)
                 content_parts.append(f"[{media_type}: download failed]")
 
         content = "\n".join(content_parts) if content_parts else "[empty message]"
-
         logger.debug("Telegram message from {}: {}...", sender_id, content[:50])
 
         str_chat_id = str(chat_id)
         metadata = self._build_message_metadata(message, user)
         session_key = self._derive_topic_session_key(message)
 
-        # Telegram media groups: buffer briefly, forward as one aggregated turn.
         if media_group_id := getattr(message, "media_group_id", None):
             key = f"{str_chat_id}:{media_group_id}"
             if key not in self._media_group_buffers:
                 self._media_group_buffers[key] = {
-                    "sender_id": sender_id, "chat_id": str_chat_id,
-                    "contents": [], "media": [],
+                    "sender_id": sender_id,
+                    "chat_id": str_chat_id,
+                    "contents": [],
+                    "media": [],
                     "metadata": metadata,
                     "session_key": session_key,
                 }
@@ -589,10 +920,7 @@ class TelegramChannel(BaseChannel):
                 self._media_group_tasks[key] = asyncio.create_task(self._flush_media_group(key))
             return
 
-        # Start typing indicator before processing
         self._start_typing(str_chat_id)
-
-        # Forward to the message bus
         await self._handle_message(
             sender_id=sender_id,
             chat_id=str_chat_id,
@@ -610,8 +938,10 @@ class TelegramChannel(BaseChannel):
                 return
             content = "\n".join(buf["contents"]) or "[empty message]"
             await self._handle_message(
-                sender_id=buf["sender_id"], chat_id=buf["chat_id"],
-                content=content, media=list(dict.fromkeys(buf["media"])),
+                sender_id=buf["sender_id"],
+                chat_id=buf["chat_id"],
+                content=content,
+                media=list(dict.fromkeys(buf["media"])),
                 metadata=buf["metadata"],
                 session_key=buf.get("session_key"),
             )
@@ -620,7 +950,6 @@ class TelegramChannel(BaseChannel):
 
     def _start_typing(self, chat_id: str) -> None:
         """Start sending 'typing...' indicator for a chat."""
-        # Cancel any existing typing task for this chat
         self._stop_typing(chat_id)
         self._typing_tasks[chat_id] = asyncio.create_task(self._typing_loop(chat_id))
 
@@ -638,8 +967,8 @@ class TelegramChannel(BaseChannel):
                 await asyncio.sleep(4)
         except asyncio.CancelledError:
             pass
-        except Exception as e:
-            logger.debug("Typing indicator stopped for {}: {}", chat_id, e)
+        except Exception as exc:
+            logger.debug("Typing indicator stopped for {}: {}", chat_id, exc)
 
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Log polling / handler errors instead of silently swallowing them."""
@@ -654,8 +983,12 @@ class TelegramChannel(BaseChannel):
         """Get file extension based on media type or original filename."""
         if mime_type:
             ext_map = {
-                "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
-                "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/mp4": ".m4a",
+                "image/jpeg": ".jpg",
+                "image/png": ".png",
+                "image/gif": ".gif",
+                "audio/ogg": ".ogg",
+                "audio/mpeg": ".mp3",
+                "audio/mp4": ".m4a",
             }
             if mime_type in ext_map:
                 return ext_map[mime_type]
