@@ -248,6 +248,27 @@ class AgentLoop:
             return tool_name
         return f'{tool_name}("{val[:40]}...")' if len(val) > 40 else f'{tool_name}("{val}")'
 
+    @staticmethod
+    def _extract_skill_read(tool_name: str, arguments: dict[str, Any] | list[Any] | None) -> str | None:
+        if tool_name != "read_file":
+            return None
+        args = (arguments[0] if isinstance(arguments, list) and arguments else arguments) or {}
+        if not isinstance(args, dict):
+            return None
+        raw_path = args.get("path")
+        if not isinstance(raw_path, str) or not raw_path.endswith("SKILL.md"):
+            return None
+        normalized = raw_path.replace("\\", "/")
+        parts = [p for p in normalized.split("/") if p]
+        try:
+            idx = len(parts) - 1 - parts[::-1].index("skills")
+        except ValueError:
+            return None
+        skill_parts = parts[idx + 1 : -1]
+        if not skill_parts:
+            return None
+        return "/".join(skill_parts)
+
     async def _emit_progress(
         self,
         callback: Callable[..., Awaitable[None]] | None,
@@ -298,6 +319,7 @@ class AgentLoop:
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        skill_reads: list[str] = []
         usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         max_prompt_tokens = 0
         last_prompt_tokens = 0
@@ -349,6 +371,12 @@ class AgentLoop:
 
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
+                    if skill_read := self._extract_skill_read(tool_call.name, tool_call.arguments):
+                        if skill_read not in skill_reads:
+                            skill_reads.append(skill_read)
+                            if message_tool := self.tools.get("message"):
+                                if isinstance(message_tool, MessageTool):
+                                    message_tool.set_turn_metadata({"_skill_reads": list(skill_reads)})
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
                     preview = self._tool_preview(tool_call.name, tool_call.arguments)
@@ -421,7 +449,7 @@ class AgentLoop:
         usage_totals["last_prompt_tokens"] = last_prompt_tokens
         usage_totals["max_prompt_tokens"] = max_prompt_tokens
         usage_totals["usage_seen"] = 1 if usage_seen else 0
-        return final_content, tools_used, messages, usage_totals, tool_call_count
+        return final_content, tools_used, skill_reads, messages, usage_totals, tool_call_count
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -540,7 +568,7 @@ class AgentLoop:
                 chat_id=chat_id,
             )
             await self._emit_progress(on_progress, "Running main loop", stage="Thinking", status="started")
-            final_content, tools_used, all_msgs, usage_totals, tool_call_count = await self._run_agent_loop(
+            final_content, tools_used, skill_reads, all_msgs, usage_totals, tool_call_count = await self._run_agent_loop(
                 messages,
                 on_progress=on_progress,
             )
@@ -560,8 +588,12 @@ class AgentLoop:
                 on_progress=on_progress,
             )
             await self._emit_progress(on_progress, "Turn complete", stage="Turn complete", status="done")
-            return OutboundMessage(channel=channel, chat_id=chat_id,
-                                  content=final_content or "Background task completed.")
+            return OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content=final_content or "Background task completed.",
+                metadata={"_skill_reads": skill_reads},
+            )
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
@@ -642,6 +674,7 @@ class AgentLoop:
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
+                message_tool.set_turn_metadata({})
 
         async def _bus_progress(content: str, **kwargs: Any) -> None:
             meta = dict(msg.metadata or {})
@@ -688,7 +721,7 @@ class AgentLoop:
         )
 
         await self._emit_progress(on_progress or _bus_progress, "Running main loop", stage="Thinking", status="started")
-        final_content, tools_used, all_msgs, usage_totals, tool_call_count = await self._run_agent_loop(
+        final_content, tools_used, skill_reads, all_msgs, usage_totals, tool_call_count = await self._run_agent_loop(
             initial_messages, on_progress=on_progress or _bus_progress,
         )
 
@@ -717,9 +750,14 @@ class AgentLoop:
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+        meta = dict(msg.metadata or {})
+        if skill_reads:
+            meta["_skill_reads"] = skill_reads
         return OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-            metadata=msg.metadata or {},
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=final_content,
+            metadata=meta,
         )
 
     def _update_session_usage(self, session: Session, usage_totals: dict[str, int]) -> None:

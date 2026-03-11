@@ -244,7 +244,7 @@ def _render_markdown_v2_inline(text: str) -> str:
     placeholders: dict[str, str] = {}
 
     def store(value: str) -> str:
-        token = f"\x00TG{len(placeholders)}\x00"
+        token = f"FAGENTTGPLACEHOLDER{len(placeholders)}X"
         placeholders[token] = value
         return token
 
@@ -303,6 +303,23 @@ def _split_markdown_blocks(text: str) -> list[tuple[str, str, str]]:
 def _render_code_block_markdown_v2(language: str, text: str) -> str:
     escaped = escape_markdown(text, version=2, entity_type="pre")
     return f"```{language}\n{escaped}\n```"
+
+
+def _prepend_skill_reads(text: str, skill_reads: list[str] | None) -> str:
+    items = []
+    seen: set[str] = set()
+    for item in skill_reads or []:
+        if not isinstance(item, str):
+            continue
+        clean = item.strip().strip("/")
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        items.append(clean)
+    if not items:
+        return text
+    block = "Skills read:\n" + "\n".join(f"- {item}" for item in items)
+    return f"{block}\n\n{text}" if text else block
 
 
 def _split_markdown_v2_message(text: str, max_len: int = TELEGRAM_RENDER_LIMIT) -> list[str]:
@@ -738,9 +755,10 @@ class TelegramChannel(BaseChannel):
             return
 
         state.final_sent = True
+        final_text = _prepend_skill_reads(msg.content, msg.metadata.get("_skill_reads"))
         await self._send_markdown_v2_chunks(
             chat_id=chat_id,
-            text=msg.content,
+            text=final_text,
             reply_params=reply_params,
             thread_kwargs=thread_kwargs,
         )
