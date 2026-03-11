@@ -241,46 +241,48 @@ def _escape_markdown_v2_url(url: str) -> str:
 
 
 def _render_markdown_v2_inline(text: str) -> str:
-    placeholders: dict[str, str] = {}
+    normalized_lines: list[str] = []
+    for line in text.splitlines():
+        heading = re.match(r"^#{1,6}\s+(.+)$", line)
+        if heading:
+            normalized_lines.append(f"**{heading.group(1).strip()}**")
+        else:
+            normalized_lines.append(line)
+    normalized = "\n".join(normalized_lines)
 
-    def store(value: str) -> str:
-        token = f"FAGENTTGPLACEHOLDER{len(placeholders)}X"
-        placeholders[token] = value
-        return token
-
-    def replace_inline_code(match: re.Match) -> str:
-        code = escape_markdown(match.group(1), version=2, entity_type="code")
-        return store(f"`{code}`")
-
-    def replace_link(match: re.Match) -> str:
-        label = _escape_markdown_v2_text(match.group(1))
-        url = _escape_markdown_v2_url(match.group(2).strip())
-        return store(f"[{label}]({url})")
-
-    def replace_bold(match: re.Match) -> str:
-        return store(f"*{_escape_markdown_v2_text(match.group(1))}*")
-
-    def replace_italic(match: re.Match) -> str:
-        return store(f"_{_escape_markdown_v2_text(match.group(1))}_")
-
-    def replace_strike(match: re.Match) -> str:
-        return store(f"~{_escape_markdown_v2_text(match.group(1))}~")
-
-    text = re.sub(r"`([^`]+)`", replace_inline_code, text)
-    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", replace_link, text)
-    text = re.sub(r"\*\*(.+?)\*\*", replace_bold, text)
-    text = re.sub(r"__(.+?)__", replace_bold, text)
-    text = re.sub(r"~~(.+?)~~", replace_strike, text)
-    text = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", replace_italic, text)
-    text = re.sub(
-        r"(?m)^#{1,6}\s+(.+)$",
-        lambda match: store(f"*{_escape_markdown_v2_text(match.group(1).strip())}*"),
-        text,
+    pattern = re.compile(
+        r"`([^`]+)`"
+        r"|\[([^\]]+)\]\(([^)]+)\)"
+        r"|\*\*(.+?)\*\*"
+        r"|__(.+?)__"
+        r"|~~(.+?)~~"
+        r"|(?<!\w)_([^_\n]+)_(?!\w)"
     )
-    escaped = _escape_markdown_v2_text(text)
-    for token, value in placeholders.items():
-        escaped = escaped.replace(_escape_markdown_v2_text(token), value)
-    return escaped
+
+    parts: list[str] = []
+    last = 0
+    for match in pattern.finditer(normalized):
+        if match.start() > last:
+            parts.append(_escape_markdown_v2_text(normalized[last:match.start()]))
+        if match.group(1) is not None:
+            code = escape_markdown(match.group(1), version=2, entity_type="code")
+            parts.append(f"`{code}`")
+        elif match.group(2) is not None and match.group(3) is not None:
+            label = _escape_markdown_v2_text(match.group(2))
+            url = _escape_markdown_v2_url(match.group(3).strip())
+            parts.append(f"[{label}]({url})")
+        elif match.group(4) is not None:
+            parts.append(f"*{_escape_markdown_v2_text(match.group(4))}*")
+        elif match.group(5) is not None:
+            parts.append(f"*{_escape_markdown_v2_text(match.group(5))}*")
+        elif match.group(6) is not None:
+            parts.append(f"~{_escape_markdown_v2_text(match.group(6))}~")
+        elif match.group(7) is not None:
+            parts.append(f"_{_escape_markdown_v2_text(match.group(7))}_")
+        last = match.end()
+    if last < len(normalized):
+        parts.append(_escape_markdown_v2_text(normalized[last:]))
+    return "".join(parts)
 
 
 def _split_markdown_blocks(text: str) -> list[tuple[str, str, str]]:
