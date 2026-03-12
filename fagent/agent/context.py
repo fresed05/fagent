@@ -8,7 +8,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fagent.agent.memory import MemoryStore
 from fagent.agent.skills import SkillsLoader
 from fagent.prompts import PromptLoader
 from fagent.utils.helpers import detect_image_mime
@@ -22,7 +21,6 @@ class ContextBuilder:
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
-        self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
         self.prompts = PromptLoader.from_package()
 
@@ -32,7 +30,7 @@ class ContextBuilder:
         shadow_context: str | None = None,
         runtime_memory_context: str | None = None,
     ) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        """Build the system prompt from identity, bootstrap files, and skills."""
         parts = [self._get_identity()]
         try:
             main_prompt = self.prompts.load("system/main-agent.md")
@@ -43,10 +41,6 @@ class ContextBuilder:
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
-
-        memory = self.memory.get_memory_context()
-        if memory:
-            parts.append(f"# Memory\n\n{memory}")
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
@@ -98,8 +92,8 @@ You are fagent, a helpful AI assistant.
 
 ## Workspace
 Your workspace is at: {workspace_path}
-- Long-term memory: {workspace_path}/memory/MEMORY.md (write important facts here)
-- History log: {workspace_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
+- Optional file memory: {workspace_path}/memory/MEMORY.md
+- Manual memory notes: {workspace_path}/memory/*.md
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 {platform_policy}

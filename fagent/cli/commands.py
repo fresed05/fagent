@@ -161,7 +161,6 @@ class _HybridAutoSuggest(AutoSuggest):
 
 class _TurnTimeline:
     _SUMMARY_STAGE_KEYS = {
-        "Saving file memory": "file_memory",
         "Building graph": "graph",
         "Writing vectors": "vector",
         "Summarizing session": "summary",
@@ -366,13 +365,12 @@ class _TurnTimeline:
         graph_value = self._clean_summary_value(self._summary.get("graph", "pending (background)"))
         vector_value = self._clean_summary_value(self._summary.get("vector", "pending (background)"))
         summary_value = self._clean_summary_value(self._summary.get("summary", "pending (background)"))
-        file_value = self._clean_summary_value(self._summary.get("file_memory", "done"))
-        body = Group(
-            Text.assemble(f"{self._stage_icon('Saving file memory')} File: ", (file_value, "white")),
+        lines = [
             Text.assemble(f"{self._stage_icon('Building graph')} Graph: ", (graph_value, "white")),
             Text.assemble(f"{self._stage_icon('Writing vectors')} Vector: ", (vector_value, "white")),
             Text.assemble(f"{self._stage_icon('Summarizing session')} Summary: ", (summary_value, "white")),
-        )
+        ]
+        body = Group(*lines)
         self.console.print(
             Panel(
                 body,
@@ -386,7 +384,6 @@ class _TurnTimeline:
 
     def _render_background_stage_update(self, stage: str, status: str, message: str) -> None:
         stage_label = {
-            "Saving file memory": "File memory",
             "Building graph": "Graph",
             "Writing vectors": "Vector",
             "Summarizing session": "Summary",
@@ -439,7 +436,7 @@ class _TurnTimeline:
         if stage == "Pre-search":
             self._render_presearch(extra if isinstance(extra, dict) else {})
             return
-        if stage in self._SUMMARY_STAGE_KEYS and status in {"started", "running", "ok", "done"}:
+        if stage in self._SUMMARY_STAGE_KEYS and status in {"started", "running", "ok", "done", "skipped"}:
             return
         if stage in self._SUMMARY_STAGE_KEYS and status in {"retry", "failed", "error", "skipped", "not_triggered"}:
             self._render_background_stage_update(stage, status, content or error or status)

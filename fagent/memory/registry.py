@@ -98,7 +98,8 @@ class MemoryRegistry:
                 CREATE TABLE IF NOT EXISTS graph_nodes (
                     id TEXT PRIMARY KEY,
                     label TEXT NOT NULL,
-                    metadata_json TEXT NOT NULL
+                    metadata_json TEXT NOT NULL,
+                    tier INTEGER NOT NULL DEFAULT 3
                 );
                 CREATE TABLE IF NOT EXISTS entity_aliases (
                     entity_id TEXT NOT NULL,
@@ -216,12 +217,19 @@ class MemoryRegistry:
                     "graph_jobs",
                     {"error": "TEXT NOT NULL DEFAULT ''"},
                 )
+            if self._table_exists(conn, "graph_nodes"):
+                self._ensure_columns(
+                    conn,
+                    "graph_nodes",
+                    {"tier": "INTEGER NOT NULL DEFAULT 3"},
+                )
             conn.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS idx_artifacts_type_created_at ON artifacts(type, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_artifacts_session_type_created_at ON artifacts(session_key, type, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_artifacts_session_created_at ON artifacts(session_key, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_post_turn_jobs_episode ON post_turn_jobs(episode_id, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_graph_nodes_tier ON graph_nodes(tier);
                 """
             )
             required_backfill_columns = {"session_key", "turn_id", "channel", "chat_id", "search_text"}
@@ -501,34 +509,36 @@ class MemoryRegistry:
                 (episode_id,),
             ).fetchone()
 
-    def upsert_graph_node(self, node_id: str, label: str, metadata: dict[str, Any]) -> None:
+    def upsert_graph_node(self, node_id: str, label: str, metadata: dict[str, Any], tier: int = 3) -> None:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO graph_nodes(id, label, metadata_json)
-                VALUES (?, ?, ?)
+                INSERT INTO graph_nodes(id, label, metadata_json, tier)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     label=excluded.label,
-                    metadata_json=excluded.metadata_json
+                    metadata_json=excluded.metadata_json,
+                    tier=excluded.tier
                 """,
-                (node_id, label, json.dumps(metadata, ensure_ascii=False)),
+                (node_id, label, json.dumps(metadata, ensure_ascii=False), tier),
             )
 
-    def bulk_upsert_graph_nodes(self, rows: list[tuple[str, str, dict[str, Any]]]) -> None:
+    def bulk_upsert_graph_nodes(self, rows: list[tuple[str, str, dict[str, Any], int]]) -> None:
         if not rows:
             return
         with self._connect() as conn:
             conn.executemany(
                 """
-                INSERT INTO graph_nodes(id, label, metadata_json)
-                VALUES (?, ?, ?)
+                INSERT INTO graph_nodes(id, label, metadata_json, tier)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     label=excluded.label,
-                    metadata_json=excluded.metadata_json
+                    metadata_json=excluded.metadata_json,
+                    tier=excluded.tier
                 """,
                 [
-                    (node_id, label, json.dumps(metadata, ensure_ascii=False))
-                    for node_id, label, metadata in rows
+                    (node_id, label, json.dumps(metadata, ensure_ascii=False), tier)
+                    for node_id, label, metadata, tier in rows
                 ],
             )
 

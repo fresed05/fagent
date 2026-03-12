@@ -11,6 +11,7 @@
 - Нужно понять continuity и экономию токенов: читайте [Архитектуру памяти](./memory-architecture.ru.md)
 - Нужны bounded delegation и execution mechanics: читайте [Subagents и workflows](./subagents-and-workflows.ru.md)
 - Нужны graph internals и browser GUI: читайте [Graph memory и Graph UI](./graph-memory-and-gui.ru.md)
+- Нужна иерархическая графовая память с tier системой: читайте [Иерархическую графовую память](./hierarchical-graph-memory.ru.md)
 - Нужны provider wiring и разделение model roles: читайте [Провайдеры и роли моделей](./providers-and-model-roles.ru.md)
 - Нужны inspection-команды и runtime surfaces: читайте [CLI и observability](./cli-and-observability.ru.md)
 - Нужна полная схема конфига: читайте [Конфигурацию](../CONFIGURATION.ru.md)

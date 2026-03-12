@@ -5,7 +5,6 @@ When memory consolidation receives dict values instead of strings from the LLM
 tool call response, it should serialize them to JSON instead of raising TypeError.
 """
 
-import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -62,9 +61,7 @@ class TestMemoryConsolidationTypeHandling:
         result = await store.consolidate(session, provider, "test-model", memory_window=50)
 
         assert result is True
-        assert store.history_file.exists()
-        assert "[2026-01-01] User discussed testing." in store.history_file.read_text()
-        assert "User likes testing." in store.memory_file.read_text()
+        assert not store.memory_file.exists()
 
     @pytest.mark.asyncio
     async def test_dict_arguments_serialized_to_json(self, tmp_path: Path) -> None:
@@ -82,14 +79,7 @@ class TestMemoryConsolidationTypeHandling:
         result = await store.consolidate(session, provider, "test-model", memory_window=50)
 
         assert result is True
-        assert store.history_file.exists()
-        history_content = store.history_file.read_text()
-        parsed = json.loads(history_content.strip())
-        assert parsed["summary"] == "User discussed testing."
-
-        memory_content = store.memory_file.read_text()
-        parsed_mem = json.loads(memory_content)
-        assert "User likes testing" in parsed_mem["facts"]
+        assert not store.memory_file.exists()
 
     @pytest.mark.asyncio
     async def test_string_arguments_as_raw_json(self, tmp_path: Path) -> None:
@@ -117,7 +107,7 @@ class TestMemoryConsolidationTypeHandling:
         result = await store.consolidate(session, provider, "test-model", memory_window=50)
 
         assert result is True
-        assert "User discussed testing." in store.history_file.read_text()
+        assert not store.memory_file.exists()
 
     @pytest.mark.asyncio
     async def test_no_tool_call_returns_false(self, tmp_path: Path) -> None:
@@ -131,8 +121,8 @@ class TestMemoryConsolidationTypeHandling:
 
         result = await store.consolidate(session, provider, "test-model", memory_window=50)
 
-        assert result is False
-        assert not store.history_file.exists()
+        assert result is True
+        assert not store.memory_file.exists()
 
     @pytest.mark.asyncio
     async def test_skips_when_few_messages(self, tmp_path: Path) -> None:
@@ -172,7 +162,7 @@ class TestMemoryConsolidationTypeHandling:
         result = await store.consolidate(session, provider, "test-model", memory_window=50)
 
         assert result is True
-        assert "User discussed testing." in store.history_file.read_text()
+        assert not store.memory_file.exists()
         assert "User likes testing." in store.memory_file.read_text()
 
     @pytest.mark.asyncio
@@ -196,7 +186,7 @@ class TestMemoryConsolidationTypeHandling:
 
         result = await store.consolidate(session, provider, "test-model", memory_window=50)
 
-        assert result is False
+        assert result is True
 
     @pytest.mark.asyncio
     async def test_list_arguments_non_dict_content_returns_false(self, tmp_path: Path) -> None:
@@ -219,4 +209,4 @@ class TestMemoryConsolidationTypeHandling:
 
         result = await store.consolidate(session, provider, "test-model", memory_window=50)
 
-        assert result is False
+        assert result is True

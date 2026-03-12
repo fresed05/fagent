@@ -311,17 +311,8 @@ class MemoryOrchestrator:
         )
 
     def _ingest_file_memory(self, episode: EpisodeRecord, summary: str) -> list[MemoryArtifact]:
-        file_artifacts: list[MemoryArtifact] = []
-        if not self.registry.get_artifact(f"{episode.episode_id}:history"):
-            file_artifacts = self.file_store.ingest_episode(episode, summary=summary)
-            for artifact in file_artifacts:
-                self.registry.upsert_artifact(artifact)
-            return file_artifacts
-        for suffix in ("history", "daily", "memory"):
-            artifact = self.registry.get_artifact(f"{episode.episode_id}:{suffix}")
-            if artifact is not None:
-                file_artifacts.append(artifact)
-        return file_artifacts
+        del episode, summary
+        return []
 
     async def _run_graph_stage(
         self,
@@ -435,33 +426,18 @@ class MemoryOrchestrator:
             attempt=0,
         )
         self.registry.set_job_status(episode.episode_id, "running")
-        summary = self.policy.build_summary(episode)
         try:
             ingest_plan = self._build_turn_ingest_plan(episode, session=session, seed_artifacts=seed_artifacts)
             ingest_plan.artifacts.append(self._ensure_session_artifact(episode))
-
-            started_at = time.perf_counter()
+            results["file_memory"] = {"status": "skipped", "artifacts": 0, "reason": "explicit_only"}
+            stage_state["file_memory"] = "skipped"
             await self._emit_stage(
                 on_progress,
                 stage="Saving file memory",
-                status="started",
+                status="skipped",
                 session_key=episode.session_key,
                 turn_id=episode.turn_id,
-                detail="Writing file artifacts",
-            )
-            file_artifacts = self._ingest_file_memory(episode, summary=summary)
-            ingest_plan.artifacts.extend(file_artifacts)
-            results["file_memory"] = {"status": "ok", "artifacts": len(file_artifacts)}
-            stage_state["file_memory"] = "ok"
-            await self._emit_stage(
-                on_progress,
-                stage="Saving file memory",
-                status="ok",
-                session_key=episode.session_key,
-                turn_id=episode.turn_id,
-                detail=f"Wrote {len(file_artifacts)} artifacts",
-                duration_ms=int((time.perf_counter() - started_at) * 1000),
-                extra={"artifacts": len(file_artifacts)},
+                detail="skipped: explicit_only",
             )
             self.registry.upsert_post_turn_job(
                 job_id=job_id,
@@ -886,9 +862,9 @@ class MemoryOrchestrator:
             return True
         if item.store == "file":
             path = str(item.metadata.get("path") or "")
-            if "daily_note" in artifact_types and path.endswith(".md") and "\\daily\\" in path.replace("/", "\\"):
-                return True
             if "file_note" in artifact_types and path.endswith(".md"):
+                return True
+            if "fact" in artifact_types and path.endswith("MEMORY.md"):
                 return True
         return False
 
@@ -1408,6 +1384,11 @@ class MemoryOrchestrator:
 
         if not results:
             empty_reason_codes.append("no_matching_data")
+            if "file" in selected_stores and not any(path.exists() for path in self.file_store._candidate_files()):
+                empty_reason_codes.append("file_source_disabled")
+            unavailable = [store for store in selected_stores if not store_attempts.get(store, {}).get("healthy", True)]
+            if unavailable:
+                empty_reason_codes.append("store_unavailable")
             if any(store_health.get(store, True) for store in selected_stores):
                 empty_reason_codes.append("query_data_mismatch")
             if "graph" in selected_stores and per_store_hits.get("graph", 0) == 0:
@@ -1423,6 +1404,8 @@ class MemoryOrchestrator:
                 )
                 if unscoped_hits:
                     empty_reason_codes.append("vector_filtered_out_by_scope")
+            elif "vector" in selected_stores and not store_health.get("vector", False):
+                empty_reason_codes.append("embedding_failed")
         elif allow_raw_requested and not raw_escalated and not session_scope and len(results) < max(2, len(selected_stores)):
             empty_reason_codes.append("raw_escalation_skipped_no_session_scope")
 
@@ -1464,9 +1447,11 @@ class MemoryOrchestrator:
             candidates = self.graph_backend.search_candidates(entity_ref, limit=3)
             if candidates:
                 top = candidates[0]
-                row = self.registry.get_graph_node(str(top["id"]))
-                match_source = "ranked_graph_search"
-                match_confidence = float(top.get("search_score", 0.0) or 0.0)
+                candidate_score = float(top.get("search_score", 0.0) or 0.0)
+                if candidate_score >= 0.3:
+                    row = self.registry.get_graph_node(str(top["id"]))
+                    match_source = "ranked_graph_search"
+                    match_confidence = candidate_score
         if row is not None:
             edges = self.registry.get_graph_edges_for_node(row["id"], limit=256)
             neighbor_ids = {
@@ -1541,19 +1526,24 @@ class MemoryOrchestrator:
         artifact_matches = self.registry.search_artifacts(entity_ref, limit=3)
         if artifact_matches:
             primary = artifact_matches[0]
+            primary_text = f"{primary.summary}\n{primary.content}".lower()
+            query_tokens = [token for token in re.split(r"\W+", entity_ref.lower()) if len(token) >= 3]
+            if query_tokens and not any(token in primary_text for token in query_tokens):
+                return None
+            fallback_confidence = 0.45
             return {
                 "id": f"artifact:{primary.id}",
                 "label": entity_ref,
                 "resolution": "artifact_fallback",
                 "match_source": "artifact_search",
-                "match_confidence": 0.45,
+                "match_confidence": fallback_confidence,
                 "metadata": {
                     "kind": "artifact_fallback",
                     "degraded": True,
-                    "confidence": 0.45,
+                    "confidence": fallback_confidence,
                     "resolution": "artifact_fallback",
                     "match_source": "artifact_search",
-                    "match_confidence": 0.45,
+                    "match_confidence": fallback_confidence,
                     "artifact_id": primary.id,
                     "artifact_type": primary.type,
                     "source_ref": primary.source_ref,
@@ -1698,6 +1688,16 @@ class MemoryOrchestrator:
             metadata = dict(node.get("metadata") or {})
             metadata.setdefault("view_role", "overview")
             metadata.setdefault("priority_score", self._graph_priority_score(node))
+
+            tier = node.get("tier", 3)
+            metadata["visual"] = {
+                "size": {1: 40, 2: 25, 3: 15}.get(tier, 15),
+                "color": {1: "#FF6B6B", 2: "#4ECDC4", 3: "#95E1D3"}.get(tier, "#95E1D3"),
+                "strokeWidth": {1: 3, 2: 2, 3: 1}.get(tier, 1),
+                "fontSize": {1: 16, 2: 12, 3: 10}.get(tier, 10),
+                "opacity": {1: 1.0, 2: 0.9, 3: 0.8}.get(tier, 0.8)
+            }
+
             node["metadata"] = metadata
         search_results = [
             {
@@ -2726,6 +2726,81 @@ class NullMemoryOrchestrator:
 
     async def drain(self) -> None:
         return None
+
+    async def analyze_node_tier(self, node_id: str, context: str = "") -> dict[str, object]:
+        """Use LLM to determine tier of a node."""
+        node = self.registry.get_graph_node(node_id)
+        if not node:
+            return {"error": "Node not found"}
+
+        edges = self.registry.list_graph_edges(source_id=node_id) + self.registry.list_graph_edges(target_id=node_id)
+        edge_count = len(edges)
+
+        neighbors = []
+        for edge in edges[:10]:
+            neighbor_id = edge["target_id"] if edge["source_id"] == node_id else edge["source_id"]
+            neighbor = self.registry.get_graph_node(neighbor_id)
+            if neighbor:
+                neighbors.append(neighbor["label"])
+
+        prompt = f"""Analyze this knowledge graph node and determine its tier level.
+
+Node: {node['label']}
+Edges: {edge_count}
+Connected to: {', '.join(neighbors[:5])}
+Context: {context}
+
+Tier 1: Main concepts (8+ edges, groups many nodes) - Examples: "Python Ecosystem", "Backend Architecture"
+Tier 2: Frameworks/components (3+ edges) - Examples: "FastAPI", "PostgreSQL"
+Tier 3: Details (specific facts, configs) - Examples: "FastAPI uses Pydantic"
+
+Return JSON:
+{{"tier": 1-3, "confidence": 0.0-1.0, "reason": "explanation", "parent_ids": ["suggested_parent_id"]}}"""
+
+        if not self.provider:
+            tier = 1 if edge_count >= 8 else 2 if edge_count >= 3 else 3
+            return {"recommended_tier": tier, "confidence": 0.8, "reason": f"Based on {edge_count} edges", "parent_ids": []}
+
+        response = await self.provider.generate(prompt, model=self.graph_backend.normalize_model or "fast")
+        try:
+            result = json.loads(response.strip())
+            return {
+                "recommended_tier": result.get("tier", 3),
+                "confidence": result.get("confidence", 0.5),
+                "reason": result.get("reason", ""),
+                "parent_ids": result.get("parent_ids", [])
+            }
+        except:
+            tier = 1 if edge_count >= 8 else 2 if edge_count >= 3 else 3
+            return {"recommended_tier": tier, "confidence": 0.6, "reason": "Fallback heuristic", "parent_ids": []}
+
+    async def reorganize_node_hierarchy(self, node_id: str, new_tier: int, new_parent_ids: list[str] | None = None) -> dict[str, object]:
+        """Move node to different tier and update parent relationships."""
+        node = self.registry.get_graph_node(node_id)
+        if not node:
+            return {"error": "Node not found"}
+
+        old_tier = node.get("tier", 3)
+        metadata = json.loads(node.get("metadata_json", "{}"))
+        metadata["tier"] = new_tier
+        metadata["tier_reason"] = f"Reorganized from tier {old_tier} to tier {new_tier}"
+        metadata["last_tier_update"] = datetime.utcnow().isoformat()
+
+        self.registry.upsert_graph_node(node_id, node["label"], metadata, tier=new_tier)
+
+        old_parents = self.registry.list_graph_edges(target_id=node_id, relation="parent_of")
+        for edge in old_parents:
+            self.registry.delete_graph_edge(edge["source_id"], node_id, "parent_of")
+
+        if new_parent_ids:
+            for parent_id in new_parent_ids:
+                self.registry.upsert_graph_edge(parent_id, node_id, "parent_of", weight=1.0, metadata={})
+
+        return {"status": "success", "old_tier": old_tier, "new_tier": new_tier, "parent_count": len(new_parent_ids or [])}
+
+    def traverse_hierarchy(self, start_node_id: str, direction: str = "both", max_depth: int = 3) -> dict[str, object]:
+        """Traverse graph hierarchy from a starting node."""
+        return self.graph_backend.traverse_hierarchy(start_node_id, direction, max_depth)
 
     def close(self) -> None:
         return None

@@ -7,14 +7,13 @@ from fagent.memory.file_store import FileMemoryStore
 from fagent.memory.orchestrator import MemoryOrchestrator
 from fagent.memory.router import MemoryRouter
 from fagent.memory.shadow import ShadowContextBuilder
-from fagent.memory.types import EpisodeRecord, RetrievedMemory
-from fagent.memory.types import WorkflowStateArtifact
+from fagent.memory.types import EpisodeRecord, RetrievedMemory, WorkflowStateArtifact
 from fagent.providers.base import LLMResponse, ToolCallRequest
 from fagent.session.manager import Session
 
 
 @pytest.mark.asyncio
-async def test_memory_orchestrator_ingests_episode_and_is_idempotent(tmp_path: Path) -> None:
+async def test_memory_orchestrator_ingests_episode_without_auto_file_writes(tmp_path: Path) -> None:
     orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
     episode = EpisodeRecord(
         episode_id="ep-1",
@@ -22,38 +21,27 @@ async def test_memory_orchestrator_ingests_episode_and_is_idempotent(tmp_path: P
         turn_id="turn-000001",
         channel="cli",
         chat_id="direct",
-        user_text="Мы выбрали стек памяти на базе qdrant и neo4j.",
-        assistant_text="Зафиксировал default stack: qdrant для vector, neo4j для graph.",
+        user_text="We selected qdrant for vectors and neo4j for graph memory.",
+        assistant_text="Default stack noted: qdrant for vector, neo4j for graph.",
         timestamp="2026-03-09T12:00:00",
     )
 
     await orchestrator.ingest_episode(episode)
     await orchestrator.ingest_episode(episode)
 
-    history = (tmp_path / "memory" / "HISTORY.md").read_text(encoding="utf-8")
-    daily = (tmp_path / "memory" / "daily" / "2026-03-09.md").read_text(encoding="utf-8")
-    memory = (tmp_path / "memory" / "MEMORY.md").read_text(encoding="utf-8")
-
-    assert "qdrant" in history.lower()
-    assert "turn-000001" in daily
-    assert "default stack" in memory.lower()
+    assert not (tmp_path / "memory" / "HISTORY.md").exists()
+    assert not (tmp_path / "memory" / "daily" / "2026-03-09.md").exists()
+    assert not (tmp_path / "memory" / "MEMORY.md").exists()
+    artifacts = orchestrator.registry.list_artifacts("session_turn")
+    assert len(artifacts) == 1
+    assert artifacts[0].id == "ep-1"
     assert orchestrator.registry.get_job_status("ep-1") == "done"
 
 
 @pytest.mark.asyncio
-async def test_memory_orchestrator_builds_shadow_context_from_file_memory(tmp_path: Path) -> None:
+async def test_memory_orchestrator_builds_shadow_context_from_explicit_file_memory(tmp_path: Path) -> None:
     store = FileMemoryStore(tmp_path)
-    episode = EpisodeRecord(
-        episode_id="ep-2",
-        session_key="cli:direct",
-        turn_id="turn-000002",
-        channel="cli",
-        chat_id="direct",
-        user_text="Мы решили добавить shadow context.",
-        assistant_text="Shadow context будет собирать краткий brief из memory backends.",
-        timestamp="2026-03-09T13:00:00",
-    )
-    store.ingest_episode(episode)
+    store.write_long_term("We decided to add shadow context.\nShadow context builds a compact brief from memory backends.\n")
     orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
 
     brief = await orchestrator.prepare_shadow_context(
@@ -72,8 +60,8 @@ async def test_memory_backfill_uses_turn_ids(tmp_path: Path) -> None:
     session = Session(key="cli:direct")
     session.metadata["turn_seq"] = 1
     session.messages = [
-        {"role": "user", "content": "Нужна память", "turn_id": "turn-000001", "timestamp": "2026-03-09T12:00:00"},
-        {"role": "assistant", "content": "Сделаем память", "turn_id": "turn-000001", "timestamp": "2026-03-09T12:00:01"},
+        {"role": "user", "content": "Need memory", "turn_id": "turn-000001", "timestamp": "2026-03-09T12:00:00"},
+        {"role": "assistant", "content": "We will build memory", "turn_id": "turn-000001", "timestamp": "2026-03-09T12:00:01"},
     ]
     orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
 
@@ -82,7 +70,7 @@ async def test_memory_backfill_uses_turn_ids(tmp_path: Path) -> None:
     assert count == 1
     artifacts = orchestrator.registry.list_artifacts("session_turn")
     assert len(artifacts) == 1
-    assert orchestrator.query("память")
+    assert artifacts[0].id
 
 
 @pytest.mark.asyncio
@@ -149,7 +137,7 @@ async def test_vector_memory_uses_external_embeddings_without_local_servers(
 
 
 @pytest.mark.asyncio
-async def test_vector_failure_does_not_break_file_memory(
+async def test_vector_failure_does_not_break_session_memory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -181,15 +169,15 @@ async def test_vector_failure_does_not_break_file_memory(
         channel="cli",
         chat_id="direct",
         user_text="please remember fallback behavior",
-        assistant_text="file memory should still work",
+        assistant_text="session memory should still work",
         timestamp="2026-03-09T15:00:00",
     )
 
     await orchestrator.ingest_episode(episode)
 
-    assert (tmp_path / "memory" / "HISTORY.md").exists()
+    assert not (tmp_path / "memory" / "HISTORY.md").exists()
     assert orchestrator.registry.get_job_status("ep-4") == "retry"
-    assert any("[file]" in item for item in orchestrator.query("fallback behavior"))
+    assert orchestrator.registry.get_artifact("ep-4") is not None
 
 
 @pytest.mark.asyncio
@@ -200,11 +188,14 @@ async def test_run_post_turn_pipeline_normalizes_workflow_state_seed_artifacts(t
     config.vector.embedding_api_key = "test-key"
 
     class _Response:
+        def __init__(self, count: int) -> None:
+            self.count = count
+
         def raise_for_status(self) -> None:
             return None
 
         def json(self) -> dict:
-            return {"data": [{"embedding": [0.1, 0.2, 0.3]} for _ in range(4)]}
+            return {"data": [{"embedding": [0.1, 0.2, 0.3]} for _ in range(self.count)]}
 
     class _Client:
         def __init__(self, *args, **kwargs):
@@ -217,7 +208,7 @@ async def test_run_post_turn_pipeline_normalizes_workflow_state_seed_artifacts(t
             return False
 
         def post(self, url, headers=None, json=None):
-            return _Response()
+            return _Response(len(json["input"]))
 
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr("fagent.memory.vector.httpx.Client", _Client)
@@ -261,6 +252,7 @@ async def test_run_post_turn_pipeline_normalizes_workflow_state_seed_artifacts(t
     finally:
         monkeypatch.undo()
 
+    assert result["file_memory"]["status"] == "skipped"
     assert result["vector"]["status"] == "ok"
     assert not any("WorkflowStateArtifact" in str(event.get("content", "")) for event in events)
     stored = orchestrator.registry.get_artifact("workflow:snap-1")
@@ -344,8 +336,8 @@ async def test_graph_stage_skips_repeated_turns_in_same_session(tmp_path: Path) 
         turn_id="turn-000101",
         channel="cli",
         chat_id="direct",
-        user_text="повтори снова",
-        assistant_text="22 — SSH, 3389 — XRDP, 8000 — cliproxyapi.",
+        user_text="repeat again",
+        assistant_text="22 - SSH, 3389 - XRDP, 8000 - cliproxyapi.",
         timestamp="2026-03-10T06:00:00",
     )
     second = EpisodeRecord(
@@ -354,8 +346,8 @@ async def test_graph_stage_skips_repeated_turns_in_same_session(tmp_path: Path) 
         turn_id="turn-000102",
         channel="cli",
         chat_id="direct",
-        user_text="повтори в одну строку",
-        assistant_text="22 — SSH, 3389 — XRDP, 8000 — cliproxyapi",
+        user_text="repeat in one line",
+        assistant_text="22 - SSH, 3389 - XRDP, 8000 - cliproxyapi",
         timestamp="2026-03-10T06:01:00",
     )
 

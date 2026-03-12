@@ -9,9 +9,8 @@ from typing import Any, Literal
 
 ArtifactType = Literal[
     "session_turn",
-    "summary_note",
-    "daily_note",
     "fact",
+    "file_note",
     "entity",
     "relationship",
     "shadow_bundle",

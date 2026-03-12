@@ -25,13 +25,13 @@ from fagent.utils.helpers import split_message
 TELEGRAM_MAX_MESSAGE_LEN = 4000
 TELEGRAM_RENDER_LIMIT = 3800
 POST_TURN_STAGES = {
-    "Saving file memory",
+    "Updating file notes",
     "Building graph",
     "Writing vectors",
     "Summarizing session",
 }
 POST_TURN_LABELS = {
-    "Saving file memory": "File",
+    "Updating file notes": "Notes",
     "Building graph": "Graph",
     "Writing vectors": "Vector",
     "Summarizing session": "Summary",
@@ -641,9 +641,8 @@ class TelegramChannel(BaseChannel):
         reply_params,
         thread_kwargs: dict,
     ) -> None:
-        lines = ["Post-turn memory"]
+        lines = ["Post-turn retrieval indexing"]
         for stage in (
-            "Saving file memory",
             "Building graph",
             "Writing vectors",
             "Summarizing session",
@@ -735,7 +734,8 @@ class TelegramChannel(BaseChannel):
             status = str(event.get("status", "running") or "running")
             content = str(event.get("content", msg.content) or msg.content)
             if stage in POST_TURN_STAGES:
-                state.post_turn_summary[stage] = _format_post_turn_value(status, content)
+                if content.strip() or status not in {"ok", "done"}:
+                    state.post_turn_summary[stage] = _format_post_turn_value(status, content)
                 if state.final_sent:
                     await self._send_or_update_post_turn_summary(
                         state=state,

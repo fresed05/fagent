@@ -59,6 +59,9 @@ _RELATION_SYNONYMS = {
     "configured": "configured_with",
     "настроен через": "configured_with",
     "relates_to": "mentions",
+    "parent_of": "parent_of",
+    "child_of": "child_of",
+    "groups": "parent_of",
 }
 
 _ENGLISH_CANONICAL_MAP = {
@@ -498,18 +501,21 @@ class LocalGraphBackend:
             logger.debug("Graph semantic search skipped: {}", exc)
             return {}
 
-    def _search_graph_candidates(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+    def _search_graph_candidates(self, query: str, limit: int = 20, tier_weights: dict[int, float] | None = None) -> list[dict[str, Any]]:
+        tier_weights = tier_weights or {1: 2.0, 2: 1.5, 3: 1.0}
         raw_limit = max(limit * 12, 240)
         raw_rows = self.registry.list_graph_nodes(query=query, limit=raw_limit)
         self.last_search_candidate_count = len(raw_rows)
         preliminary: list[dict[str, Any]] = []
         for row in raw_rows:
             lexical = self._score_graph_row(query, row)
+            tier = int(row.get("tier", 3))
             preliminary.append(
                 {
                     "id": str(row["id"]),
                     "label": str(row["label"]),
                     "metadata_json": str(row["metadata_json"] or "{}"),
+                    "tier": tier,
                     "search_score": lexical,
                     "lexical_score": lexical,
                     "semantic_score": 0.0,
@@ -524,14 +530,16 @@ class LocalGraphBackend:
             semantic = semantic_scores.get(item["id"], 0.0)
             item["semantic_score"] = semantic
             item["search_score"] = max(item["search_score"], semantic, 0.72 * item["lexical_score"] + 0.28 * semantic)
+            tier_boost = tier_weights.get(item["tier"], 1.0)
+            item["search_score"] *= tier_boost
             if item["lexical_score"] >= 0.52 or semantic >= 0.72 or item["search_score"] >= 0.7:
                 ranked.append(item)
-        ranked.sort(key=lambda item: (item["search_score"], item["semantic_score"], item["label"]), reverse=True)
+        ranked.sort(key=lambda item: (item["search_score"], -item["tier"], item["semantic_score"], item["label"]), reverse=True)
         return ranked[:limit]
 
-    def search_candidates(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+    def search_candidates(self, query: str, limit: int = 20, tier_weights: dict[int, float] | None = None) -> list[dict[str, Any]]:
         """Expose ranked graph candidates for retrieval and diagnostics."""
-        return self._search_graph_candidates(query, limit=limit)
+        return self._search_graph_candidates(query, limit=limit, tier_weights=tier_weights)
 
     def healthcheck(self) -> bool:
         return True
@@ -547,6 +555,76 @@ class LocalGraphBackend:
 
     def delete_edge(self, source_id: str, target_id: str, relation: str) -> str | None:
         return None
+
+    def _traverse_up(self, node_id: str, max_depth: int, visited: set[str], depth: int = 0) -> list[dict[str, Any]]:
+        """Traverse up the hierarchy following parent_of edges."""
+        if depth >= max_depth or node_id in visited:
+            return []
+        visited.add(node_id)
+        parents = []
+        edges = self.registry.list_graph_edges(target_id=node_id, relation="parent_of")
+        for edge in edges:
+            parent_id = edge["source_id"]
+            parent_node = self.registry.get_graph_node(parent_id)
+            if parent_node:
+                parents.append({
+                    "node": dict(parent_node),
+                    "depth": depth + 1,
+                    "relation": "parent_of"
+                })
+                parents.extend(self._traverse_up(parent_id, max_depth, visited, depth + 1))
+        return parents
+
+    def _traverse_down(self, node_id: str, max_depth: int, visited: set[str], depth: int = 0) -> list[dict[str, Any]]:
+        """Traverse down the hierarchy following child_of edges."""
+        if depth >= max_depth or node_id in visited:
+            return []
+        visited.add(node_id)
+        children = []
+        edges = self.registry.list_graph_edges(source_id=node_id, relation="parent_of")
+        for edge in edges:
+            child_id = edge["target_id"]
+            child_node = self.registry.get_graph_node(child_id)
+            if child_node:
+                children.append({
+                    "node": dict(child_node),
+                    "depth": depth + 1,
+                    "relation": "child_of"
+                })
+                children.extend(self._traverse_down(child_id, max_depth, visited, depth + 1))
+        return children
+
+    def traverse_hierarchy(self, start_node_id: str, direction: str = "both", max_depth: int = 3) -> dict[str, Any]:
+        """Traverse graph hierarchy from a starting node."""
+        start_node = self.registry.get_graph_node(start_node_id)
+        if not start_node:
+            return {"error": "Node not found", "start_node": None, "parents": [], "children": [], "siblings": []}
+
+        result = {
+            "start_node": dict(start_node),
+            "parents": [],
+            "children": [],
+            "siblings": []
+        }
+
+        if direction in ("up", "both"):
+            result["parents"] = self._traverse_up(start_node_id, max_depth, set())
+
+        if direction in ("down", "both"):
+            result["children"] = self._traverse_down(start_node_id, max_depth, set())
+
+        if direction == "both":
+            parent_ids = {p["node"]["id"] for p in result["parents"]}
+            for parent_id in parent_ids:
+                edges = self.registry.list_graph_edges(source_id=parent_id, relation="parent_of")
+                for edge in edges:
+                    sibling_id = edge["target_id"]
+                    if sibling_id != start_node_id:
+                        sibling_node = self.registry.get_graph_node(sibling_id)
+                        if sibling_node and sibling_node["id"] not in [s["id"] for s in result["siblings"]]:
+                            result["siblings"].append(dict(sibling_node))
+
+        return result
 
     async def ingest_episode_async(
         self,

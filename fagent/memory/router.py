@@ -107,13 +107,13 @@ _INTENT_STORE_MAP: dict[str, list[str]] = {
 }
 
 _INTENT_ARTIFACT_MAP: dict[str, list[str]] = {
-    "temporal_recall": ["daily_note", "summary_note", "session_turn", "session_summary"],
+    "temporal_recall": ["session_turn", "session_summary", "workflow_state"],
     "relationship_recall": ["entity", "relationship", "fact", "task_state"],
     "workflow_recall": ["workflow_state", "task_state", "task_step", "experience_pattern", "session_turn"],
-    "factual_recall": ["fact", "summary_note", "daily_note", "session_turn", "session_summary"],
-    "preference_recall": ["fact", "experience_pattern"],
-    "continuity": ["session_summary", "task_state", "workflow_state", "fact", "summary_note", "daily_note", "session_turn"],
-    "broad_synthesis": ["session_summary", "summary_note", "daily_note", "workflow_state", "fact", "session_turn"],
+    "factual_recall": ["fact", "file_note", "session_turn", "session_summary"],
+    "preference_recall": ["fact", "experience_pattern", "file_note"],
+    "continuity": ["session_summary", "task_state", "workflow_state", "fact", "file_note", "session_turn"],
+    "broad_synthesis": ["session_summary", "workflow_state", "fact", "file_note", "session_turn"],
     "fresh_request": [],
 }
 

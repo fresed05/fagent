@@ -1,4 +1,4 @@
-"""Deterministic memory policy helpers."""
+"""Deterministic helpers for summarizing and tagging memory episodes."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ _STOPWORDS = {
 
 
 class MemoryPolicy:
-    """Rules deciding what should be kept and how it should be tagged."""
+    """Rules for building deterministic summaries and topic tags."""
 
     def extract_topic_tags(self, text: str, limit: int = 8) -> list[str]:
         """Return stable-ish keywords for indexing and graph edges."""
@@ -28,15 +28,6 @@ class MemoryPolicy:
         ]
         counts = Counter(words)
         return [word for word, _ in counts.most_common(limit)]
-
-    def should_update_long_term(self, episode: EpisodeRecord) -> bool:
-        """Only persist durable memory when the turn likely contains a stable decision."""
-        text = f"{episode.user_text}\n{episode.assistant_text}".lower()
-        markers = (
-            "we chose", "мы выбрали", "default", "по умолчанию", "use ", "используем",
-            "stack", "архитектур", "решили", "будем", "decision", "предпочита",
-        )
-        return any(marker in text for marker in markers)
 
     def build_summary(self, episode: EpisodeRecord) -> str:
         """Create a short deterministic summary when LLM summarization is unavailable."""

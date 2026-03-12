@@ -1,4 +1,4 @@
-"""Memory search tools exposed to the main agent."""
+"""Memory tools exposed to the main agent."""
 
 from __future__ import annotations
 
@@ -7,15 +7,13 @@ from typing import Any
 
 from fagent.agent.tools.base import Tool
 from fagent.memory.orchestrator import MemoryOrchestrator, NullMemoryOrchestrator
-from fagent.prompts import PromptLoader
 
 
 class MemorySearchTool(Tool):
-    """Explicit memory search across file, vector, and graph stores."""
+    """Unified memory search with routing and diagnostics."""
 
     def __init__(self, memory: MemoryOrchestrator | NullMemoryOrchestrator):
         self.memory = memory
-        self.prompts = PromptLoader.from_package()
 
     @property
     def name(self) -> str:
@@ -23,98 +21,7 @@ class MemorySearchTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Search file, vector, and graph memory for prior context or evidence."
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "minLength": 2},
-                "stores": {
-                    "type": "array",
-                    "items": {"type": "string", "enum": ["file", "vector", "graph", "all"]},
-                },
-                "artifact_types": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-                "top_k": {"type": "integer", "minimum": 1, "maximum": 20},
-                "session_scope": {"type": "string"},
-                "time_range": {
-                    "type": "object",
-                    "properties": {
-                        "start": {"type": "string"},
-                        "end": {"type": "string"},
-                    },
-                },
-            },
-            "required": ["query"],
-        }
-
-    async def execute(
-        self,
-        query: str,
-        stores: list[str] | None = None,
-        artifact_types: list[str] | None = None,
-        top_k: int = 5,
-        session_scope: str | None = None,
-        time_range: dict[str, str] | None = None,
-    ) -> str:
-        payload = await self.memory.search_v2(
-            query,
-            stores=None if not stores or "all" in stores else stores,
-            artifact_types=artifact_types,
-            top_k=top_k,
-            session_scope=session_scope,
-            time_range=time_range,
-        )
-        return json.dumps(
-            {
-                "query": query,
-                "intent": payload["intent"],
-                "retrieval_strategy": payload["retrieval_strategy"],
-                "confidence": payload["confidence"],
-                "used_stores": payload["used_stores"],
-                "raw_escalated": payload["raw_escalated"],
-                "count": payload["count"],
-                "citations": payload["citations"],
-                "store_health": payload.get("store_health", {}),
-                "store_attempts": payload.get("store_attempts", {}),
-                "empty_reason_codes": payload.get("empty_reason_codes", []),
-                "raw_escalation_reason": payload.get("raw_escalation_reason", ""),
-                "session_scope_applied": payload.get("session_scope_applied", False),
-                "filters_applied": payload.get("filters_applied", {}),
-                "results": [
-                    {
-                        "artifact_id": item.artifact_id,
-                        "store": item.store,
-                        "score": round(item.score, 4),
-                        "snippet": item.snippet,
-                        "reason": item.reason,
-                        "metadata": item.metadata,
-                    }
-                    for item in payload["results"]
-                ],
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-
-
-class MemorySearchV2Tool(Tool):
-    """Query-aware memory search with routing and evidence escalation."""
-
-    def __init__(self, memory: MemoryOrchestrator | NullMemoryOrchestrator):
-        self.memory = memory
-
-    @property
-    def name(self) -> str:
-        return "memory_search_v2"
-
-    @property
-    def description(self) -> str:
-        return "Search memory using query-aware routing, intent detection, and optional raw evidence escalation."
+        return "Search memory using routed retrieval across file, vector, graph, workflow, and experience stores."
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -123,8 +30,17 @@ class MemorySearchV2Tool(Tool):
             "properties": {
                 "query": {"type": "string", "minLength": 2},
                 "strategy": {"type": "string", "enum": ["cheap", "balanced", "evidence_first"]},
-                "stores": {"type": "array", "items": {"type": "string"}},
-                "artifact_types": {"type": "array", "items": {"type": "string"}},
+                "stores": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["file", "vector", "graph", "workflow", "task_graph", "experience", "summary", "all"],
+                    },
+                },
+                "artifact_types": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
                 "top_k": {"type": "integer", "minimum": 1, "maximum": 20},
                 "session_scope": {"type": "string"},
                 "time_range": {
@@ -177,15 +93,18 @@ class MemorySearchV2Tool(Tool):
                 "raw_escalation_reason": payload.get("raw_escalation_reason", ""),
                 "session_scope_applied": payload.get("session_scope_applied", False),
                 "filters_applied": payload.get("filters_applied", {}),
+                "store_contributions": payload.get("store_contributions", {}),
+                "route_reason": payload.get("route_reason", ""),
+                "query_variants": payload.get("query_variants", []),
                 "results": [
-                {
-                    "artifact_id": item.artifact_id,
-                    "store": item.store,
-                    "score": round(item.score, 4),
-                    "snippet": item.snippet,
-                    "reason": item.reason,
-                    "metadata": item.metadata,
-                }
+                    {
+                        "artifact_id": item.artifact_id,
+                        "store": item.store,
+                        "score": round(item.score, 4),
+                        "snippet": item.snippet,
+                        "reason": item.reason,
+                        "metadata": item.metadata,
+                    }
                     for item in payload["results"]
                 ],
             },
@@ -270,35 +189,12 @@ class MemoryGetEntityTool(Tool):
             return json.dumps({"status": "not_found", "entity_ref": entity_ref}, ensure_ascii=False, indent=2)
         resolution = str(entity.get("resolution") or (entity.get("metadata") or {}).get("resolution") or "")
         status = "degraded" if resolution == "artifact_fallback" or bool((entity.get("metadata") or {}).get("degraded")) else "ok"
-        return json.dumps({"status": status, "resolution": resolution or ("artifact_fallback" if status == "degraded" else "graph_entity"), "entity": entity}, ensure_ascii=False, indent=2)
-
-
-class MemoryGetDailyNoteTool(Tool):
-    """Load one daily note file by ISO date."""
-
-    def __init__(self, memory: MemoryOrchestrator | NullMemoryOrchestrator):
-        self.memory = memory
-
-    @property
-    def name(self) -> str:
-        return "memory_get_daily_note"
-
-    @property
-    def description(self) -> str:
-        return "Load a daily note by date in YYYY-MM-DD format."
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "date": {"type": "string", "minLength": 10, "maxLength": 10},
+        return json.dumps(
+            {
+                "status": status,
+                "resolution": resolution or ("artifact_fallback" if status == "degraded" else "graph_entity"),
+                "entity": entity,
             },
-            "required": ["date"],
-        }
-
-    async def execute(self, date: str) -> str:
-        note = self.memory.get_daily_note(date)
-        if note is None:
-            return json.dumps({"status": "not_found", "date": date}, ensure_ascii=False, indent=2)
-        return json.dumps({"status": "ok", "note": note}, ensure_ascii=False, indent=2)
+            ensure_ascii=False,
+            indent=2,
+        )

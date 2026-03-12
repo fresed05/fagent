@@ -288,9 +288,9 @@ async def test_post_turn_summary_sent_as_separate_message_after_final() -> None:
                 "message_id": 77,
                 "_progress_event": {
                     "event": "stage",
-                    "stage": "Saving file memory",
+                    "stage": "Building graph",
                     "status": "ok",
-                    "content": "Wrote 2 artifacts",
+                    "content": "Updated graph relationships",
                 },
             },
         )
@@ -299,8 +299,10 @@ async def test_post_turn_summary_sent_as_separate_message_after_final() -> None:
     assert len(channel._app.bot.sent_messages) == 3
     assert channel._app.bot.sent_messages[1]["parse_mode"] == "MarkdownV2"
     assert channel._app.bot.sent_messages[2]["parse_mode"] == "HTML"
-    assert "Post-turn memory" in channel._app.bot.sent_messages[2]["text"]
-    assert "Wrote 2 artifacts" in channel._app.bot.sent_messages[2]["text"]
+    assert "Post-turn retrieval indexing" in channel._app.bot.sent_messages[2]["text"]
+    assert "Graph" in channel._app.bot.sent_messages[2]["text"]
+    assert "Updated graph relationships" in channel._app.bot.sent_messages[2]["text"]
+    assert "Notes" not in channel._app.bot.sent_messages[2]["text"]
 
 
 def test_split_pre_lines_keeps_chunks_renderable() -> None:

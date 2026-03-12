@@ -22,10 +22,8 @@ from fagent.agent.tools.cron import CronTool
 from fagent.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from fagent.agent.tools.memory_search import (
     MemoryGetArtifactTool,
-    MemoryGetDailyNoteTool,
     MemoryGetEntityTool,
     MemorySearchTool,
-    MemorySearchV2Tool,
 )
 from fagent.agent.tools.message import MessageTool
 from fagent.agent.tools.moa import MoaTool
@@ -161,10 +159,8 @@ class AgentLoop:
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         self.tools.register(MemorySearchTool(memory=self.memory))
-        self.tools.register(MemorySearchV2Tool(memory=self.memory))
         self.tools.register(MemoryGetArtifactTool(memory=self.memory))
         self.tools.register(MemoryGetEntityTool(memory=self.memory))
-        self.tools.register(MemoryGetDailyNoteTool(memory=self.memory))
         workflow_light_role = self.app_config.resolve_model_role("workflow_light", self.model) if self.app_config else None
         workflow_provider = self.provider
         if self.provider_factory and workflow_light_role and workflow_light_role.provider_kind not in ("", "inherit"):

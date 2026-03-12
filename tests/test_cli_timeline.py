@@ -47,8 +47,9 @@ def test_timeline_shows_background_pending_summary_before_post_turn_finishes() -
 
     output = console.export_text()
     assert "Post-turn indexing" in output
-    assert "File: done" in output
     assert "Graph: pending (background)" in output
+    assert "Notes:" not in output
+    assert "Notes:" not in output
     assert "Vector: pending (background)" in output
     assert "Summary: pending (background)" in output
 
@@ -75,7 +76,9 @@ def test_timeline_shows_graph_failure_reason_after_turn_complete() -> None:
 
     output = console.export_text()
     assert "Graph: pending (background)" in output
+    assert "Notes:" not in output
     assert "Graph skipped: graph_extract_unavailable" in output
+    assert "Graph: pending (background)" in output
 
 
 def test_timeline_sanitizes_workflow_state_vector_error() -> None:

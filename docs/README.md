@@ -11,6 +11,7 @@ This is the documentation hub for `fagent`: the graph-aware, memory-first runtim
 - Want to understand continuity and token savings: read [Memory architecture](./memory-architecture.md)
 - Want to understand bounded delegation and operational execution: read [Subagents and workflows](./subagents-and-workflows.md)
 - Want graph internals and the browser GUI: read [Graph memory and Graph UI](./graph-memory-and-gui.md)
+- Want hierarchical graph memory with tier system: read [Hierarchical graph memory](./hierarchical-graph-memory.md)
 - Want provider wiring and model-role separation: read [Providers and model roles](./providers-and-model-roles.md)
 - Want the inspection commands and runtime surfaces: read [CLI and observability](./cli-and-observability.md)
 - Want the full config schema: read [Configuration reference](../CONFIGURATION.md)

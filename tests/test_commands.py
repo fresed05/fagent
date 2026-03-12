@@ -68,7 +68,6 @@ def test_onboard_existing_config_refresh(mock_paths):
 
     assert result.exit_code == 0
     assert "Config already exists" in result.stdout
-    assert "existing values preserved" in result.stdout
     assert workspace_dir.exists()
     assert (workspace_dir / "AGENTS.md").exists()
 

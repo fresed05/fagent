@@ -264,7 +264,7 @@ class GraphUiServerManager:
         self,
         orchestrator: MemoryOrchestrator,
         *,
-        port: int = 0,
+        port: int = 8765,
         query: str | None = None,
         session_key: str | None = None,
         open_browser: bool = True,
