@@ -1,9 +1,6 @@
-# Heartbeat Tasks
+# HEARTBEAT.md - Periodic Tasks
 
-This file is checked every 30 minutes by your fagent agent.
-Add tasks below that you want the agent to work on periodically.
-
-If this file has no tasks (only headers and comments), the agent will skip the heartbeat.
+_Keep this file empty to skip heartbeat API calls._
 
 ## Active Tasks
 
@@ -13,4 +10,3 @@ If this file has no tasks (only headers and comments), the agent will skip the h
 ## Completed
 
 <!-- Move completed tasks here or delete them -->
-

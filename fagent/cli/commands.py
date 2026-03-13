@@ -889,6 +889,7 @@ def gateway(
     from fagent.cron.service import CronService
     from fagent.cron.types import CronJob
     from fagent.heartbeat.service import HeartbeatService
+    from fagent.recovery.manager import RecoveryManager
     from fagent.runtime_logging import setup_runtime_logging
     from fagent.session.manager import SessionManager
 
@@ -1040,6 +1041,21 @@ def gateway(
 
     async def run():
         try:
+            # Detect interrupted sessions from previous gateway run
+            recovery = RecoveryManager(config.workspace_path)
+            interrupted = recovery.detect_interrupted_sessions()
+
+            if interrupted:
+                logger.warning(f"Gateway restarted. Detected {len(interrupted)} interrupted session(s):")
+                for session in interrupted:
+                    logger.info(
+                        f"  - {session.session_key} (turn {session.turn_id}, "
+                        f"interrupted {session.duration_seconds:.1f}s ago)"
+                    )
+
+            # Clear old state
+            recovery.clear_state()
+
             await cron.start()
             await heartbeat.start()
             await asyncio.gather(

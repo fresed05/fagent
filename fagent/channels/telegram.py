@@ -789,7 +789,7 @@ class TelegramChannel(BaseChannel):
         if not update.message:
             return
         await update.message.reply_text(
-            "🐈 fagent commands:\n"
+            "⚡ fagent commands:\n"
             "/new — Start a new conversation\n"
             "/stop — Stop the current task\n"
             "/help — Show available commands"

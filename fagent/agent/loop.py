@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import os
 import re
 import time
 import weakref
@@ -18,6 +19,7 @@ from loguru import logger
 from fagent.agent.context import ContextBuilder
 from fagent.agent.memory import consolidate_session_memory
 from fagent.agent.subagent import SubagentManager
+from fagent.recovery.tracker import StateTracker
 from fagent.agent.tools.cron import CronTool
 from fagent.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from fagent.agent.tools.memory_search import (
@@ -141,6 +143,7 @@ class AgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._session_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._post_turn_tasks: set[asyncio.Task] = set()
+        self._state_tracker = StateTracker(workspace, os.getpid())
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -477,6 +480,8 @@ class AgentLoop:
                 pass
         sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
         total = cancelled + sub_cancelled
+        # Mark session as completed after stopping
+        self._state_tracker.mark_completed(msg.session_key)
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
@@ -487,6 +492,16 @@ class AgentLoop:
         lock_key = msg.chat_id if msg.channel == "system" else msg.session_key
         lock = self._session_locks.setdefault(lock_key, asyncio.Lock())
         async with lock:
+            # Create turn_id for state tracking
+            session = self.sessions.get_or_create(msg.session_key)
+            turn_seq = int(session.metadata.get("turn_seq", 0)) + 1
+            turn_id = f"turn-{turn_seq:06d}"
+
+            # Mark session as processing
+            self._state_tracker.mark_processing(
+                msg.session_key, msg.channel, msg.chat_id, turn_id
+            )
+
             try:
                 response = await self._process_message(msg)
                 if response is not None:
@@ -496,11 +511,15 @@ class AgentLoop:
                         channel=msg.channel, chat_id=msg.chat_id,
                         content="", metadata=msg.metadata or {},
                     ))
+                # Mark session as completed
+                self._state_tracker.mark_completed(msg.session_key)
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
+                self._state_tracker.mark_error(msg.session_key)
                 raise
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
+                self._state_tracker.mark_error(msg.session_key)
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
                     content="Sorry, I encountered an error.",
@@ -631,7 +650,7 @@ class AgentLoop:
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
-                content="🐈 fagent commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/graph [query] — Open local graph UI\n/help — Show available commands",
+                content="⚡ fagent commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/graph [query] — Open local graph UI\n/help — Show available commands",
             )
         if cmd.startswith("/graph"):
             query = msg.content.strip()[len("/graph"):].strip() or None

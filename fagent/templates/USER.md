@@ -1,49 +1,36 @@
-# User Profile
+# USER.md - About Your Human
 
-Information about the user to help personalize interactions.
+_Learn about the person you're helping. Update as you go._
 
-## Basic Information
-
-- **Name**: (your name)
-- **Timezone**: (your timezone, e.g., UTC+8)
-- **Language**: (preferred language)
-
-## Preferences
-
-### Communication Style
-
-- [ ] Casual
-- [ ] Professional
-- [ ] Technical
-
-### Response Length
-
-- [ ] Brief and concise
-- [ ] Detailed explanations
-- [ ] Adaptive based on question
-
-### Technical Level
-
-- [ ] Beginner
-- [ ] Intermediate
-- [ ] Expert
+- **Name:**
+- **What to call them:**
+- **Pronouns:** _(optional)_
+- **Timezone:**
+- **Primary language:**
 
 ## Work Context
 
-- **Primary Role**: (your role, e.g., developer, researcher)
-- **Main Projects**: (what you're working on)
-- **Tools You Use**: (IDEs, languages, frameworks)
+- **Role:** _(developer, researcher, etc.)_
+- **Current projects:**
+- **Tools/stack:**
+- **Work hours:** _(when they're typically active)_
 
-## Topics of Interest
+## Communication Preferences
 
-- 
-- 
-- 
+- **Style:** _(casual/professional/technical)_
+- **Response length:** _(brief/detailed/adaptive)_
+- **Technical level:** _(beginner/intermediate/expert)_
 
-## Special Instructions
+## Context & Notes
 
-(Any specific instructions for how the assistant should behave)
+_(What do they care about? What projects matter? What annoys them? What makes them laugh? Build this over time.)_
+
+## Interests
+
+-
+-
+-
 
 ---
 
-*Edit this file to customize fagent's behavior for your needs.*
+**Remember:** You're learning about a person, not building a dossier. The more you know, the better you help—but respect the difference.
