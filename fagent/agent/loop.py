@@ -26,6 +26,7 @@ from fagent.agent.tools.memory_search import (
     MemoryGetArtifactTool,
     MemoryGetEntityTool,
     MemorySearchTool,
+    MemorySemanticGraphSearchTool,
 )
 from fagent.agent.tools.message import MessageTool
 from fagent.agent.tools.moa import MoaTool
@@ -164,6 +165,7 @@ class AgentLoop:
         self.tools.register(MemorySearchTool(memory=self.memory))
         self.tools.register(MemoryGetArtifactTool(memory=self.memory))
         self.tools.register(MemoryGetEntityTool(memory=self.memory))
+        self.tools.register(MemorySemanticGraphSearchTool(memory=self.memory))
         workflow_light_role = self.app_config.resolve_model_role("workflow_light", self.model) if self.app_config else None
         workflow_provider = self.provider
         if self.provider_factory and workflow_light_role and workflow_light_role.provider_kind not in ("", "inherit"):
@@ -592,16 +594,17 @@ class AgentLoop:
             self.sessions.save(session)
             episode = self.memory.build_episode(key, turn_id, channel, chat_id, saved_entries)
             await self._emit_progress(on_progress, (final_content or "")[:120], stage="Draft ready", status="done")
-            await self._post_turn_memory_tasks(
-                session,
-                turn_id,
-                msg.content,
-                tools_used,
-                tool_call_count,
-                saved_entries,
-                episode=episode,
-                on_progress=on_progress,
-            )
+            if not msg.metadata.get("_subagent_result"):
+                await self._post_turn_memory_tasks(
+                    session,
+                    turn_id,
+                    msg.content,
+                    tools_used,
+                    tool_call_count,
+                    saved_entries,
+                    episode=episode,
+                    on_progress=on_progress,
+                )
             await self._emit_progress(on_progress, "Turn complete", stage="Turn complete", status="done")
             return OutboundMessage(
                 channel=channel,
@@ -748,16 +751,17 @@ class AgentLoop:
         self.sessions.save(session)
         episode = self.memory.build_episode(key, turn_id, msg.channel, msg.chat_id, saved_entries)
         await self._emit_progress(on_progress or _bus_progress, final_content[:120], stage="Draft ready", status="done")
-        await self._post_turn_memory_tasks(
-            session,
-            turn_id,
-            msg.content,
-            tools_used,
-            tool_call_count,
-            saved_entries,
-            episode=episode,
-            on_progress=on_progress or _bus_progress,
-        )
+        if not msg.metadata.get("_subagent_result"):
+            await self._post_turn_memory_tasks(
+                session,
+                turn_id,
+                msg.content,
+                tools_used,
+                tool_call_count,
+                saved_entries,
+                episode=episode,
+                on_progress=on_progress or _bus_progress,
+            )
         await self._emit_progress(on_progress or _bus_progress, "Turn complete", stage="Turn complete", status="done")
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:

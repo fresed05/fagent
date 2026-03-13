@@ -1875,6 +1875,51 @@ def status():
                 console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
 
 
+@app.command()
+def skills():
+    """List available skills."""
+    from fagent.config.loader import load_config
+    from fagent.agent.skills import SkillsLoader
+
+    config = load_config()
+    workspace = config.workspace_path
+    loader = SkillsLoader(workspace)
+
+    _print_brand_banner("Available Skills")
+
+    all_skills = loader.list_skills(filter_unavailable=False)
+
+    if not all_skills:
+        console.print("[dim]No skills found[/dim]")
+        return
+
+    table = Table(box=box.ROUNDED, show_header=True)
+    table.add_column("Name", style="cyan", no_wrap=True)
+    table.add_column("Description", style="white")
+    table.add_column("Source", style="dim", no_wrap=True)
+    table.add_column("Status", style="green", no_wrap=True)
+
+    for skill in all_skills:
+        name = skill["name"]
+        desc = loader._get_skill_description(name)
+        source = skill["source"]
+        meta = loader._get_skill_meta(name)
+        available = loader._check_requirements(meta)
+        status = "✓" if available else "✗"
+        status_style = "green" if available else "red"
+
+        table.add_row(
+            name,
+            desc[:60] + "..." if len(desc) > 60 else desc,
+            source,
+            f"[{status_style}]{status}[/{status_style}]"
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]Total: {len(all_skills)} skills[/dim]")
+    console.print(f"[dim]Workspace: {workspace / 'skills'}[/dim]")
+
+
 # ============================================================================
 # OAuth Login
 # ============================================================================

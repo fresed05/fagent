@@ -1448,7 +1448,7 @@ class MemoryOrchestrator:
             if candidates:
                 top = candidates[0]
                 candidate_score = float(top.get("search_score", 0.0) or 0.0)
-                if candidate_score >= 0.3:
+                if candidate_score >= 0.2:
                     row = self.registry.get_graph_node(str(top["id"]))
                     match_source = "ranked_graph_search"
                     match_confidence = candidate_score
@@ -1564,6 +1564,71 @@ class MemoryOrchestrator:
                 "edges": [],
             }
         return None
+
+    def semantic_search_nodes(self, query: str, top_k: int = 5, include_edges: bool = True) -> list[dict]:
+        """Semantic search over graph nodes using embeddings."""
+        if not self.vector_backend:
+            return []
+
+        try:
+            query_vector = self.vector_backend.embed(query)
+            node_embeddings = self.registry.get_all_node_embeddings()
+
+            if not node_embeddings:
+                return []
+
+            # Compute cosine similarity
+            scores = []
+            for node_id, node_vector in node_embeddings:
+                similarity = self._cosine_similarity(query_vector, node_vector)
+                scores.append((node_id, similarity))
+
+            # Sort by similarity and take top_k
+            scores.sort(key=lambda x: x[1], reverse=True)
+            top_nodes = scores[:top_k]
+
+            results = []
+            for node_id, score in top_nodes:
+                node_row = self.registry.get_graph_node(node_id)
+                if not node_row:
+                    continue
+
+                result = {
+                    "id": node_row["id"],
+                    "label": node_row["label"],
+                    "score": score,
+                    "metadata": json.loads(node_row["metadata_json"]) if node_row["metadata_json"] else {},
+                }
+
+                if include_edges:
+                    edges = self.registry.get_graph_edges_for_node(node_id, limit=16)
+                    result["edges"] = [
+                        {
+                            "source_id": edge["source_id"],
+                            "target_id": edge["target_id"],
+                            "relation": edge["relation"],
+                            "weight": edge["weight"],
+                        }
+                        for edge in edges
+                    ]
+
+                results.append(result)
+
+            return results
+        except Exception as exc:
+            logger.warning("Semantic search failed: {}", exc)
+            return []
+
+    @staticmethod
+    def _cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
+        """Compute cosine similarity between two vectors."""
+        import math
+        dot_product = sum(a * b for a, b in zip(vec1, vec2))
+        magnitude1 = math.sqrt(sum(a * a for a in vec1))
+        magnitude2 = math.sqrt(sum(b * b for b in vec2))
+        if magnitude1 == 0 or magnitude2 == 0:
+            return 0.0
+        return dot_product / (magnitude1 * magnitude2)
 
     def export_graph_subgraph(
         self,

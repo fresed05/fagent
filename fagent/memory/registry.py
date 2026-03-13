@@ -134,6 +134,11 @@ class MemoryRegistry:
                     expires_at TEXT,
                     PRIMARY KEY (artifact_id, content_hash, embedding_version)
                 );
+                CREATE TABLE IF NOT EXISTS graph_node_embeddings (
+                    node_id TEXT PRIMARY KEY,
+                    vector_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE TABLE IF NOT EXISTS graph_jobs (
                     job_id TEXT PRIMARY KEY,
                     episode_id TEXT NOT NULL,
@@ -722,6 +727,24 @@ class MemoryRegistry:
                 """,
                 (source_id, target_id, relation),
             ).fetchone()
+
+    def upsert_node_embedding(self, node_id: str, vector: list[float]) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO graph_node_embeddings(node_id, vector_json)
+                VALUES (?, ?)
+                ON CONFLICT(node_id) DO UPDATE SET
+                    vector_json=excluded.vector_json,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (node_id, json.dumps(vector)),
+            )
+
+    def get_all_node_embeddings(self) -> list[tuple[str, list[float]]]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT node_id, vector_json FROM graph_node_embeddings").fetchall()
+            return [(row["node_id"], json.loads(row["vector_json"])) for row in rows]
 
     def list_graph_nodes(
         self,

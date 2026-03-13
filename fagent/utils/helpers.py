@@ -71,6 +71,8 @@ def split_message(content: str, max_len: int = 2000) -> list[str]:
 def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
     """Sync bundled templates to workspace. Only creates missing files."""
     from importlib.resources import files as pkg_files
+    import shutil
+
     try:
         tpl = pkg_files("fagent") / "templates"
     except Exception:
@@ -91,7 +93,23 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         if item.name.endswith(".md"):
             _write(item, workspace / item.name)
     _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md")
-    (workspace / "skills").mkdir(exist_ok=True)
+
+    # Create skills directory
+    skills_dir = workspace / "skills"
+    skills_dir.mkdir(exist_ok=True)
+
+    # Copy builtin skills to workspace if not exists
+    try:
+        builtin_skills = pkg_files("fagent") / "skills"
+        if builtin_skills.is_dir():
+            for skill_dir in builtin_skills.iterdir():
+                if skill_dir.is_dir():
+                    dest_skill = skills_dir / skill_dir.name
+                    if not dest_skill.exists():
+                        shutil.copytree(str(skill_dir), str(dest_skill))
+                        added.append(f"skills/{skill_dir.name}")
+    except Exception:
+        pass
 
     if added and not silent:
         from rich.console import Console

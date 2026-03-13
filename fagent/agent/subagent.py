@@ -211,6 +211,7 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
             sender_id="subagent",
             chat_id=f"{origin['channel']}:{origin['chat_id']}",
             content=announce_content,
+            metadata={"_subagent_result": True},
         )
 
         await self.bus.publish_inbound(msg)

@@ -671,6 +671,11 @@ class TelegramChannel(BaseChannel):
             logger.warning("Telegram bot not running")
             return
 
+        # Skip text messages from subagents (but allow progress/tool calls)
+        if msg.metadata.get("_subagent_result") and not msg.metadata.get("_progress"):
+            logger.debug("Skipping subagent text message to Telegram")
+            return
+
         if not msg.metadata.get("_progress", False):
             self._stop_typing(msg.chat_id)
 

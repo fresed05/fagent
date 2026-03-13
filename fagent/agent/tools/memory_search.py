@@ -198,3 +198,43 @@ class MemoryGetEntityTool(Tool):
             ensure_ascii=False,
             indent=2,
         )
+
+
+class MemorySemanticGraphSearchTool(Tool):
+    """Semantic search over graph nodes using embeddings."""
+
+    def __init__(self, memory: MemoryOrchestrator | NullMemoryOrchestrator):
+        self.memory = memory
+
+    @property
+    def name(self) -> str:
+        return "memory_semantic_graph_search"
+
+    @property
+    def description(self) -> str:
+        return "Semantic search over graph nodes to find related entities and their connections."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "minLength": 2},
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 10},
+                "include_edges": {"type": "boolean"},
+            },
+            "required": ["query"],
+        }
+
+    async def execute(self, query: str, top_k: int = 5, include_edges: bool = True) -> str:
+        results = self.memory.semantic_search_nodes(query, top_k=top_k, include_edges=include_edges)
+        return json.dumps(
+            {
+                "query": query,
+                "count": len(results),
+                "results": results,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+

@@ -1081,9 +1081,35 @@ class LocalGraphBackend:
                     {"episode_id": episode.episode_id, "source": "relation"},
                 )
             )
-        self.registry.bulk_upsert_graph_nodes(node_rows)
-        self.registry.bulk_replace_graph_aliases(alias_rows_by_entity)
-        self.registry.bulk_upsert_graph_edges(edge_rows)
+
+        try:
+            logger.debug(
+                "Persisting graph: {} nodes, {} edges,  entities with aliases",
+                len(node_rows),
+                len(edge_rows),
+                len(alias_rows_by_entity),
+            )
+            self.registry.bulk_upsert_graph_nodes(node_rows)
+            self.registry.bulk_replace_graph_aliases(alias_rows_by_entity)
+            self.registry.bulk_upsert_graph_edges(edge_rows)
+
+            if self.semantic_embedder:
+                for node_id, label, metadata, *_ in node_rows:
+                    try:
+                        vector = self.semantic_embedder.embed(label)
+                        self.registry.upsert_node_embedding(node_id, vector)
+                    except Exception as emb_exc:
+                        logger.warning("Failed to embed node {}: {}", node_id, emb_exc)
+        except Exception as exc:
+            logger.error(
+                "Graph persistence failed: {} | extraction keys: {} | entities: {} | facts: {} | relations: {}",
+                exc,
+                list(extraction.keys()),
+                len(entities),
+                len(facts),
+                len(relations),
+            )
+            raise
 
     def _slug(self, value: str) -> str:
         return hashlib.sha1(value.encode("utf-8")).hexdigest()[:12]
