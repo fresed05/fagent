@@ -1007,7 +1007,7 @@ class LocalGraphBackend:
                 "provenance_episode": episode.episode_id,
                 "source": "llm_graph_agent",
             }
-            node_rows.append((entity_id, label, metadata))
+            node_rows.append((entity_id, label, metadata, 3))
             alias_rows_by_entity[entity_id] = aliases
             edge_rows.append(
                 (
@@ -1039,6 +1039,7 @@ class LocalGraphBackend:
                         "supersedes": fact.get("supersedes", []),
                         "source": "llm_graph_agent",
                     },
+                    3,
                 )
             )
             subject = str(fact.get("subject") or episode_node)

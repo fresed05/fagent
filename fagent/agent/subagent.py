@@ -61,29 +61,95 @@ class SubagentManager:
         session_key: str | None = None,
         model: str | None = None,
     ) -> str:
-        """Spawn a subagent to execute a task in the background."""
+        """Spawn a subagent and wait for result."""
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
 
-        bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin, model)
-        )
-        self._running_tasks[task_id] = bg_task
-        if session_key:
-            self._session_tasks.setdefault(session_key, set()).add(task_id)
+        logger.info("Spawning subagent [{}]: {}", task_id, display_label)
 
-        def _cleanup(_: asyncio.Task) -> None:
-            self._running_tasks.pop(task_id, None)
-            if session_key and (ids := self._session_tasks.get(session_key)):
-                ids.discard(task_id)
-                if not ids:
-                    del self._session_tasks[session_key]
+        result = await self._run_subagent_sync(task_id, task, display_label, origin, model)
+        return result
 
-        bg_task.add_done_callback(_cleanup)
+    async def _run_subagent_sync(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        origin: dict[str, str],
+        model: str | None = None,
+    ) -> str:
+        """Execute subagent synchronously and return result."""
+        logger.info("Subagent [{}] starting task: {}", task_id, label)
 
-        logger.info("Spawned subagent [{}]: {}", task_id, display_label)
-        return f"Subagent [{display_label}] started (id: {task_id}). I'll notify you when it completes."
+        subagent_model = model or self.model
+
+        try:
+            tools = ToolRegistry()
+            tools.register(ReadFileTool(workspace=self.workspace))
+            tools.register(WriteFileTool(workspace=self.workspace))
+            tools.register(EditFileTool(workspace=self.workspace))
+            tools.register(ListDirTool(workspace=self.workspace))
+            tools.register(ExecTool(workspace=self.workspace))
+            tools.register(WebSearchTool())
+            tools.register(WebFetchTool())
+            tools.register(MemorySearchTool(memory=self.memory))
+            tools.register(MemoryGetArtifactTool(memory=self.memory))
+            tools.register(MemoryGetEntityTool(memory=self.memory))
+
+            system_prompt = self._build_subagent_prompt()
+            messages = [{"role": "user", "content": task}]
+
+            final_result = None
+            for _ in range(20):
+                response = await self.provider.generate(
+                    model=subagent_model,
+                    messages=messages,
+                    system=system_prompt,
+                    tools=tools.to_schema(),
+                    max_tokens=8000,
+                )
+
+                if response.tool_calls:
+                    tool_call_dicts = [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                            },
+                        }
+                        for tc in response.tool_calls
+                    ]
+                    messages.append({
+                        "role": "assistant",
+                        "content": response.content or "",
+                        "tool_calls": tool_call_dicts,
+                    })
+
+                    for tool_call in response.tool_calls:
+                        result = await tools.execute(tool_call.name, tool_call.arguments)
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_call.name,
+                            "content": result,
+                        })
+                else:
+                    final_result = response.content
+                    break
+
+            if final_result is None:
+                final_result = "Task completed but no final response was generated."
+
+            logger.info("Subagent [{}] completed successfully", task_id)
+            return final_result
+
+        except Exception as e:
+            logger.error("Subagent [{}] failed: {}", task_id, e)
+            return f"Error: {str(e)}"
+
 
     async def _run_subagent(
         self,

@@ -121,6 +121,9 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         """Load all bootstrap files from workspace."""
         parts = []
 
+        # Add warning about already-loaded files
+        parts.append("# Bootstrap Context\n\nThe following files are already loaded in your context. DO NOT read them again with read_file:\n- IDENTITY.md\n- SOUL.md\n- USER.md\n- AGENTS.md\n- TOOLS.md\n")
+
         for filename in self.BOOTSTRAP_FILES:
             file_path = self.workspace / filename
             if file_path.exists():
