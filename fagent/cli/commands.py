@@ -1958,5 +1958,102 @@ def _login_github_copilot() -> None:
         raise typer.Exit(1)
 
 
+# ============================================================================
+# Agent Management
+# ============================================================================
+
+agent_app = typer.Typer(help="Manage agents")
+app.add_typer(agent_app, name="agent")
+
+
+@agent_app.command("create")
+def agent_create(
+    name: str = typer.Argument(..., help="Agent name"),
+    model: str = typer.Option(None, help="Model to use (e.g., 'anthropic/claude-sonnet-4')"),
+):
+    """Create a new agent configuration."""
+    from fagent.config.loader import get_config_path, load_config, save_config
+    from fagent.config.schema import AgentConfig
+
+    config = load_config()
+
+    if name in config.agents.agents:
+        console.print(f"[red]Agent '{name}' already exists[/red]")
+        raise typer.Exit(1)
+
+    agent_config = AgentConfig(model=model)
+    config.agents.agents[name] = agent_config
+
+    save_config(config)
+    console.print(f"[green]✓ Agent '{name}' created[/green]")
+    if model:
+        console.print(f"  Model: {model}")
+
+
+@agent_app.command("list")
+def agent_list():
+    """List all configured agents."""
+    from fagent.config.loader import load_config
+
+    config = load_config()
+
+    if not config.agents.agents:
+        console.print("[dim]No agents configured[/dim]")
+        return
+
+    table = Table(title="Configured Agents", box=box.ROUNDED)
+    table.add_column("Name", style="cyan")
+    table.add_column("Model", style="green")
+    table.add_column("Temperature", style="yellow")
+    table.add_column("Max Tokens", style="blue")
+
+    for name, agent_config in config.agents.agents.items():
+        model = agent_config.model or config.agents.defaults.model
+        temp = str(agent_config.temperature) if agent_config.temperature is not None else "default"
+        tokens = str(agent_config.max_tokens) if agent_config.max_tokens is not None else "default"
+        table.add_row(name, model, temp, tokens)
+
+    console.print(table)
+
+
+@agent_app.command("delete")
+def agent_delete(name: str = typer.Argument(..., help="Agent name")):
+    """Delete an agent configuration."""
+    from fagent.config.loader import load_config, save_config
+
+    config = load_config()
+
+    if name not in config.agents.agents:
+        console.print(f"[red]Agent '{name}' not found[/red]")
+        raise typer.Exit(1)
+
+    del config.agents.agents[name]
+    save_config(config)
+    console.print(f"[green]✓ Agent '{name}' deleted[/green]")
+
+
+@agent_app.command("config")
+def agent_config(name: str = typer.Argument(..., help="Agent name")):
+    """Show agent configuration."""
+    from fagent.config.loader import load_config
+
+    config = load_config()
+
+    if name not in config.agents.agents:
+        console.print(f"[red]Agent '{name}' not found[/red]")
+        raise typer.Exit(1)
+
+    agent = config.agents.agents[name]
+    defaults = config.agents.defaults
+
+    console.print(f"\n[cyan]Agent: {name}[/cyan]\n")
+    console.print(f"Model: {agent.model or defaults.model}")
+    console.print(f"Temperature: {agent.temperature if agent.temperature is not None else defaults.temperature}")
+    console.print(f"Max Tokens: {agent.max_tokens if agent.max_tokens is not None else defaults.max_tokens}")
+    console.print(f"Vector Memory: {'disabled' if agent.disable_vector_memory else 'enabled'}")
+    console.print(f"Shadow Context: {'disabled' if agent.disable_shadow_context else 'enabled'}")
+    console.print(f"Graph Memory: {'disabled' if agent.disable_graph_memory else 'enabled'}")
+
+
 if __name__ == "__main__":
     app()

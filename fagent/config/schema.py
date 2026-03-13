@@ -234,10 +234,27 @@ class AgentDefaults(Base):
     reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
 
 
+class AgentConfig(Base):
+    """Individual agent configuration with optional overrides."""
+
+    model: str | None = None
+    provider: str | None = None
+    max_tokens: int | None = None
+    temperature: float | None = None
+    max_tool_iterations: int | None = None
+    memory_window: int | None = None
+    reasoning_effort: str | None = None
+    disable_vector_memory: bool = False
+    disable_shadow_context: bool = False
+    disable_graph_memory: bool = False
+    disable_post_processing: bool = False
+
+
 class AgentsConfig(Base):
     """Agent configuration."""
 
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+    agents: dict[str, AgentConfig] = Field(default_factory=dict)
 
 
 class ProviderInstanceConfig(Base):

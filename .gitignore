@@ -27,3 +27,4 @@ runtime-demo-config.json
 *.sqlite3
 botpy.log
 
+config.json
