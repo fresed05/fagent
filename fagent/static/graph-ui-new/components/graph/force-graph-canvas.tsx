@@ -4,7 +4,13 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import ForceGraph2D from "react-force-graph-2d";
 import { forceCollide } from "d3-force";
 import { RawNode, RawEdge } from "@/lib/graph-types";
-import { NODE_COLORS, NodeKind, calculateNodeSize } from "@/lib/sigma-styles";
+import { NODE_COLORS as _NODE_COLORS_SIGMA, NodeKind, calculateNodeSize } from "@/lib/sigma-styles";
+
+// Safe color lookup: falls back to 'entity' color for unknown node kinds
+const FALLBACK_COLOR = "#64748b";
+function getNodeColor(kind: string): string {
+  return (_NODE_COLORS_SIGMA as Record<string, string>)[kind] ?? FALLBACK_COLOR;
+}
 
 interface ForceGraphCanvasProps {
   rawNodes: RawNode[];
@@ -160,7 +166,7 @@ export function ForceGraphCanvas({
         const isDimmed = hoveredNode && !isHighlighted;
         
         // Цвет узла
-        const color = NODE_COLORS[node.kind as NodeKind];
+        const color = getNodeColor(node.kind as string);
         
         // Glow эффект
         if (!isDimmed) {
@@ -241,8 +247,8 @@ export function ForceGraphCanvas({
           ctx.globalAlpha = 0.8;
         } else {
           // Градиент от цвета source к цвету target
-          const sourceColor = sourceNode ? NODE_COLORS[sourceNode.kind as NodeKind] : '#64748b';
-          const targetColor = targetNode ? NODE_COLORS[targetNode.kind as NodeKind] : '#64748b';
+          const sourceColor = sourceNode ? getNodeColor(sourceNode.kind as string) : FALLBACK_COLOR;
+          const targetColor = targetNode ? getNodeColor(targetNode.kind as string) : FALLBACK_COLOR;
           
           const gradient = ctx.createLinearGradient(start.x, start.y, end.x, end.y);
           gradient.addColorStop(0, sourceColor);
