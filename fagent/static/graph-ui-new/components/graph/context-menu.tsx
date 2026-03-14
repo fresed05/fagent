@@ -130,7 +130,7 @@ export function ContextMenu({
     : canvasActions
 
   const kind = (node?.data?.kind || "entity") as NodeKind
-  const colors = NODE_COLORS[kind]
+  const colors = NODE_COLORS[kind] || NODE_COLORS.entity
 
   return (
     <div

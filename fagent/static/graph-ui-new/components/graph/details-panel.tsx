@@ -82,8 +82,8 @@ export function DetailsPanel({
     )
   }
 
-  const kind = details.kind || "entity"
-  const colors = NODE_COLORS[kind]
+  const kind = (details.kind || "entity") as NodeKind
+  const colors = NODE_COLORS[kind] || NODE_COLORS.entity
 
   // Filter neighbors by search
   const filteredNeighbors = details.neighbors?.filter(n => 
@@ -222,7 +222,7 @@ export function DetailsPanel({
             <div className="space-y-1">
               {filteredNeighbors.map((neighbor: RawNode) => {
                 const neighborKind = (neighbor.metadata?.kind || "entity") as NodeKind
-                const neighborColors = NODE_COLORS[neighborKind]
+                const neighborColors = NODE_COLORS[neighborKind] || NODE_COLORS.entity
                 const edge = details.edges?.find(e => 
                   e.source_id === neighbor.id || e.target_id === neighbor.id
                 )

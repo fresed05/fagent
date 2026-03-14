@@ -1,15 +1,9 @@
 import type { Metadata } from 'next'
-import { Geist, Geist_Mono } from 'next/font/google'
-import { Analytics } from '@vercel/analytics/next'
 import './globals.css'
 
-const _geist = Geist({ subsets: ["latin"] });
-const _geistMono = Geist_Mono({ subsets: ["latin"] });
-
 export const metadata: Metadata = {
-  title: 'Graph Atlas - High-Performance Knowledge Graph Visualization',
-  description: 'Modern, optimized interactive visualization for large-scale knowledge graphs with 10,000+ nodes. Features force-directed layouts, clustering, LOD rendering, and context menus.',
-  generator: 'v0.app',
+  title: 'Graph Atlas - Knowledge Graph Visualization',
+  description: 'Interactive knowledge graph visualization for fagent memory.',
   icons: {
     icon: [
       {
@@ -38,7 +32,6 @@ export default function RootLayout({
     <html lang="en" className="dark">
       <body className="font-sans antialiased overflow-hidden">
         {children}
-        <Analytics />
       </body>
     </html>
   )

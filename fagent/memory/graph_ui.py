@@ -93,6 +93,15 @@ class GraphUiRequestHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
 
     def do_GET(self) -> None:  # noqa: N802
+        try:
+            self._handle_get()
+        except Exception:  # noqa: BLE001
+            try:
+                self._send_json({"error": "internal_error"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _handle_get(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
 
@@ -177,7 +186,21 @@ class GraphUiRequestHandler(BaseHTTPRequestHandler):
             self._serve_file(index_candidate)
             return
 
-        # SPA fallback: serve root index.html for unknown paths
+        # Do NOT SPA-fallback for asset paths — return 404 to avoid
+        # the browser misinterpreting an HTML page as JavaScript/CSS.
+        _NO_SPA_PREFIXES = ("/_next/", "/_vercel/", "/static/", "/favicon")
+        if any(url_path.startswith(p) for p in _NO_SPA_PREFIXES):
+            self._send_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
+            return
+
+        # Also do not SPA-fallback for requests with known asset extensions
+        _ASSET_EXTS = {".js", ".mjs", ".css", ".map", ".woff", ".woff2", ".ttf", ".ico", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp"}
+        suffix = Path(url_path.split("?")[0]).suffix.lower()
+        if suffix in _ASSET_EXTS:
+            self._send_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
+            return
+
+        # SPA fallback: serve root index.html for unknown HTML routes
         root_index = _STATIC_DIR / "index.html"
         if root_index.is_file():
             self._serve_file(root_index)

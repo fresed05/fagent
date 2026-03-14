@@ -183,7 +183,7 @@ export function SearchPanel({ nodes, onSelectNode, selectedNodeId }: SearchPanel
         {showFilters && (
           <div className="flex flex-wrap gap-1.5 mt-3 pt-3 border-t border-border/30">
             {nodeKinds.map((kind) => {
-              const colors = NODE_COLORS[kind]
+              const colors = NODE_COLORS[kind] || NODE_COLORS.entity
               const isActive = activeFilters.has(kind)
               const count = kindCounts[kind] || 0
               return (
@@ -234,7 +234,7 @@ export function SearchPanel({ nodes, onSelectNode, selectedNodeId }: SearchPanel
         <div className="p-2 space-y-0.5">
           {visibleNodes.map((node) => {
             const kind = (node.metadata?.kind || "entity") as NodeKind
-            const colors = NODE_COLORS[kind]
+            const colors = NODE_COLORS[kind] || NODE_COLORS.entity
             const isSelected = selectedNodeId === node.id
 
             return (
