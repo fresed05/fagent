@@ -27,4 +27,17 @@ runtime-demo-config.json
 *.sqlite3
 botpy.log
 
+# graph-ui-new: compiled output and dev artifacts (not committed)
+fagent/static/graph-ui-new/out/
+fagent/static/graph-ui-new/.next/
+fagent/static/graph-ui-new/node_modules/
+# pnpm lockfile is redundant — project uses npm (package-lock.json)
+fagent/static/graph-ui-new/pnpm-lock.yaml
+# Next.js / v0 generated placeholder images
+fagent/static/graph-ui-new/public/placeholder.jpg
+fagent/static/graph-ui-new/public/placeholder.svg
+fagent/static/graph-ui-new/public/placeholder-logo.png
+fagent/static/graph-ui-new/public/placeholder-logo.svg
+fagent/static/graph-ui-new/public/placeholder-user.jpg
+
 config.json

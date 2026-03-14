@@ -383,12 +383,21 @@ class HeartbeatConfig(Base):
     interval_s: int = 30 * 60  # 30 minutes
 
 
+class GraphUiConfig(Base):
+    """Graph UI embedded web server configuration."""
+
+    enabled: bool = False
+    port: int = 8765
+    open_browser: bool = False
+
+
 class GatewayConfig(Base):
     """Gateway/server configuration."""
 
     host: str = "0.0.0.0"
     port: int = 18790
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
+    graph_ui: GraphUiConfig = Field(default_factory=GraphUiConfig)
 
 
 class WebSearchConfig(Base):

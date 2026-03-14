@@ -66,11 +66,64 @@ That helps with:
 - checking whether useful entities and relations exist
 - understanding why a relationship-oriented answer happened
 
+## Graph UI — new interface (graph-ui-new)
+
+The Graph UI has been upgraded to a modern React/Next.js interface built with
+`react-force-graph-2d`, Tailwind CSS and Radix UI. It replaces the old
+`graph_ui/` Vanilla JS viewer.
+
+Features of the new UI:
+
+- force-directed layout with radial and hierarchical modes
+- live search and filter panel with kind/type filters
+- rich details panel showing neighbors, edges, and metadata
+- zoom-independent labels (LOD rendering)
+- keyboard shortcuts: `R` relayout, `L` toggle labels, `Esc` deselect
+- graph mode selector: Atlas (clustered) / Raw (all nodes)
+- query and session filter passed through URL or UI
+
+### First-time setup
+
+The new UI must be compiled once before use:
+
+```bash
+# Requires Node.js >= 18 and npm
+fagent memory graph-ui-install
+```
+
+This builds the static frontend into `fagent/static/graph-ui-new/out/` which
+the Python server then serves.
+
+### Auto-start with gateway
+
+Add to `config.json` to start the Graph UI automatically when `fagent gateway` runs:
+
+```json
+{
+  "gateway": {
+    "graph_ui": {
+      "enabled": true,
+      "port": 8765,
+      "open_browser": false
+    }
+  }
+}
+```
+
+Use `"open_browser": true` to open a tab in the default browser on startup.
+
 ## CLI commands
 
 ```bash
-fagent memory graph-ui --open
+# Build the UI (once after installation or upgrade)
+fagent memory graph-ui-install
+
+# Start the Graph UI server (opens browser by default)
+fagent memory graph-ui
 fagent memory graph-ui --query "shadow context"
+fagent memory graph-ui --port 9090 --no-open
+
+# Graph data management
 fagent memory rebuild-graph
 fagent memory inspect-graph-jobs
 fagent memory inspect-task-graph cli:direct

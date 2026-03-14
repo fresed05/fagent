@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import threading
 import webbrowser
 from functools import partial
@@ -15,8 +16,40 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 from fagent.memory.orchestrator import MemoryOrchestrator
 
 
-_STATIC_DIR = Path(__file__).resolve().parent.parent / "static" / "graph_ui"
+# Compiled Next.js static export lives at graph-ui-new/out/
+_STATIC_DIR = Path(__file__).resolve().parent.parent / "static" / "graph-ui-new" / "out"
 _MANAGERS: dict[str, "GraphUiServerManager"] = {}
+
+# Explicit MIME type overrides (supplement system mimetypes)
+_MIME_OVERRIDES: dict[str, str] = {
+    ".html": "text/html; charset=utf-8",
+    ".htm": "text/html; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".mjs": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".ico": "image/x-icon",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+    ".map": "application/json; charset=utf-8",
+    ".txt": "text/plain; charset=utf-8",
+}
+
+
+def _content_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in _MIME_OVERRIDES:
+        return _MIME_OVERRIDES[suffix]
+    guessed, _ = mimetypes.guess_type(str(path))
+    return guessed or "application/octet-stream"
 
 
 def get_graph_ui_manager(workspace: Path) -> "GraphUiServerManager":
@@ -32,7 +65,7 @@ def get_graph_ui_manager(workspace: Path) -> "GraphUiServerManager":
 class GraphUiRequestHandler(BaseHTTPRequestHandler):
     """Serve graph UI static files and a small JSON CRUD API."""
 
-    server_version = "fagent-graph-ui/1.0"
+    server_version = "fagent-graph-ui/2.0"
 
     @property
     def graph_server(self) -> "GraphUiHttpServer":
@@ -41,26 +74,30 @@ class GraphUiRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
         return
 
+    # ------------------------------------------------------------------
+    # CORS preflight
+    # ------------------------------------------------------------------
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self._send_cors_headers()
+        self.end_headers()
+
+    def _send_cors_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    # ------------------------------------------------------------------
+    # GET
+    # ------------------------------------------------------------------
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path == "/":
-            self._serve_static("index.html", "text/html; charset=utf-8")
-            return
-        if parsed.path.startswith("/assets/"):
-            asset_rel = parsed.path.removeprefix("/assets/")
-            asset_root = (_STATIC_DIR / "assets").resolve()
-            asset_path = (asset_root / asset_rel).resolve()
-            if not str(asset_path).startswith(str(asset_root)) or not asset_path.exists():
-                self._send_json({"error": "asset_not_found"}, status=HTTPStatus.NOT_FOUND)
-                return
-            content_type = "application/octet-stream"
-            if asset_path.suffix == ".js":
-                content_type = "application/javascript; charset=utf-8"
-            elif asset_path.suffix == ".css":
-                content_type = "text/css; charset=utf-8"
-            self._serve_static(f"assets/{asset_rel}", content_type)
-            return
-        if parsed.path == "/api/graph":
+        path = parsed.path
+
+        # ----- API routes (unchanged) -----
+        if path == "/api/graph" or path == "/api/graph/overview":
             params = parse_qs(parsed.query)
             payload = self.graph_server.orchestrator.export_graph_overview(
                 query=_first(params.get("query")),
@@ -71,20 +108,10 @@ class GraphUiRequestHandler(BaseHTTPRequestHandler):
             )
             self._send_json(payload)
             return
-        if parsed.path == "/api/graph/overview":
+
+        if path.startswith("/api/graph/focus/"):
             params = parse_qs(parsed.query)
-            payload = self.graph_server.orchestrator.export_graph_overview(
-                query=_first(params.get("query")),
-                session_key=_first(params.get("session")),
-                mode=_first(params.get("mode")) or "global-clustered",
-                node_limit=_int_or_default(_first(params.get("node_limit")), 200),
-                edge_limit=_int_or_default(_first(params.get("edge_limit")), 400),
-            )
-            self._send_json(payload)
-            return
-        if parsed.path.startswith("/api/graph/focus/"):
-            params = parse_qs(parsed.query)
-            node_id = unquote(parsed.path.removeprefix("/api/graph/focus/"))
+            node_id = unquote(path.removeprefix("/api/graph/focus/"))
             payload = self.graph_server.orchestrator.export_graph_focus(
                 node_id,
                 query=_first(params.get("query")),
@@ -94,9 +121,10 @@ class GraphUiRequestHandler(BaseHTTPRequestHandler):
             )
             self._send_json(payload)
             return
-        if parsed.path.startswith("/api/graph/details/"):
+
+        if path.startswith("/api/graph/details/"):
             params = parse_qs(parsed.query)
-            node_id = unquote(parsed.path.removeprefix("/api/graph/details/"))
+            node_id = unquote(path.removeprefix("/api/graph/details/"))
             payload = self.graph_server.orchestrator.export_graph_details(
                 node_id,
                 query=_first(params.get("query")),
@@ -106,15 +134,76 @@ class GraphUiRequestHandler(BaseHTTPRequestHandler):
             )
             self._send_json(payload)
             return
-        if parsed.path.startswith("/api/graph/node/"):
-            node_id = unquote(parsed.path.removeprefix("/api/graph/node/"))
+
+        if path.startswith("/api/graph/node/"):
+            node_id = unquote(path.removeprefix("/api/graph/node/"))
             entity = self.graph_server.orchestrator.get_entity(node_id)
             if entity is None:
                 self._send_json({"error": "node_not_found", "node_id": node_id}, status=HTTPStatus.NOT_FOUND)
                 return
             self._send_json(entity)
             return
+
+        # ----- Static file serving (Next.js export) -----
+        self._serve_static_path(path)
+
+    def _serve_static_path(self, url_path: str) -> None:
+        """Resolve a URL path to a file in _STATIC_DIR and serve it.
+
+        Falls back to index.html for SPA navigation (client-side routing).
+        With `trailingSlash: true` in next.config.mjs, Next.js generates
+        /foo/index.html for each route, but we also handle the bare /foo case.
+        """
+        # Normalise: strip leading slash, default to index.html
+        relative = url_path.lstrip("/") or "index.html"
+
+        candidate = (_STATIC_DIR / relative).resolve()
+
+        # Security check: must stay within _STATIC_DIR
+        try:
+            candidate.relative_to(_STATIC_DIR)
+        except ValueError:
+            self._send_json({"error": "forbidden"}, status=HTTPStatus.FORBIDDEN)
+            return
+
+        # Try exact path first
+        if candidate.is_file():
+            self._serve_file(candidate)
+            return
+
+        # Try appending index.html (trailingSlash behaviour)
+        index_candidate = candidate / "index.html"
+        if index_candidate.is_file():
+            self._serve_file(index_candidate)
+            return
+
+        # SPA fallback: serve root index.html for unknown paths
+        root_index = _STATIC_DIR / "index.html"
+        if root_index.is_file():
+            self._serve_file(root_index)
+            return
+
         self._send_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
+
+    def _serve_file(self, path: Path) -> None:
+        body = path.read_bytes()
+        ct = _content_type(path)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", ct)
+        self.send_header("Content-Length", str(len(body)))
+        # Cache control: aggressive caching for _next/static (hashed filenames),
+        # no-cache for HTML (SPA entry points)
+        if "/_next/static/" in path.as_posix():
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        else:
+            self.send_header("Cache-Control", "no-cache")
+        self._send_cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    # ------------------------------------------------------------------
+    # POST
+    # ------------------------------------------------------------------
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -148,6 +237,10 @@ class GraphUiRequestHandler(BaseHTTPRequestHandler):
             self._send_json(payload)
             return
         self._send_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
+
+    # ------------------------------------------------------------------
+    # PATCH
+    # ------------------------------------------------------------------
 
     def do_PATCH(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -197,6 +290,10 @@ class GraphUiRequestHandler(BaseHTTPRequestHandler):
             return
         self._send_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
 
+    # ------------------------------------------------------------------
+    # DELETE
+    # ------------------------------------------------------------------
+
     def do_DELETE(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         if parsed.path.startswith("/api/graph/nodes/"):
@@ -215,14 +312,9 @@ class GraphUiRequestHandler(BaseHTTPRequestHandler):
             return
         self._send_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
 
-    def _serve_static(self, relative_path: str, content_type: str) -> None:
-        path = (_STATIC_DIR / relative_path).resolve()
-        body = path.read_bytes()
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _read_json_body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -239,6 +331,7 @@ class GraphUiRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self._send_cors_headers()
         self.end_headers()
         self.wfile.write(body)
 

@@ -1,6 +1,6 @@
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
-# Install Node.js 20 for the WhatsApp bridge
+# Install Node.js 20 for the WhatsApp bridge and graph-ui-new build
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates gnupg git && \
     mkdir -p /etc/apt/keyrings && \
@@ -19,6 +19,21 @@ COPY pyproject.toml README.md LICENSE ./
 RUN mkdir -p fagent bridge && touch fagent/__init__.py && \
     uv pip install --system --no-cache . && \
     rm -rf fagent bridge
+
+# Build graph-ui-new (Next.js static export → out/)
+# Separate layer so npm install is cached independently
+COPY fagent/static/graph-ui-new/package.json fagent/static/graph-ui-new/package-lock.json /tmp/graph-ui-new/
+WORKDIR /tmp/graph-ui-new
+RUN npm install --legacy-peer-deps
+
+COPY fagent/static/graph-ui-new/ /tmp/graph-ui-new/
+RUN npm run build
+
+# Copy the compiled static output into the source tree
+RUN mkdir -p /app/fagent/static/graph-ui-new && \
+    cp -r /tmp/graph-ui-new/out /app/fagent/static/graph-ui-new/out
+
+WORKDIR /app
 
 # Copy the full source and install
 COPY fagent/ fagent/

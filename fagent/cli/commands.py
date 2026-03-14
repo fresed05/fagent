@@ -1039,6 +1039,31 @@ def gateway(
 
     _print_success(f"Heartbeat: every {hb_cfg.interval_s}s")
 
+    # Auto-start graph UI if configured
+    gui_cfg = config.gateway.graph_ui
+    if gui_cfg.enabled:
+        from fagent.memory.graph_ui import _STATIC_DIR
+        if not (_STATIC_DIR / "index.html").exists():
+            _print_warning(
+                "Graph UI is enabled but not built. "
+                "Run: fagent memory graph-ui-install"
+            )
+        else:
+            try:
+                gui_manager = _get_graph_ui_manager(config.workspace_path)
+                # NOTE: orchestrator is created inside AgentLoop; we re-use the
+                # existing manager pattern — the actual orchestrator is passed
+                # lazily when the UI is first accessed.  Here we pre-start the
+                # HTTP server so the port is open from gateway boot.
+                gui_url = gui_manager.start(
+                    agent.memory,
+                    port=gui_cfg.port,
+                    open_browser=gui_cfg.open_browser,
+                )
+                _print_success(f"Graph UI: {gui_url}")
+            except Exception as _gui_err:  # pragma: no cover
+                _print_warning(f"Graph UI failed to start: {_gui_err}")
+
     async def run():
         try:
             # Detect interrupted sessions from previous gateway run
@@ -1614,6 +1639,91 @@ def memory_graph_ui(
         manager.wait_forever()
     except KeyboardInterrupt:
         manager.stop()
+
+
+@memory_app.command("graph-ui-install")
+def memory_graph_ui_install(
+    force: bool = typer.Option(False, "--force", "-f", help="Reinstall even if already built"),
+):
+    """Build the graph-ui-new frontend (requires Node.js >= 18 and npm).
+
+    Run this once after installing/upgrading fagent to compile the new graph UI.
+    The compiled files are placed in fagent/static/graph-ui-new/out/ and served
+    automatically by the graph UI server.
+    """
+    import shutil
+    import subprocess
+
+    # Resolve the source directory for graph-ui-new
+    # Works both from an installed package and from the development repo
+    pkg_ui = Path(__file__).parent.parent / "static" / "graph-ui-new"  # installed package
+    src_ui = Path(__file__).parent.parent.parent / "fagent" / "static" / "graph-ui-new"  # dev repo
+
+    ui_source: Path | None = None
+    for candidate in (pkg_ui, src_ui):
+        if (candidate / "package.json").exists():
+            ui_source = candidate
+            break
+
+    if ui_source is None:
+        console.print("[red]graph-ui-new source not found.[/red]")
+        console.print("Try reinstalling: pip install --force-reinstall fagent")
+        raise typer.Exit(1)
+
+    out_dir = ui_source / "out"
+
+    if out_dir.exists() and not force:
+        console.print(f"[green]✓[/green] Graph UI already built at {out_dir}")
+        console.print("Pass [bold]--force[/bold] to rebuild.")
+        raise typer.Exit(0)
+
+    # Check npm
+    if not shutil.which("npm"):
+        console.print("[red]npm not found. Please install Node.js >= 18.[/red]")
+        console.print("  https://nodejs.org/en/download")
+        raise typer.Exit(1)
+
+    node_version = subprocess.run(
+        ["node", "--version"], capture_output=True, text=True
+    ).stdout.strip()
+    npm_version = subprocess.run(
+        ["npm", "--version"], capture_output=True, text=True
+    ).stdout.strip()
+    _print_info(f"Node.js {node_version}, npm {npm_version}")
+    _print_info(f"Source: {ui_source}")
+
+    _print_brand_banner("Graph UI build")
+
+    # Install dependencies
+    try:
+        _print_info("Installing npm dependencies (this may take a minute)…")
+        subprocess.run(
+            ["npm", "install", "--legacy-peer-deps"],
+            cwd=ui_source,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        console.print(f"[red]npm install failed: {e}[/red]")
+        raise typer.Exit(1)
+
+    # Build static export
+    try:
+        _print_info("Building static export (next build)…")
+        subprocess.run(
+            ["npm", "run", "build"],
+            cwd=ui_source,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        console.print(f"[red]Build failed: {e}[/red]")
+        raise typer.Exit(1)
+
+    if not out_dir.exists():
+        console.print("[red]Build completed but out/ directory not found — check next.config.mjs.[/red]")
+        raise typer.Exit(1)
+
+    _print_success(f"Graph UI built successfully → {out_dir}")
+    console.print("You can now run: [bold]fagent memory graph-ui[/bold]")
 
 
 @memory_app.command("inspect-graph-jobs")
