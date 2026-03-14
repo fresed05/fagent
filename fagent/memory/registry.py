@@ -798,6 +798,9 @@ class MemoryRegistry:
         self,
         *,
         node_ids: list[str] | None = None,
+        source_id: str | None = None,
+        target_id: str | None = None,
+        relation: str | None = None,
         limit: int = 400,
     ) -> list[sqlite3.Row]:
         sql = """
@@ -805,11 +808,23 @@ class MemoryRegistry:
             FROM graph_edges
         """
         params: list[Any] = []
+        clauses: list[str] = []
         if node_ids:
             placeholders = ", ".join("?" for _ in node_ids)
-            sql += f" WHERE source_id IN ({placeholders}) AND target_id IN ({placeholders})"
+            clauses.append(f"source_id IN ({placeholders}) AND target_id IN ({placeholders})")
             params.extend(node_ids)
             params.extend(node_ids)
+        if source_id:
+            clauses.append("source_id = ?")
+            params.append(source_id)
+        if target_id:
+            clauses.append("target_id = ?")
+            params.append(target_id)
+        if relation:
+            clauses.append("relation = ?")
+            params.append(relation)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY weight DESC, rowid DESC LIMIT ?"
         params.append(limit)
         with self._connect() as conn:

@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import unicodedata
+from collections import Counter
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -90,13 +91,24 @@ _GRAPH_AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "list_graph_roots",
+            "description": "List the persisted top-level graph roots to navigate before searching or creating nodes.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_graph",
             "description": "Search existing graph nodes before creating new ones.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 32, "default": 20},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 10, "default": 10},
                 },
                 "required": ["query"],
             },
@@ -292,6 +304,39 @@ _GRAPH_AGENT_TOOLS = [
 class LocalGraphBackend:
     """SQLite-backed graph memory with tool-driven LLM extraction."""
 
+    ROOT_NODE_SPECS = (
+        {
+            "id": "root:user_profile",
+            "label": "User Profile",
+            "aliases": ["user profile", "preferences", "identity", "about the user"],
+            "description": "Stable information about the user, preferences, identity, and personal context.",
+        },
+        {
+            "id": "root:agent_identity",
+            "label": "Agent Identity",
+            "aliases": ["agent identity", "fagent", "runtime", "models", "prompts"],
+            "description": "Facts about the agent itself, runtime behavior, prompts, and model setup.",
+        },
+        {
+            "id": "root:device_context",
+            "label": "Device Context",
+            "aliases": ["device context", "environment", "os", "terminal", "machine"],
+            "description": "Operating system, shell, hardware, environment, and local machine details.",
+        },
+        {
+            "id": "root:projects",
+            "label": "Projects",
+            "aliases": ["projects", "repositories", "codebase", "workspace"],
+            "description": "Projects, repositories, files, modules, and implementation work.",
+        },
+        {
+            "id": "root:workflow_tools",
+            "label": "Workflow Tools",
+            "aliases": ["workflow tools", "tooling", "providers", "integrations", "automation"],
+            "description": "Tools, workflows, providers, services, and automation chains.",
+        },
+    )
+
     def __init__(
         self,
         workspace: Path,
@@ -313,6 +358,17 @@ class LocalGraphBackend:
         self.semantic_embedder = semantic_embedder
         self._semantic_payload_cache: dict[str, list[float]] = {}
         self.last_search_candidate_count = 0
+
+    @staticmethod
+    def _row_value(row: Any, key: str, default: Any = None) -> Any:
+        if row is None:
+            return default
+        if isinstance(row, dict):
+            return row.get(key, default)
+        keys = row.keys() if hasattr(row, "keys") else ()
+        if key in keys:
+            return row[key]
+        return default
 
     @staticmethod
     def _looks_english(value: str) -> bool:
@@ -398,6 +454,106 @@ class LocalGraphBackend:
             )
         return rows
 
+    def ensure_root_nodes(self) -> None:
+        for spec in self.ROOT_NODE_SPECS:
+            aliases = self._build_alias_rows(spec["label"], list(spec["aliases"]), spec["label"])
+            metadata = {
+                "kind": "root",
+                "graph_root": True,
+                "root_key": spec["id"].split(":", 1)[1],
+                "canonical_name": spec["label"],
+                "aliases": [item["alias_text"] for item in aliases],
+                "description": spec["description"],
+                "priority_score": 100,
+                "source": "system_root",
+            }
+            self.registry.upsert_graph_node(spec["id"], spec["label"], metadata, tier=1)
+            self.registry.replace_graph_aliases(spec["id"], aliases)
+
+    def list_root_nodes(self) -> list[dict[str, Any]]:
+        roots: list[dict[str, Any]] = []
+        for spec in self.ROOT_NODE_SPECS:
+            row = self.registry.get_graph_node(spec["id"])
+            metadata = json.loads(self._row_value(row, "metadata_json", "{}")) if row else {}
+            child_count = len(self.registry.list_graph_edges(source_id=spec["id"], relation="parent_of", limit=256))
+            roots.append(
+                {
+                    "id": spec["id"],
+                    "label": self._row_value(row, "label", spec["label"]),
+                    "aliases": metadata.get("aliases") or list(spec["aliases"]),
+                    "description": metadata.get("description") or spec["description"],
+                    "tier": int(self._row_value(row, "tier", 1) or 1),
+                    "child_count": child_count,
+                }
+            )
+        return roots
+
+    def _embed_text(self, text: str) -> list[float] | None:
+        if self.semantic_embedder is None:
+            return None
+        try:
+            if hasattr(self.semantic_embedder, "embed_query"):
+                return self.semantic_embedder.embed_query(text)
+            if hasattr(self.semantic_embedder, "embed"):
+                return self.semantic_embedder.embed(text)
+            if getattr(self.semantic_embedder, "embedding_client", None) is not None:
+                return self.semantic_embedder.embedding_client.embed_texts([text])[0]
+        except Exception as exc:
+            logger.warning("Failed to embed graph text {}: {}", text[:80], exc)
+        return None
+
+    def _episode_title(self, episode: EpisodeRecord, summary: str) -> str:
+        topic_tags = [
+            str(item).strip()
+            for item in episode.metadata.get("topic_tags", [])
+            if isinstance(item, str) and len(re.sub(r"[^A-Za-zА-Яа-я0-9]+", "", item)) >= 5
+        ]
+        cleaned_tags: list[str] = []
+        for tag in topic_tags:
+            normalized = re.sub(r"[^\w/-]+", "", tag, flags=re.UNICODE).strip("-_/")
+            if not normalized:
+                continue
+            if normalized.lower() not in {item.lower() for item in cleaned_tags}:
+                cleaned_tags.append(normalized)
+            if len(cleaned_tags) == 3:
+                break
+        if cleaned_tags:
+            return " / ".join(cleaned_tags)
+        first_sentence = re.split(r"[.!?\n]", episode.user_text.strip(), maxsplit=1)[0]
+        if first_sentence:
+            return first_sentence[:96]
+        return summary.splitlines()[0][:96] if summary else episode.turn_id
+
+    def _root_for_text(self, text: str, *, default: str = "root:projects") -> str:
+        normalized = self._normalize_text(text)
+        if any(token in normalized for token in ("user", "profile", "preference", "favorite", "name", "about me", "persona")):
+            return "root:user_profile"
+        if any(token in normalized for token in ("agent", "fagent", "runtime", "prompt", "model", "subagent")):
+            return "root:agent_identity"
+        if any(token in normalized for token in ("windows", "linux", "mac", "device", "terminal", "powershell", "bash", "shell", "machine", "environment")):
+            return "root:device_context"
+        if any(token in normalized for token in ("workflow", "tool", "provider", "service", "automation", "playwright", "git", "docker", "lancedb", "shadow context", "api")):
+            return "root:workflow_tools"
+        return default
+
+    def _choose_episode_root(self, episode: EpisodeRecord, entities: list[dict[str, Any]], facts: list[dict[str, Any]]) -> str:
+        counts = Counter()
+        combined_parts = [episode.user_text, episode.assistant_text, *[str(item.get("name") or "") for item in entities], *[str(item.get("statement") or "") for item in facts]]
+        for part in combined_parts:
+            counts[self._root_for_text(part)] += 1
+        return counts.most_common(1)[0][0] if counts else "root:projects"
+
+    def _choose_parent_id(self, label: str, metadata: dict[str, Any], *, episode_root_id: str, fallback_subject: str | None = None) -> str:
+        kind = str(metadata.get("kind") or "").lower()
+        if fallback_subject and fallback_subject.startswith("entity:"):
+            return fallback_subject
+        if kind == "fact" and fallback_subject:
+            return fallback_subject
+        if kind == "root":
+            return ""
+        root_guess = self._root_for_text(" ".join([label, kind, " ".join(str(item) for item in metadata.get("aliases", []))]), default=episode_root_id)
+        return root_guess or episode_root_id
+
     def _find_existing_entity_id(self, canonical_label: str) -> str | None:
         rows = self._search_graph_candidates(canonical_label, limit=8)
         if not rows:
@@ -425,26 +581,30 @@ class LocalGraphBackend:
                 rescored.sort(key=lambda item: (item["search_score"], item["semantic_score"], item["label"]), reverse=True)
                 rows = rescored[:8]
         for row in rows:
-            metadata = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
-            score = float(row.get("search_score", 0.0))
-            semantic_score = float(row.get("semantic_score", 0.0))
-            if self._normalize_text(str(metadata.get("canonical_name") or row["label"])) == self._normalize_text(canonical_label):
-                return str(row["id"])
+            metadata = json.loads(self._row_value(row, "metadata_json", "{}")) if self._row_value(row, "metadata_json") else {}
+            score = float(self._row_value(row, "search_score", 0.0) or 0.0)
+            semantic_score = float(self._row_value(row, "semantic_score", 0.0) or 0.0)
+            if self._normalize_text(str(metadata.get("canonical_name") or self._row_value(row, "label", ""))) == self._normalize_text(canonical_label):
+                return str(self._row_value(row, "id", ""))
             if score >= 0.84 or semantic_score >= 0.9:
-                return str(row["id"])
+                return str(self._row_value(row, "id", ""))
         return None
 
     def _compact_key(self, value: str) -> str:
         return re.sub(r"[^a-z0-9]+", "", self._normalize_text(value))
 
     def _candidate_texts(self, row: Any) -> list[str]:
-        metadata = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
-        texts = [str(row["label"])]
+        metadata = json.loads(self._row_value(row, "metadata_json", "{}")) if self._row_value(row, "metadata_json") else {}
+        texts = [str(self._row_value(row, "label", ""))]
         canonical_name = str(metadata.get("canonical_name") or "").strip()
         if canonical_name:
             texts.append(canonical_name)
         for alias in metadata.get("aliases") or []:
             alias_text = str(alias).strip()
+            if alias_text:
+                texts.append(alias_text)
+        for alias in self.registry.list_graph_aliases(str(self._row_value(row, "id", ""))):
+            alias_text = str(alias["alias_text"]).strip()
             if alias_text:
                 texts.append(alias_text)
         return list(dict.fromkeys(texts))
@@ -503,18 +663,28 @@ class LocalGraphBackend:
 
     def _search_graph_candidates(self, query: str, limit: int = 20, tier_weights: dict[int, float] | None = None) -> list[dict[str, Any]]:
         tier_weights = tier_weights or {1: 2.0, 2: 1.5, 3: 1.0}
+        limit = max(1, min(10, limit))
         raw_limit = max(limit * 12, 240)
         raw_rows = self.registry.list_graph_nodes(query=query, limit=raw_limit)
+        if len(raw_rows) < limit:
+            supplemental = self.registry.list_graph_nodes(limit=raw_limit)
+            seen_ids = {str(row["id"]) for row in raw_rows}
+            for row in supplemental:
+                row_id = str(row["id"])
+                if row_id in seen_ids:
+                    continue
+                raw_rows.append(row)
+                seen_ids.add(row_id)
         self.last_search_candidate_count = len(raw_rows)
         preliminary: list[dict[str, Any]] = []
         for row in raw_rows:
             lexical = self._score_graph_row(query, row)
-            tier = int(row.get("tier", 3))
+            tier = int(self._row_value(row, "tier", 3) or 3)
             preliminary.append(
                 {
-                    "id": str(row["id"]),
-                    "label": str(row["label"]),
-                    "metadata_json": str(row["metadata_json"] or "{}"),
+                    "id": str(self._row_value(row, "id", "")),
+                    "label": str(self._row_value(row, "label", "")),
+                    "metadata_json": str(self._row_value(row, "metadata_json", "{}") or "{}"),
                     "tier": tier,
                     "search_score": lexical,
                     "lexical_score": lexical,
@@ -791,9 +961,12 @@ class LocalGraphBackend:
         arguments: dict[str, Any],
         stage: dict[str, Any],
     ) -> tuple[dict[str, Any], bool]:
+        if name == "list_graph_roots":
+            return {"roots": self.list_root_nodes()}, False
+
         if name == "search_graph":
             query = str(arguments.get("query", "")).strip()
-            limit = max(1, min(32, int(arguments.get("limit", 20) or 20)))
+            limit = max(1, min(10, int(arguments.get("limit", 10) or 10)))
             rows = self._search_graph_candidates(query, limit=limit) if query else []
             return {
                 "matches": [
@@ -845,14 +1018,15 @@ class LocalGraphBackend:
                 english_label, source_language, language_confidence, normalization_method = self._canonicalize_english(surface_label)
             if not english_label:
                 return {"ok": False, "error": "english_canonicalization_required"}, False
-            if language_confidence < 0.75 or self._normalize_text(surface_label or english_label) in _GENERIC_ENTITY_WORDS:
-                return {"ok": False, "error": "ambiguous_or_generic_entity"}, False
+            if language_confidence < 0.6:
+                return {"ok": False, "error": "ambiguous_entity_language"}, False
             if not surface_label:
                 surface_label = english_label
             if not english_label:
                 return {"ok": False, "error": "label_required"}, False
             entity_id = str(arguments.get("entity_id") or self._find_existing_entity_id(english_label) or f"entity:{self._slug(english_label)}")
             aliases = [str(item).strip() for item in (arguments.get("aliases") or []) if str(item).strip()]
+            generic_candidate = self._normalize_text(surface_label or english_label) in _GENERIC_ENTITY_WORDS
             stage["entities"][entity_id] = {
                 "id": entity_id,
                 "name": english_label,
@@ -863,7 +1037,8 @@ class LocalGraphBackend:
                 "language_confidence": float(arguments.get("language_confidence", language_confidence) or language_confidence),
                 "normalization_method": normalization_method,
                 "ambiguous_language": bool(arguments.get("ambiguous_language", language_confidence < 0.75)),
-                "confidence": float(arguments.get("confidence", 0.7) or 0.7),
+                "generic_candidate": generic_candidate,
+                "confidence": min(float(arguments.get("confidence", 0.7) or 0.7), 0.55) if generic_candidate else float(arguments.get("confidence", 0.7) or 0.7),
             }
             return {"ok": True, "entity_id": entity_id}, False
 
@@ -966,27 +1141,41 @@ class LocalGraphBackend:
 
     def _persist_graph(self, episode: EpisodeRecord, summary: str, extraction: dict[str, Any]) -> None:
         episode_node = f"episode:{episode.episode_id}"
-        node_rows: list[tuple[str, str, dict[str, Any]]] = [
+        entities = extraction.get("entities") or []
+        facts = extraction.get("facts") or []
+        relations = extraction.get("relations") or []
+        episode_title = self._episode_title(episode, summary)
+        episode_root_id = self._choose_episode_root(episode, entities, facts)
+        node_rows: list[tuple[str, str, dict[str, Any], int]] = [
             (
                 episode_node,
-                episode.turn_id,
+                episode_title,
                 {
                     "kind": "episode",
+                    "title": episode_title,
                     "summary": summary,
                     "session_key": episode.session_key,
                     "episode_id": episode.episode_id,
                     "turn_id": episode.turn_id,
                     "timestamp": episode.timestamp,
+                    "topic_tags": list(episode.metadata.get("topic_tags", [])),
+                    "root_parent_id": episode_root_id,
                     "source": "llm_graph_agent",
                 },
+                3,
             )
         ]
         alias_rows_by_entity: dict[str, list[dict[str, Any]]] = {}
         edge_rows: list[tuple[str, str, str, float, dict[str, Any]]] = []
-
-        entities = extraction.get("entities") or []
-        facts = extraction.get("facts") or []
-        relations = extraction.get("relations") or []
+        edge_rows.append(
+            (
+                episode_root_id,
+                episode_node,
+                "parent_of",
+                1.0,
+                {"episode_id": episode.episode_id, "source": "root_assignment"},
+            )
+        )
 
         for entity in entities:
             entity_id = str(entity.get("id") or f"entity:{self._slug(entity.get('name', 'unknown'))}")
@@ -1003,12 +1192,25 @@ class LocalGraphBackend:
                 "source_language": entity.get("source_language", "en"),
                 "language_confidence": entity.get("language_confidence", 1.0),
                 "normalization_method": entity.get("normalization_method", "exact"),
+                "generic_candidate": bool(entity.get("generic_candidate", False)),
                 "confidence": entity.get("confidence", 0.7),
                 "provenance_episode": episode.episode_id,
+                "parent_id": self._choose_parent_id(label, entity, episode_root_id=episode_root_id),
                 "source": "llm_graph_agent",
             }
             node_rows.append((entity_id, label, metadata, 3))
             alias_rows_by_entity[entity_id] = aliases
+            parent_id = str(metadata.get("parent_id") or episode_root_id)
+            if parent_id:
+                edge_rows.append(
+                    (
+                        parent_id,
+                        entity_id,
+                        "parent_of",
+                        1.0,
+                        {"episode_id": episode.episode_id, "source": "entity_parent"},
+                    )
+                )
             edge_rows.append(
                 (
                     episode_node,
@@ -1022,6 +1224,8 @@ class LocalGraphBackend:
         for fact in facts:
             fact_id = str(fact.get("id") or f"fact:{self._slug(fact.get('statement', 'fact'))}")
             statement = str(fact.get("statement") or summary)
+            fact_subject = str(fact.get("subject") or episode_node)
+            fact_parent = self._choose_parent_id(statement[:80], {"kind": "fact"}, episode_root_id=episode_root_id, fallback_subject=fact_subject)
             node_rows.append(
                 (
                     fact_id,
@@ -1037,21 +1241,31 @@ class LocalGraphBackend:
                         "confidence": fact.get("confidence", 0.8),
                         "provenance_episode": episode.episode_id,
                         "supersedes": fact.get("supersedes", []),
+                        "parent_id": fact_parent,
                         "source": "llm_graph_agent",
                     },
                     3,
                 )
             )
-            subject = str(fact.get("subject") or episode_node)
             edge_rows.append(
                 (
-                    subject,
+                    fact_subject,
                     fact_id,
                     "decided",
                     float(fact.get("confidence", 0.8)),
                     {"episode_id": episode.episode_id},
                 )
             )
+            if fact_parent:
+                edge_rows.append(
+                    (
+                        fact_parent,
+                        fact_id,
+                        "parent_of",
+                        1.0,
+                        {"episode_id": episode.episode_id, "source": "fact_parent"},
+                    )
+                )
             edge_rows.append(
                 (
                     episode_node,
@@ -1097,8 +1311,9 @@ class LocalGraphBackend:
             if self.semantic_embedder:
                 for node_id, label, metadata, *_ in node_rows:
                     try:
-                        vector = self.semantic_embedder.embed(label)
-                        self.registry.upsert_node_embedding(node_id, vector)
+                        vector = self._embed_text(label)
+                        if vector:
+                            self.registry.upsert_node_embedding(node_id, vector)
                     except Exception as emb_exc:
                         logger.warning("Failed to embed node {}: {}", node_id, emb_exc)
         except Exception as exc:

@@ -93,6 +93,7 @@ class MemoryOrchestrator:
             registry=self.registry,
         )
         self.graph_backend = self._build_graph_backend(workspace)
+        self.graph_backend.ensure_root_nodes()
         self.router = MemoryRouter(
             provider=shadow_provider,
             model=(shadow_role.model if shadow_role else None),
@@ -104,6 +105,35 @@ class MemoryOrchestrator:
             max_tokens=self.config.shadow_context.max_tokens,
         )
         self._tasks: set[asyncio.Task] = set()
+        self._bootstrap_graph_roots()
+
+    def _bootstrap_graph_roots(self) -> None:
+        self.graph_backend.ensure_root_nodes()
+        for row in self.registry.list_graph_nodes(limit=5000):
+            metadata = json.loads(str(row["metadata_json"] or "{}"))
+            kind = str(metadata.get("kind") or "").lower()
+            label = str(row["label"] or "")
+            node_id = str(row["id"] or "")
+            tier = int(row["tier"]) if "tier" in row.keys() else int(metadata.get("tier", 3) or 3)
+            updated = False
+
+            if kind == "episode" and (not label or label.startswith("turn-")):
+                topic_tags = [str(item).strip() for item in metadata.get("topic_tags", []) if str(item).strip()]
+                if topic_tags:
+                    label = " / ".join(topic_tags[:3])[:96]
+                else:
+                    summary = str(metadata.get("summary") or "").strip()
+                    label = summary.splitlines()[0][:96] if summary else label
+                metadata["title"] = label
+                updated = True
+
+            if metadata.get("graph_root"):
+                if tier != 1:
+                    tier = 1
+                    updated = True
+
+            if updated:
+                self.registry.upsert_graph_node(node_id, label, metadata, tier=tier)
 
     def _normalize_seed_artifact(
         self,
@@ -1668,6 +1698,7 @@ class MemoryOrchestrator:
                 "id": str(row["id"]),
                 "label": str(row["label"]),
                 "metadata": json.loads(row["metadata_json"]) if row["metadata_json"] else {},
+                "tier": int(row["tier"]) if "tier" in row.keys() else 3,
                 "degree": int(row["degree"]) if "degree" in row.keys() else 0,
                 "layout": layout_map.get(str(row["id"])),
             }
@@ -1782,7 +1813,7 @@ class MemoryOrchestrator:
                 item["label"],
             )
         )
-        payload["search_results"] = search_results[:18]
+        payload["search_results"] = search_results[:10]
         payload["view"] = "overview"
         return payload
 
@@ -1798,7 +1829,7 @@ class MemoryOrchestrator:
             return False
         if node_id.startswith("turn-") or label.startswith("turn-"):
             return False
-        if kind in {"episode", "session_turn", "workflow_state", "artifact_fallback"}:
+        if kind in {"session_turn", "workflow_state", "artifact_fallback"}:
             return False
 
         low_signal_prefixes = ("episode-", "artifact:", "session:", "turn:")
@@ -2845,8 +2876,8 @@ Return JSON:
         if not node:
             return {"error": "Node not found"}
 
-        old_tier = node.get("tier", 3)
-        metadata = json.loads(node.get("metadata_json", "{}"))
+        old_tier = int(node["tier"]) if "tier" in node.keys() else 3
+        metadata = json.loads(str(node["metadata_json"] or "{}"))
         metadata["tier"] = new_tier
         metadata["tier_reason"] = f"Reorganized from tier {old_tier} to tier {new_tier}"
         metadata["last_tier_update"] = datetime.utcnow().isoformat()

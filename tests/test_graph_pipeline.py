@@ -303,3 +303,61 @@ def test_search_graph_returns_hybrid_matches_with_scores(tmp_path: Path) -> None
     assert result["matches"]
     assert result["matches"][0]["id"] == "entity:cliproxyapi"
     assert result["matches"][0]["search_score"] > 0.8
+
+
+def test_graph_pipeline_names_episode_nodes_for_search(tmp_path: Path) -> None:
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
+    orchestrator.registry.upsert_graph_node(
+        "episode:demo",
+        "turn-000111",
+        {
+            "kind": "episode",
+            "summary": "User asked about lancedb shadow context indexing",
+            "topic_tags": ["lancedb", "shadow", "context"],
+            "turn_id": "turn-000111",
+        },
+        tier=3,
+    )
+
+    # Re-run bootstrap to backfill old turn-like labels.
+    orchestrator._bootstrap_graph_roots()
+
+    row = orchestrator.registry.get_graph_node("episode:demo")
+    assert row is not None
+    assert str(row["label"]) != "turn-000111"
+    assert "lancedb" in str(row["label"]).lower()
+
+
+def test_list_graph_roots_returns_persisted_roots(tmp_path: Path) -> None:
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
+    backend = orchestrator.graph_backend
+    stage = {"summary": "", "reason": "", "entities": {}, "facts": {}, "relations": []}
+
+    result, finished = backend._run_graph_tool("list_graph_roots", {}, stage)
+
+    assert finished is False
+    assert len(result["roots"]) >= 5
+    assert {item["id"] for item in result["roots"]} >= {
+        "root:user_profile",
+        "root:agent_identity",
+        "root:device_context",
+        "root:projects",
+        "root:workflow_tools",
+    }
+
+
+def test_list_graph_edges_supports_source_target_and_relation_filters(tmp_path: Path) -> None:
+    orchestrator = MemoryOrchestrator(workspace=tmp_path, provider=None, model="test-model")
+    orchestrator.registry.upsert_graph_edge("root:projects", "entity:a", "parent_of", 1.0, {"source": "test"})
+    orchestrator.registry.upsert_graph_edge("entity:a", "fact:b", "decided", 0.9, {"source": "test"})
+
+    source_rows = orchestrator.registry.list_graph_edges(source_id="root:projects", limit=10)
+    target_rows = orchestrator.registry.list_graph_edges(target_id="entity:a", relation="parent_of", limit=10)
+    relation_rows = orchestrator.registry.list_graph_edges(relation="parent_of", limit=10)
+
+    assert len(source_rows) == 1
+    assert source_rows[0]["target_id"] == "entity:a"
+    assert len(target_rows) == 1
+    assert target_rows[0]["source_id"] == "root:projects"
+    assert len(relation_rows) == 1
+    assert relation_rows[0]["relation"] == "parent_of"
