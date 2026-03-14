@@ -198,12 +198,9 @@ function GraphAtlasInner() {
   // UI state
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
   const [selectedDetails, setSelectedDetails] = useState<NodeDetails | null>(null)
-  const [edgeOpacity, setEdgeOpacity] = useState(0.6)
   const [showLabels, setShowLabels] = useState(true)
   const [layoutKey, setLayoutKey] = useState(0)
   const [layoutMode, setLayoutMode] = useState<"force" | "radial" | "hierarchical">("force")
-  const [nodeSize, setNodeSize] = useState(1)
-  const [performanceMode, setPerformanceMode] = useState(false)
   const [hiddenNodeIds, setHiddenNodeIds] = useState<Set<string>>(new Set())
 
   // Read URL params on mount
@@ -256,13 +253,6 @@ function GraphAtlasInner() {
     loadGraph(query, session, mode)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialLoaded])
-
-  // Auto-enable performance mode for large graphs
-  useEffect(() => {
-    if (currentNodes.length > 300 || currentEdges.length > 800) {
-      setPerformanceMode(true)
-    }
-  }, [currentNodes.length, currentEdges.length])
 
   // Handlers
   const handleSelectNode = useCallback(async (nodeId: string | null) => {
@@ -390,18 +380,12 @@ function GraphAtlasInner() {
             <div className="relative h-full">
               <Toolbar
                 onRelayout={handleRelayout}
-                edgeOpacity={edgeOpacity}
-                onEdgeOpacityChange={setEdgeOpacity}
                 showLabels={showLabels}
                 onToggleLabels={() => setShowLabels(!showLabels)}
                 nodeCount={currentNodes.length - hiddenNodeIds.size}
                 edgeCount={currentEdges.length}
                 layoutMode={layoutMode}
                 onLayoutModeChange={setLayoutMode}
-                nodeSize={nodeSize}
-                onNodeSizeChange={setNodeSize}
-                performanceMode={performanceMode}
-                onPerformanceModeChange={setPerformanceMode}
               />
 
               {/* Loading overlay */}

@@ -241,10 +241,10 @@ export function ForceGraphCanvas({
         const targetNode = graphData.nodes.find(n => n.id === targetId);
         
         if (isHighlighted) {
-          // Подсвеченная связь - белая
+          // Подсвеченная связь - белая, яркая
           ctx.strokeStyle = '#ffffff';
           ctx.lineWidth = 2 / globalScale;
-          ctx.globalAlpha = 0.8;
+          ctx.globalAlpha = 0.9;
         } else {
           // Градиент от цвета source к цвету target
           const sourceColor = sourceNode ? getNodeColor(sourceNode.kind as string) : FALLBACK_COLOR;
@@ -255,8 +255,8 @@ export function ForceGraphCanvas({
           gradient.addColorStop(1, targetColor);
           
           ctx.strokeStyle = gradient;
-          ctx.lineWidth = 0.5 / globalScale;
-          ctx.globalAlpha = isDimmed ? 0.05 : 0.15;
+          ctx.lineWidth = 1.0 / globalScale;
+          ctx.globalAlpha = isDimmed ? 0.08 : 0.45;
         }
         
         // Рисовать линию
