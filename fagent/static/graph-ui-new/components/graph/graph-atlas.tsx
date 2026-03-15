@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useCallback, useMemo, useEffect } from "react"
+import { useState, useCallback, useEffect } from "react"
 import dynamic from "next/dynamic"
 import {
   ResizableHandle,
@@ -15,7 +15,9 @@ import { SearchPanel } from "./search-panel"
 import { DetailsPanel } from "./details-panel"
 import { Toolbar } from "./toolbar"
 import { Legend } from "./legend"
+import { NodeContextMenu } from "./node-context-menu"
 import type { RawNode, RawEdge, NodeDetails } from "@/lib/graph-types"
+import type { NodeRightClickInfo } from "./force-graph-canvas"
 import {
   fetchGraphOverview,
   fetchGraphDetails,
@@ -200,8 +202,8 @@ function GraphAtlasInner() {
   const [selectedDetails, setSelectedDetails] = useState<NodeDetails | null>(null)
   const [showLabels, setShowLabels] = useState(true)
   const [layoutKey, setLayoutKey] = useState(0)
-  const [layoutMode, setLayoutMode] = useState<"force" | "radial" | "hierarchical">("force")
   const [hiddenNodeIds, setHiddenNodeIds] = useState<Set<string>>(new Set())
+  const [contextMenu, setContextMenu] = useState<NodeRightClickInfo | null>(null)
 
   // Read URL params on mount
   useEffect(() => {
@@ -379,13 +381,12 @@ function GraphAtlasInner() {
           <ResizablePanel defaultSize={57}>
             <div className="relative h-full">
               <Toolbar
-                onRelayout={handleRelayout}
+                onReload={handleReload}
                 showLabels={showLabels}
-                onToggleLabels={() => setShowLabels(!showLabels)}
+                onToggleLabels={() => setShowLabels(prev => !prev)}
                 nodeCount={currentNodes.length - hiddenNodeIds.size}
                 edgeCount={currentEdges.length}
-                layoutMode={layoutMode}
-                onLayoutModeChange={setLayoutMode}
+                loading={loading}
               />
 
               {/* Loading overlay */}
@@ -399,12 +400,13 @@ function GraphAtlasInner() {
               )}
 
               <ForceGraphCanvas
-                key={`${layoutKey}-${layoutMode}`}
+                key={String(layoutKey)}
                 rawNodes={currentNodes}
                 rawEdges={currentEdges}
                 selectedNodeId={selectedNodeId}
+                showLabels={showLabels}
                 onSelectNode={handleSelectNode}
-                layoutMode={layoutMode}
+                onNodeRightClick={setContextMenu}
                 onExpandCluster={handleExpandCluster}
                 onCollapseNodes={handleCollapseNodes}
                 hiddenNodeIds={hiddenNodeIds}
@@ -425,6 +427,22 @@ function GraphAtlasInner() {
                   loading={loading}
                 />
               </div>
+
+              {/* Context menu */}
+              {contextMenu && (
+                <NodeContextMenu
+                  x={contextMenu.screenX}
+                  y={contextMenu.screenY}
+                  nodeId={contextMenu.nodeId}
+                  nodeLabel={contextMenu.nodeLabel}
+                  isCluster={contextMenu.isCluster}
+                  clusterSize={contextMenu.clusterSize}
+                  onSelect={() => handleSelectNode(contextMenu.nodeId)}
+                  onExpand={contextMenu.isCluster ? () => handleExpandCluster(contextMenu.nodeId) : undefined}
+                  onHide={() => handleHideNode(contextMenu.nodeId)}
+                  onClose={() => setContextMenu(null)}
+                />
+              )}
             </div>
           </ResizablePanel>
 
@@ -436,6 +454,7 @@ function GraphAtlasInner() {
               details={selectedDetails}
               onClose={handleCloseDetails}
               onSelectNode={handleSelectNode}
+              onExpandCluster={handleExpandCluster}
               onHideNode={handleHideNode}
             />
           </ResizablePanel>

@@ -1,14 +1,14 @@
 "use client"
 
 import { useState } from "react"
-import { 
-  X, 
-  Network, 
-  Tag, 
-  GitBranch, 
-  ChevronRight, 
-  Edit3, 
-  Trash2, 
+import {
+  X,
+  Network,
+  Tag,
+  GitBranch,
+  ChevronRight,
+  Edit3,
+  Trash2,
   Link2,
   Plus,
   Search,
@@ -19,6 +19,7 @@ import {
   Lock,
   Unlock,
   Copy,
+  Expand,
 } from "lucide-react"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Badge } from "@/components/ui/badge"
@@ -40,6 +41,7 @@ interface DetailsPanelProps {
   details: NodeDetails | null
   onClose: () => void
   onSelectNode: (nodeId: string) => void
+  onExpandCluster?: (nodeId: string) => void
   onEditNode?: (nodeId: string) => void
   onDeleteNode?: (nodeId: string) => void
   onHideNode?: (nodeId: string) => void
@@ -54,10 +56,11 @@ const kindLabels: Record<NodeKind, string> = {
   bridge: "Bridge",
 }
 
-export function DetailsPanel({ 
-  details, 
-  onClose, 
+export function DetailsPanel({
+  details,
+  onClose,
   onSelectNode,
+  onExpandCluster,
   onEditNode,
   onDeleteNode,
   onHideNode,
@@ -117,13 +120,20 @@ export function DetailsPanel({
                   boxShadow: `0 0 12px ${colors.glow}` 
                 }}
               />
-              <Badge 
-                variant="outline" 
+              <Badge
+                variant="outline"
                 className="text-[10px] uppercase tracking-wider font-semibold"
                 style={{ borderColor: colors.border, color: colors.bg }}
               >
-                {kindLabels[kind]}
+                {kindLabels[kind] || kind}
               </Badge>
+              {(details.metadata?.cluster_size || details.metadata?.is_cluster) && (
+                <Badge variant="secondary" className="text-[10px] bg-purple-500/20 text-purple-300 border-purple-500/30">
+                  {details.metadata?.cluster_size
+                    ? `${details.metadata.cluster_size} members`
+                    : "cluster"}
+                </Badge>
+              )}
               {details.metadata?.confidence && (
                 <Badge variant="secondary" className="text-[10px]">
                   {Math.round((details.metadata.confidence as number) * 100)}% conf
@@ -175,6 +185,19 @@ export function DetailsPanel({
             </Button>
           </div>
         </div>
+
+        {/* Expand cluster button — shown for cluster nodes */}
+        {(kind === "cluster" || details.metadata?.is_cluster) && onExpandCluster && (
+          <Button
+            size="sm"
+            variant="outline"
+            className="mt-3 w-full text-xs gap-2 border-purple-500/40 text-purple-300 hover:bg-purple-500/10"
+            onClick={() => onExpandCluster(details.selected_id)}
+          >
+            <Expand className="w-3.5 h-3.5" />
+            Expand cluster members
+          </Button>
+        )}
 
         {/* Quick stats */}
         <div className="flex items-center gap-4 mt-3 pt-3 border-t border-border/30">

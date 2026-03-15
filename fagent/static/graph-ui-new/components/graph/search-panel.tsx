@@ -106,7 +106,7 @@ export function SearchPanel({ nodes, onSelectNode, selectedNodeId }: SearchPanel
   }, [filteredAndSortedNodes])
 
   return (
-    <div className="h-full flex flex-col bg-card/50 backdrop-blur-sm">
+    <div className="h-full flex flex-col bg-card/50 backdrop-blur-sm overflow-hidden">
       {/* Header */}
       <div className="p-3 border-b border-border/30">
         <h2 className="text-sm font-semibold mb-3">Graph Explorer</h2>
@@ -229,8 +229,9 @@ export function SearchPanel({ nodes, onSelectNode, selectedNodeId }: SearchPanel
         )}
       </div>
 
-      {/* Results */}
-      <ScrollArea className="flex-1" ref={scrollRef}>
+      {/* Results — flex-1 + overflow-hidden on parent makes ScrollArea scrollable */}
+      <div className="flex-1 overflow-hidden">
+      <ScrollArea className="h-full" ref={scrollRef}>
         <div className="p-2 space-y-0.5">
           {visibleNodes.map((node) => {
             const kind = (node.metadata?.kind || "entity") as NodeKind
@@ -285,6 +286,7 @@ export function SearchPanel({ nodes, onSelectNode, selectedNodeId }: SearchPanel
           )}
         </div>
       </ScrollArea>
+      </div>
     </div>
   )
 }
