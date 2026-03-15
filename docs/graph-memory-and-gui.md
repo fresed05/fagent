@@ -72,13 +72,17 @@ The Graph UI has been upgraded to a modern React/Next.js interface built with
 `react-force-graph-2d`, Tailwind CSS and Radix UI. It replaces the old
 `graph_ui/` Vanilla JS viewer.
 
+![Graph Atlas — knowledge graph visualization](./assets/graph-ui-preview.png)
+
 Features of the new UI:
 
-- force-directed layout with radial and hierarchical modes
+- force-directed layout with live physics simulation
 - live search and filter panel with kind/type filters
-- rich details panel showing neighbors, edges, and metadata
-- zoom-independent labels (LOD rendering)
-- keyboard shortcuts: `R` relayout, `L` toggle labels, `Esc` deselect
+- right-click context menu on any node — expand clusters, hide nodes
+- cluster nodes show member count and can be expanded inline (members spread around the cluster)
+- rich details panel showing neighbors, edges, metadata and cluster info
+- zoom-independent labels (toggle with Eye button)
+- reload button pulls fresh data from the server API
 - graph mode selector: Atlas (clustered) / Raw (all nodes)
 - query and session filter passed through URL or UI
 
