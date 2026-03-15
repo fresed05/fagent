@@ -16,6 +16,7 @@ export interface NodeRightClickInfo {
   nodeId: string;
   nodeLabel: string;
   isCluster: boolean;
+  isExpanded: boolean;
   clusterSize?: number;
   screenX: number;
   screenY: number;
@@ -26,10 +27,12 @@ interface ForceGraphCanvasProps {
   rawEdges: RawEdge[];
   selectedNodeId?: string | null;
   showLabels?: boolean;
+  expandedClusters?: Set<string>;
   onSelectNode?: (nodeId: string | null) => void;
   onNodeRightClick?: (info: NodeRightClickInfo) => void;
-  onExpandCluster?: (clusterId: string) => void;
+  onExpandCluster?: (clusterId: string, clusterX: number, clusterY: number) => void;
   onCollapseNodes?: (nodeIds: string[]) => void;
+  onBackgroundClick?: () => void;
   hiddenNodeIds?: Set<string>;
 }
 
@@ -38,9 +41,11 @@ export function ForceGraphCanvas({
   rawEdges,
   selectedNodeId,
   showLabels = true,
+  expandedClusters = new Set(),
   onSelectNode,
   onNodeRightClick,
   onExpandCluster,
+  onBackgroundClick,
   hiddenNodeIds = new Set(),
 }: ForceGraphCanvasProps) {
   const fgRef = useRef<any>();
@@ -116,16 +121,17 @@ export function ForceGraphCanvas({
       nodeId: node.id as string,
       nodeLabel: node.name as string,
       isCluster: !!(node.is_cluster),
+      isExpanded: expandedClusters.has(node.id as string),
       clusterSize: node.cluster_size as number | undefined,
       screenX: event.clientX,
       screenY: event.clientY,
     });
-  }, [onNodeRightClick]);
+  }, [onNodeRightClick, expandedClusters]);
 
-  // Double-click to expand cluster
+  // Double-click to expand cluster (with position for spawning child nodes)
   const handleNodeDoubleClick = useCallback((node: any) => {
     if (node.is_cluster && onExpandCluster) {
-      onExpandCluster(node.id as string);
+      onExpandCluster(node.id as string, node.x as number ?? 0, node.y as number ?? 0);
     }
   }, [onExpandCluster]);
 
@@ -180,69 +186,42 @@ export function ForceGraphCanvas({
             ctx.shadowColor = color;
           }
 
+          // All nodes: circle. Clusters are larger with count inside.
+          const gradient = ctx.createRadialGradient(
+            node.x - size * 0.3, node.y - size * 0.3, 0,
+            node.x, node.y, size
+          );
+          gradient.addColorStop(0, color + "dd");
+          gradient.addColorStop(1, color);
+
+          ctx.beginPath();
+          ctx.arc(node.x, node.y, size, 0, 2 * Math.PI);
+          ctx.fillStyle = isDimmed ? color + "33" : gradient;
+          ctx.fill();
+
+          ctx.shadowBlur = 0;
+
+          if (isHighlighted || isSelected) {
+            ctx.strokeStyle = "#ffffff";
+            ctx.lineWidth = 2 / globalScale;
+            ctx.stroke();
+          }
+
+          // Cluster: dashed ring + count badge
           if (isCluster) {
-            // Cluster: rounded rectangle
-            const w = size * 2.4;
-            const h = size * 1.6;
-            const r = size * 0.35;
-            const x = node.x - w / 2;
-            const y = node.y - h / 2;
+            ctx.setLineDash([3 / globalScale, 3 / globalScale]);
+            ctx.strokeStyle = isDimmed ? color + "44" : color + "cc";
+            ctx.lineWidth = 1.5 / globalScale;
+            ctx.stroke();
+            ctx.setLineDash([]);
 
-            ctx.beginPath();
-            ctx.moveTo(x + r, y);
-            ctx.lineTo(x + w - r, y);
-            ctx.quadraticCurveTo(x + w, y, x + w, y + r);
-            ctx.lineTo(x + w, y + h - r);
-            ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-            ctx.lineTo(x + r, y + h);
-            ctx.quadraticCurveTo(x, y + h, x, y + h - r);
-            ctx.lineTo(x, y + r);
-            ctx.quadraticCurveTo(x, y, x + r, y);
-            ctx.closePath();
-
-            const grad = ctx.createRadialGradient(node.x - w * 0.2, node.y - h * 0.2, 0, node.x, node.y, w * 0.7);
-            grad.addColorStop(0, color + "ee");
-            grad.addColorStop(1, color + "88");
-            ctx.fillStyle = isDimmed ? color + "33" : grad;
-            ctx.fill();
-
-            if (isHighlighted || isSelected) {
-              ctx.strokeStyle = "#ffffff";
-              ctx.lineWidth = 2 / globalScale;
-              ctx.stroke();
-            }
-
-            ctx.shadowBlur = 0;
-
-            // Cluster count badge
             if (node.cluster_size) {
-              const fontSize = Math.max(9, Math.min(14, size * 0.7)) / globalScale;
+              const fontSize = Math.max(8, Math.min(13, size * 0.65)) / globalScale;
               ctx.font = `bold ${fontSize}px Inter, Sans-Serif`;
               ctx.textAlign = "center";
               ctx.textBaseline = "middle";
               ctx.fillStyle = isDimmed ? "rgba(255,255,255,0.3)" : "rgba(255,255,255,0.95)";
               ctx.fillText(String(node.cluster_size), node.x, node.y);
-            }
-          } else {
-            // Regular node: circle
-            const gradient = ctx.createRadialGradient(
-              node.x - size * 0.3, node.y - size * 0.3, 0,
-              node.x, node.y, size
-            );
-            gradient.addColorStop(0, color + "dd");
-            gradient.addColorStop(1, color);
-
-            ctx.beginPath();
-            ctx.arc(node.x, node.y, size, 0, 2 * Math.PI);
-            ctx.fillStyle = isDimmed ? color + "33" : gradient;
-            ctx.fill();
-
-            ctx.shadowBlur = 0;
-
-            if (isHighlighted || isSelected) {
-              ctx.strokeStyle = "#ffffff";
-              ctx.lineWidth = 2 / globalScale;
-              ctx.stroke();
             }
           }
 
@@ -309,7 +288,7 @@ export function ForceGraphCanvas({
         onNodeRightClick={handleNodeRightClick}
         onNodeDoubleClick={handleNodeDoubleClick}
         onNodeHover={handleNodeHover}
-        onBackgroundClick={() => onSelectNode?.(null)}
+        onBackgroundClick={() => { onSelectNode?.(null); onBackgroundClick?.(); }}
         d3VelocityDecay={0.3}
       />
     </div>

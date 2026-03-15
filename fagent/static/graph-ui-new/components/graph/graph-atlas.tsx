@@ -204,6 +204,9 @@ function GraphAtlasInner() {
   const [layoutKey, setLayoutKey] = useState(0)
   const [hiddenNodeIds, setHiddenNodeIds] = useState<Set<string>>(new Set())
   const [contextMenu, setContextMenu] = useState<NodeRightClickInfo | null>(null)
+  // Track which clusters have been expanded and what node IDs they spawned
+  const [expandedClusters, setExpandedClusters] = useState<Set<string>>(new Set())
+  const [clusterChildIds, setClusterChildIds] = useState<Map<string, string[]>>(new Map())
 
   // Read URL params on mount
   useEffect(() => {
@@ -272,13 +275,24 @@ function GraphAtlasInner() {
     }
   }, [query, session])
 
-  const handleExpandCluster = useCallback(async (clusterId: string) => {
+  const handleExpandCluster = useCallback(async (clusterId: string, clusterX = 0, clusterY = 0) => {
     try {
       const focusPayload = await fetchGraphFocus(clusterId, { query, session })
       if (focusPayload.nodes.length > 0) {
         // Merge cluster members into the current graph
         const existingIds = new Set(currentNodes.map(n => n.id))
-        const newNodes = focusPayload.nodes.filter(n => !existingIds.has(n.id))
+        const newNodes = focusPayload.nodes
+          .filter(n => !existingIds.has(n.id))
+          .map((n, i) => {
+            // Spread new nodes in a circle around the cluster position
+            const angle = (2 * Math.PI * i) / Math.max(focusPayload.nodes.length, 1)
+            const radius = 80 + 20 * Math.ceil(Math.sqrt(focusPayload.nodes.length))
+            return {
+              ...n,
+              _fx: clusterX + radius * Math.cos(angle),
+              _fy: clusterY + radius * Math.sin(angle),
+            } as RawNode & { _fx?: number; _fy?: number }
+          })
         const existingEdgeKeys = new Set(
           currentEdges.map(e => `${e.source_id}|${e.relation}|${e.target_id}`)
         )
@@ -287,11 +301,40 @@ function GraphAtlasInner() {
         )
         setCurrentNodes(prev => [...prev, ...newNodes])
         setCurrentEdges(prev => [...prev, ...newEdges])
+        // Track expanded state
+        setExpandedClusters(prev => new Set([...prev, clusterId]))
+        setClusterChildIds(prev => {
+          const next = new Map(prev)
+          next.set(clusterId, newNodes.map(n => n.id))
+          return next
+        })
       }
     } catch {
       // silently ignore
     }
   }, [currentNodes, currentEdges, query, session])
+
+  const handleCollapseCluster = useCallback((clusterId: string) => {
+    const childIds = clusterChildIds.get(clusterId) || []
+    setCurrentNodes(prev => prev.filter(n => !childIds.includes(n.id)))
+    setCurrentEdges(prev => prev.filter(e =>
+      !childIds.includes(e.source_id) && !childIds.includes(e.target_id)
+    ))
+    setExpandedClusters(prev => {
+      const next = new Set(prev)
+      next.delete(clusterId)
+      return next
+    })
+    setClusterChildIds(prev => {
+      const next = new Map(prev)
+      next.delete(clusterId)
+      return next
+    })
+    if (childIds.includes(selectedNodeId || "")) {
+      setSelectedNodeId(null)
+      setSelectedDetails(null)
+    }
+  }, [clusterChildIds, selectedNodeId])
 
   const handleCollapseNodes = useCallback((nodeIds: string[]) => {
     setHiddenNodeIds(prev => new Set([...prev, ...nodeIds]))
@@ -405,10 +448,12 @@ function GraphAtlasInner() {
                 rawEdges={currentEdges}
                 selectedNodeId={selectedNodeId}
                 showLabels={showLabels}
+                expandedClusters={expandedClusters}
                 onSelectNode={handleSelectNode}
                 onNodeRightClick={setContextMenu}
                 onExpandCluster={handleExpandCluster}
                 onCollapseNodes={handleCollapseNodes}
+                onBackgroundClick={() => setContextMenu(null)}
                 hiddenNodeIds={hiddenNodeIds}
               />
 
@@ -436,9 +481,15 @@ function GraphAtlasInner() {
                   nodeId={contextMenu.nodeId}
                   nodeLabel={contextMenu.nodeLabel}
                   isCluster={contextMenu.isCluster}
+                  isExpanded={contextMenu.isExpanded}
                   clusterSize={contextMenu.clusterSize}
                   onSelect={() => handleSelectNode(contextMenu.nodeId)}
-                  onExpand={contextMenu.isCluster ? () => handleExpandCluster(contextMenu.nodeId) : undefined}
+                  onExpand={contextMenu.isCluster && !contextMenu.isExpanded
+                    ? () => handleExpandCluster(contextMenu.nodeId, 0, 0)
+                    : undefined}
+                  onCollapse={contextMenu.isCluster && contextMenu.isExpanded
+                    ? () => handleCollapseCluster(contextMenu.nodeId)
+                    : undefined}
                   onHide={() => handleHideNode(contextMenu.nodeId)}
                   onClose={() => setContextMenu(null)}
                 />

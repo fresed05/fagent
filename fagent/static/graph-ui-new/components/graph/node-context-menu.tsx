@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useRef } from "react"
-import { Expand, EyeOff, MousePointer2, Layers } from "lucide-react"
+import { Expand, Shrink, EyeOff, MousePointer2 } from "lucide-react"
 
 export interface NodeContextMenuProps {
   x: number
@@ -9,9 +9,11 @@ export interface NodeContextMenuProps {
   nodeId: string
   nodeLabel: string
   isCluster: boolean
+  isExpanded?: boolean
   clusterSize?: number
   onSelect: () => void
   onExpand?: () => void
+  onCollapse?: () => void
   onHide: () => void
   onClose: () => void
 }
@@ -22,9 +24,11 @@ export function NodeContextMenu({
   nodeId,
   nodeLabel,
   isCluster,
+  isExpanded = false,
   clusterSize,
   onSelect,
   onExpand,
+  onCollapse,
   onHide,
   onClose,
 }: NodeContextMenuProps) {
@@ -88,13 +92,23 @@ export function NodeContextMenu({
           Select node
         </button>
 
-        {isCluster && onExpand && (
+        {isCluster && !isExpanded && onExpand && (
           <button
             onClick={() => { onExpand(); onClose() }}
             className="w-full flex items-center gap-2.5 px-3 py-2 text-sm hover:bg-secondary/60 transition-colors text-left text-primary"
           >
             <Expand className="w-4 h-4" />
             Expand cluster
+          </button>
+        )}
+
+        {isCluster && isExpanded && onCollapse && (
+          <button
+            onClick={() => { onCollapse(); onClose() }}
+            className="w-full flex items-center gap-2.5 px-3 py-2 text-sm hover:bg-secondary/60 transition-colors text-left text-amber-400"
+          >
+            <Shrink className="w-4 h-4" />
+            Collapse cluster
           </button>
         )}
 
